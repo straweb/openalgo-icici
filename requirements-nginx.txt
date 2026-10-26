@@ -11,6 +11,7 @@ attrs==24.2.0
 bcrypt==5.0.0
 bidict==0.24.1
 blinker==1.9.0
+breeze-connect==1.0.69
 cachetools==7.1.7
 # Not below 2026.10.19: older bundles still trust the emSign ECC Root CA - G3,
 # removed after a CA key beneath it was compromised (GHSA-6q48-6c7w-9gw2).

@@ -43,7 +43,7 @@ def broker_callback(broker, para=None):
     logger.info(f"Session has user key: {'user' in session}")
 
     # Special handling for brokers that come from external auth and might lose session
-    if broker in ("compositedge", "rmoney", "iiflcapital") and "user" not in session:
+    if broker in ("compositedge", "rmoney", "iiflcapital", "icici") and "user" not in session:
         # Session will be established after successful auth token validation
         logger.info(f"{broker} callback without session - will establish session after auth")
     # Special handling for mstock POST - check session but provide better error instead of redirect

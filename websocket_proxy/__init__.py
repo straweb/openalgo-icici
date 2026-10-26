@@ -119,6 +119,21 @@ from broker.hdfcsecurities.streaming.hdfcsecurities_adapter import (
     HDFCSecuritiesWebSocketAdapter,
 )
 
+# Import the icici_adapter
+# ICICI is an optional plugin: a partial/missing install (e.g. an
+# incomplete file copy) must never prevent app startup. Missing adapter
+# only disables ICICI live feeds — orders, GTT, portfolio keep working.
+try:
+    from broker.icici.streaming.icici_adapter import IciciWebSocketAdapter
+except Exception as icici_adapter_error:  # pragma: no cover - install guard
+    IciciWebSocketAdapter = None
+
+    logger.warning(
+        "ICICI broker plugin incomplete — live feeds disabled (%s). "
+        "Re-copy the full broker/icici/ folder from the release.",
+        icici_adapter_error,
+    )
+
 # AliceBlue adapter will be loaded dynamically
 
 # Register adapters
@@ -152,6 +167,13 @@ register_adapter("arrow", ArrowWebSocketAdapter)
 register_adapter("rupeezy", RupeezyWebSocketAdapter)
 register_adapter("hdfcsky", HDFCSkyWebSocketAdapter)
 register_adapter("hdfcsecurities", HDFCSecuritiesWebSocketAdapter)
+
+if IciciWebSocketAdapter is not None:
+    register_adapter("icici", IciciWebSocketAdapter)
+else:
+    logger.warning(
+        "Skipping websocket adapter registration for broker 'icici'"
+    )
 
 # AliceBlue adapter will be registered dynamically when first used
 

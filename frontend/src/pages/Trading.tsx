@@ -1753,6 +1753,9 @@ function TradingWorkspace({ account }: { account: string | null }) {
                 // that answer has changed.
                 getChartContext={readChartContext}
                 chartRevision={chartRevision}
+                // The title combobox and the rows' chart buttons load the
+                // instrument into the focused pane, the watchlist's way.
+                onPick={sendToFocusedPane}
               />
             </Suspense>
           )}

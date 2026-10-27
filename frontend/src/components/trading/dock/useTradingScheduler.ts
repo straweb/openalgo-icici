@@ -93,7 +93,7 @@ export function useTradingScheduler(apiKey: string) {
       const key = `${optionsExchange}:${plan.spot.symbol}`
       const state = readDeployState()
       const ladder = state.books[key]
-      let orders: FireOrder[] = ladderFireOrders(ladder, state.lots, entry, plan)
+      let orders: FireOrder[] = ladderFireOrders(ladder, entry, plan)
       if (plan.strikes.length > 0) {
         const sideRows = plan.side === 'CE' ? (ladder?.ce ?? []) : (ladder?.pe ?? [])
         const missing = plan.strikes.filter(

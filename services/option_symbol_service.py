@@ -407,7 +407,7 @@ def construct_option_symbol(
         strike_str = str(strike)
 
     option_symbol = f"{base_symbol}{expiry_date}{strike_str}{option_type.upper()}"
-    logger.info(f"Constructed option symbol: {option_symbol}")
+    # logger.info(f"Constructed option symbol: {option_symbol}")
     return option_symbol
 
 

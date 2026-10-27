@@ -1,4 +1,4 @@
-import { firingRows, type DeployRow } from '@/lib/trading/deployPlan'
+import { firingRows, type DeployRow, type Sizing } from '@/lib/trading/deployPlan'
 import { levelCrosses, type LevelCross } from '@/lib/hedging/indexLevels'
 import type { ScheduledDeployPlan, ScheduledOrder } from '@/types/hedging'
 
@@ -34,12 +34,12 @@ export type Ladder = { ce: DeployRow[]; pe: DeployRow[] }
  * - `deployA`/`deployB`/`closeA`/`closeB` buy or sell the plan's side; with
  *   named strikes, only those strikes (the enabled ones among them); with an
  *   empty list, every enabled row of the side.
- * - Quantities read each row's own lots, falling back to the batch lots —
- *   the same arithmetic the quick actions run.
+ * - Quantities read each row's own lots — a row the ladder carries without
+ *   manual lots is sized by the panel's weight shares, and the engine fires
+ *   only the rows it can size from the ladder alone.
  */
 export function ladderFireOrders(
   ladder: Ladder | undefined,
-  batchLots: number,
   entry: Pick<ScheduledOrder, 'action'>,
   plan: ScheduledDeployPlan
 ): FireOrder[] {
@@ -47,7 +47,7 @@ export function ladderFireOrders(
   const orders: FireOrder[] = []
 
   if (entry.action === 'exitAll') {
-    for (const { row, qty } of firingRows([...ladder.ce, ...ladder.pe], batchLots)) {
+    for (const { row, qty } of firingRows([...ladder.ce, ...ladder.pe])) {
       orders.push({ symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty })
     }
     return orders
@@ -56,13 +56,38 @@ export function ladderFireOrders(
   const all = plan.side === 'CE' ? ladder.ce : ladder.pe
   const wanted =
     plan.strikes.length > 0 ? all.filter((row) => plan.strikes.includes(row.strike)) : all
-  for (const { row, qty } of firingRows(wanted, batchLots)) {
+  for (const { row, qty } of firingRows(wanted)) {
     orders.push({
       symbol: row.symbol,
       exchange: row.exchange,
       action: plan.optionAction,
       quantity: qty,
     })
+  }
+  return orders
+}
+
+/**
+ * A swap's orders: leave the side the trader is exiting first, then enter
+ * the opposite side. The from side sells every enabled row (the ladder is
+ * long-only, so leaving is always a SELL); the other side buys every
+ * enabled row. Exits lead — the proceeds are the entry's room. Sizing runs
+ * the same weight-share arithmetic the quick actions run.
+ */
+export function swapFireOrders(
+  ladder: Ladder | undefined,
+  fromSide: 'CE' | 'PE',
+  sizing?: Sizing
+): FireOrder[] {
+  if (!ladder) return []
+  const leaving = fromSide === 'CE' ? ladder.ce : ladder.pe
+  const entering = fromSide === 'CE' ? ladder.pe : ladder.ce
+  const orders: FireOrder[] = []
+  for (const { row, qty } of firingRows(leaving, sizing)) {
+    orders.push({ symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty })
+  }
+  for (const { row, qty } of firingRows(entering, sizing)) {
+    orders.push({ symbol: row.symbol, exchange: row.exchange, action: 'BUY', quantity: qty })
   }
   return orders
 }

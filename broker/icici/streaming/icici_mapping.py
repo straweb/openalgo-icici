@@ -233,6 +233,7 @@ def map_tick(
             "exchange": exchange,
             "token": str(token),
             "last_price": _float(_first(data, "last", "HightestPriceEver")),
+            "ltp": _float(_first(data, "last", "HightestPriceEver")),
             "volume": _int(_first(data, "ttq", "AndiOPVolume")),
             "total_buy_quantity": _int(data.get("TotalBuyQnt")),
             "total_sell_quantity": _int(data.get("TotalSellQnt")),
@@ -282,7 +283,7 @@ def map_tick(
     # --------------------------------------------------------------
     # Quote ticks (X.1!<token>)
     # --------------------------------------------------------------
-    ltp = _float(_first(data, "last", "ltp", "last_price"))
+    ltp = _float(_first(data, "last", "ltp", "last_price", "last_traded_price"))
 
     volume = _int(_first(data, "ttq", "volume", "total_quantity_traded"))
 
@@ -290,6 +291,7 @@ def map_tick(
         "symbol": symbol,
         "exchange": exchange,
         "token": str(token),
+        "ltp": ltp,
         "last_price": ltp,
         "volume": volume,
         "total_buy_quantity": _int(

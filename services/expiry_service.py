@@ -220,19 +220,32 @@ def get_expiry_dates(
         # downstream (expired contracts have no live orderbook).
         from datetime import datetime
 
+        # def parse_expiry_date(date_str):
+        #     """Parse '31-JUL-25' or '31JUL25' or '31-JUL-2025' to datetime; unparseable → max."""
+        #     try:
+        #         return datetime.strptime(date_str, "%d-%b-%y")
+        #     except ValueError:
+        #         try:
+        #             return datetime.strptime(date_str, "%d-%b-%Y")
+        #         except ValueError:
+        #             logger.warning(
+        #                 f"Could not parse expiry date: {date_str}, placing at end of list"
+        #             )
+        #             return datetime.max
         def parse_expiry_date(date_str):
-            """Parse '31-JUL-25' or '31-JUL-2025' to datetime; unparseable → max."""
-            try:
-                return datetime.strptime(date_str, "%d-%b-%y")
-            except ValueError:
+            """Parse '31-JUL-25', '31-JUL-2025' or '31JUL25'; unparseable -> max."""
+            text = str(date_str).strip().upper().replace("-", "").replace(" ", "")
+            for fmt in ("%d%b%y", "%d%b%Y"):
                 try:
-                    return datetime.strptime(date_str, "%d-%b-%Y")
+                    return datetime.strptime(text, fmt)
                 except ValueError:
-                    logger.warning(
-                        f"Could not parse expiry date: {date_str}, placing at end of list"
-                    )
-                    return datetime.max
+                    continue
 
+            logger.warning(
+                f"Could not parse expiry date: {date_str}, placing at end of list"
+            )
+
+            return datetime.max
         today = datetime.now().date()
         live_expiry_dates = [
             d for d in filtered_expiry_dates if parse_expiry_date(d).date() >= today

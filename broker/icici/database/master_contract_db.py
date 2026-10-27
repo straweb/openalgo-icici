@@ -106,7 +106,7 @@ def init_db():
 
 def delete_icici_tokens():
     db_session.query(SymToken).filter(
-        SymToken.exchange.in_(["NSE", "BSE", "NFO", "BFO", "MCX"])
+        SymToken.exchange.in_(["NSE", "BSE", "NSE_INDEX", "BSE_INDEX", "NFO", "BFO", "MCX"])
     ).delete(synchronize_session=False)
 
     db_session.commit()
@@ -159,29 +159,34 @@ def expiry_dd_mmm_yy(value) -> str:
         "%d/%m/%Y",
     ):
         try:
-            return datetime.strptime(value, fmt).strftime("%d%b%y").upper()
+            return datetime.strptime(value, fmt).strftime("%d-%b-%y").upper()
         except ValueError:
             continue
 
     return value.upper()
+def expiry_compact(value) -> str:
+    """Dash-free expiry (19OCT26) used only inside contract symbols."""
 
+    return expiry_dd_mmm_yy(value).replace("-", "")
 
 def strike_rupees(value) -> float:
     """
     ICICI stores strikes in paise-like integer form (2500000 -> 25000).
     Values below 100 are already rupees.
     """
-
+    """ICICI FONSE/FOBSE/MCX strikes are already in rupees (NIFTY 17350)."""
     try:
-        number = float(clean(value))
-
-        if abs(number) >= 100:
-            number /= 100
-
-        return number
-
+        return float(clean(value))
     except Exception:
         return 0.0
+
+    # try:
+    #     number = float(clean(value))
+    #     if abs(number) >= 100:
+    #         number /= 100
+    #     return number
+    # except Exception:
+    #     return 0.0
 
 
 def _format_strike(strike_value: float) -> str:
@@ -228,6 +233,8 @@ def parse_file(filename: str, content: bytes) -> list:
         exchange = "BFO"
     elif "MCX" in upper:
         exchange = "MCX"
+    elif "CDNSE" in upper:
+        return []
     elif "NSE" in upper:
         exchange = "NSE"
     elif "BSE" in upper:
@@ -261,26 +268,52 @@ def parse_file(filename: str, content: bytes) -> list:
 
                 if not brsymbol:
                     continue
-
+                series = columns[2] if len(columns) > 2 else ""
                 name = columns[3] if len(columns) > 3 else brsymbol
 
-                rows.append(
-                    {
-                        "symbol": f"{brsymbol}-EQ",
-                        "brsymbol": brsymbol,
-                        "name": name,
-                        "exchange": exchange,
-                        "brexchange": exchange,
-                        "token": token,
-                        "expiry": "",
-                        "strike": 0.0,
-                        "lotsize": 1,
-                        "instrumenttype": "EQ",
-                        "tick_size": 0.05,
-                    }
-                )
+                # Index rows (series "0"/"IDX") carry the Breeze stock code
+                # ("NIFTY 50") in the description column. Load as *_INDEX
+                # so get_br_symbol("NIFTY", "NSE_INDEX") resolves.
+                if series in ("0", "IDX"):
+                    rows.append(
+                        {
+                            "symbol": brsymbol.upper(),
+                            # "brsymbol": clean(name) or brsymbol,
+                            "brsymbol": brsymbol,
+                            "name": name,
+                            "exchange": f"{exchange}_INDEX",
+                            "brexchange": f"{exchange}_INDEX",
+                            "token": token,
+                            "expiry": "",
+                            "strike": 0.0,
+                            "lotsize": 1,
+                            "instrumenttype": "INDEX",
+                            "tick_size": 0.05,
+                        }
+                    )
 
-                continue
+                    continue
+
+
+                # name = columns[3] if len(columns) > 3 else brsymbol
+
+                # rows.append(
+                #     {
+                #         "symbol": f"{brsymbol}-EQ",
+                #         "brsymbol": brsymbol,
+                #         "name": name,
+                #         "exchange": exchange,
+                #         "brexchange": exchange,
+                #         "token": token,
+                #         "expiry": "",
+                #         "strike": 0.0,
+                #         "lotsize": 1,
+                #         "instrumenttype": "EQ",
+                #         "tick_size": 0.05,
+                #     }
+                # )
+
+                # continue
 
             # ----------------------------------------------------------
             # NFO / BFO derivatives
@@ -296,8 +329,11 @@ def parse_file(filename: str, content: bytes) -> list:
                 option_type = columns[6]
 
                 symbol = contract_symbol(
-                    underlying, product_type, expiry, strike, option_type
+                    underlying, product_type, expiry_compact(columns[4]), strike, option_type
                 )
+                # symbol = contract_symbol(
+                #     underlying, product_type, expiry, strike, option_type
+                # )
 
                 if not symbol:
                     continue
@@ -308,12 +344,16 @@ def parse_file(filename: str, content: bytes) -> list:
                     else ("CE" if "C" in option_type.upper() else "PE")
                 )
 
-                lotsize = parse_int(columns[8], 1) if len(columns) > 8 else 1
+                # lotsize = parse_int(columns[8], 1) if len(columns) > 8 else 1
 
+                # tick_size = (
+                #     parse_float(columns[9], 0.05) if len(columns) > 9 else 0.05
+                # )
+
+                lotsize = parse_int(columns[27], 1) if len(columns) > 27 else 1
                 tick_size = (
-                    parse_float(columns[9], 0.05) if len(columns) > 9 else 0.05
+                    parse_float(columns[28], 0.05) if len(columns) > 28 else 0.05
                 )
-
                 rows.append(
                     {
                         "symbol": symbol,
@@ -341,13 +381,19 @@ def parse_file(filename: str, content: bytes) -> list:
 
                 underlying = columns[2]
                 product_type = columns[3]
-                expiry = expiry_dd_mmm_yy(columns[7])
+                # expiry = expiry_dd_mmm_yy(columns[7])
+                # strike = columns[9]
+                # option_type = columns[8]
+                expiry = expiry_dd_mmm_yy(columns[7])          # expiry column: 19-NOV-26
                 strike = columns[9]
                 option_type = columns[8]
 
                 symbol = contract_symbol(
-                    underlying, product_type, expiry, strike, option_type
+                    underlying, product_type, expiry_compact(columns[7]), strike, option_type
                 )
+                # symbol = contract_symbol(
+                #     underlying, product_type, expiry, strike, option_type
+                # )
 
                 if not symbol:
                     continue
@@ -358,7 +404,8 @@ def parse_file(filename: str, content: bytes) -> list:
                     else ("CE" if "C" in option_type.upper() else "PE")
                 )
 
-                lotsize = parse_int(columns[10], 1) if len(columns) > 10 else 1
+                # lotsize = parse_int(columns[10], 1) if len(columns) > 10 else 1
+                lotsize = parse_int(columns[6], 1) if len(columns) > 6 else 1
 
                 rows.append(
                     {

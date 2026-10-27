@@ -31,6 +31,9 @@
  */
 
 import {
+  Badge
+} from '@/components/ui/badge'
+import {
   CalendarClock,
   CirclePlus,
   Layers,
@@ -38,6 +41,7 @@ import {
   RefreshCw,
   Rocket,
   SearchIcon,
+  Wallet,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { optionChainApi } from '@/api/option-chain'
@@ -67,7 +71,6 @@ import {
   bookKey,
   chainLtp,
   constructedRows,
-  defaultLotSize,
   defaultStrikeStep,
   equalSplitSide,
   ensureSideWeights,
@@ -79,12 +82,16 @@ import {
   rowQty,
   slideSideWeight,
   stockRowFromSearch,
+  toggleSideRow,
+  usableSessionCapital,
   type DeployBook,
+  type DeployCapitalSource,
   type DeployRow,
   type RowSide,
   type Sizing,
   writeDeployState,
 } from '@/lib/trading/deployPlan'
+import { openDepthTab } from '@/lib/trading/depthBus'
 import {
   armCloseRows,
   buildDeployPlan,
@@ -102,8 +109,7 @@ import { cn } from '@/lib/utils'
 import { PANEL_HEADER, PanelShell } from './panelShell'
 import { showToast } from '@/utils/toast'
 
-/** The hedging panel's one-tap ladder, shortened to fit a side panel. */
-const OFFSET_BUTTONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+/** Polling cadences: chain, quotes, funds and the position/order books. */
 const CHAIN_POLL_MS = 5000
 const QUOTE_POLL_MS = 4000
 const FUNDS_POLL_MS = 15000
@@ -162,10 +168,6 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   const [chain, setChain] = useState<OptionChainResponse | null>(null)
   const [expiry, setExpiry] = useState('')
   const [expiries, setExpiries] = useState<string[]>([])
-  const [nOpen, setNOpen] = useState(false)
-  const [nCount, setNCount] = useState(5)
-  const [custom, setCustom] = useState('')
-  const [customOpen, setCustomOpen] = useState(false)
   const [busy, setBusy] = useState<Record<BusyKey, boolean>>(NO_BUSY)
   const [expiryNotice, setExpiryNotice] = useState<string | null>(null)
   const [expiryFailed, setExpiryFailed] = useState(false)
@@ -244,6 +246,18 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
       return next
     })
   }, [])
+
+  /* ── session capital: the title chip's popbox ─────────────────────────── */
+  const saveCapital = useCallback(
+    (patch: Partial<Pick<DeployBook, 'capitalSource' | 'capitalFixed' | 'capitalPercent'>>) => {
+      setState((previous) => {
+        const next: DeployBook = { ...previous, ...patch }
+        writeDeployState(next)
+        return next
+      })
+    },
+    []
+  )
 
   /* ── expiries, then the chain ───────────────────────────────────── */
   const loadExpiries = useCallback(async () => {
@@ -469,13 +483,12 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     (row: DeployRow) => quotes[row.symbol] ?? chainLtp(chain, row.symbol),
     [quotes, chain]
   )
-  const sizing = useMemo(() => ({ capital: funds, ltpOf }), [funds, ltpOf])
-  /** One lot (or one share) of the bound underlying, in rupees, for the title. */
-  const titleLotSize = optionsMode
-    ? chain?.chain[0]?.ce?.lotsize ||
-      chain?.chain[0]?.pe?.lotsize ||
-      defaultLotSize(underlying)
-    : 1
+  /** The session capital the weight shares divide — the chip's number. */
+  const usable = useMemo(
+    () => usableSessionCapital(state, funds),
+    [state.capitalSource, state.capitalFixed, state.capitalPercent, funds]
+  )
+  const sizing = useMemo(() => ({ capital: usable, ltpOf }), [usable, ltpOf])
 
   /* ── add strips ───────────────────────────────────────────────────────── */
   const addStrikes = useCallback(
@@ -511,25 +524,6 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   // below ATM, exactly the hedging add-strip's behaviour — named in the
   // option's own terms, a call goes OTM above the spot, a put goes ITM.
   const dirLabel = side === 'CE' ? (dir === 1 ? 'OTM' : 'ITM') : dir === 1 ? 'ITM' : 'OTM'
-
-  const offsetStrikes = (offsets: number[]) => {
-    if (!atm || !interval) return []
-    return offsets.map((offset) => atm + offset * interval * dir)
-  }
-
-  const addN = () => {
-    const wanted = strikesForPick({ mode: dir === 1 ? 'above' : 'below', count: nCount }, atm, interval)
-    addStrikes(wanted)
-    setNOpen(false)
-  }
-
-  const addCustom = () => {
-    const strike = Number(custom)
-    if (!Number.isFinite(strike) || strike <= 0) return
-    addStrikes([strike])
-    setCustom('')
-    setCustomOpen(false)
-  }
 
   const addStock = (hit: { symbol: string; exchange: string; name?: string; lotsize?: number }) => {
     if (state.stocks.some((row) => row.symbol === hit.symbol && row.exchange === hit.exchange)) {
@@ -821,6 +815,32 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     [state.stocks, ladder, patchRows, patchStocks]
   )
 
+  /**
+   * Quit: flatten the broker position the row carries — the position's own
+   * quantity, not the row's planned size, so a partly-filled or hand-added
+   * position still goes flat. The button only exists while a position is
+   * open, and the guard here covers the poll racing a close.
+   */
+  const quitRow = useCallback(
+    (where: RowSide, symbol: string) => {
+      const row =
+        where === 'EQ'
+          ? state.stocks.find((r) => r.symbol === symbol)
+          : ladder[where === 'CE' ? 'ce' : 'pe'].find((r) => r.symbol === symbol)
+      if (!row) return
+      const position = positions.get(`${row.exchange}:${row.symbol}`)
+      const qty = position ? Math.abs(position.quantity) : 0
+      if (qty <= 0) {
+        showToast.warning('Quit: no open position on this row')
+        return
+      }
+      void placeOrders([
+        { symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty },
+      ])
+    },
+    [state.stocks, ladder, positions, placeOrders]
+  )
+
   const btn = (busyKey: BusyKey, label: string, tone: 'green' | 'red' | 'amber' | 'sky', onClick: () => void, title?: string, disabled?: boolean) => (
     <Button
       size="sm"
@@ -883,24 +903,22 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
             </button>
           ))}
         </div>
-        <span
-          className="ml-auto shrink-0 font-mono text-[10px] tabular-nums"
-          title={
-            optionsMode
-              ? 'The underlying LTP and the rupees one lot of it carries'
-              : 'The LTP and the rupees one share carries'
-          }
-        >
-          {underlyingLtp != null
-            ? underlyingLtp.toLocaleString('en-IN', { maximumFractionDigits: 2 })
-            : '—'}
-          {underlyingLtp != null && (
-            <span className="ml-1 text-muted-foreground">
-              · {optionsMode ? '1 lot' : '1 sh'} ₹
-              {(underlyingLtp * titleLotSize).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
-            </span>
-          )}
-        </span>
+        {/* Session capital: the chip the hedging page ships, pointed at the
+            pool this panel's percent rows divide. The ltp and the one-lot
+            rupee amount moved onto the rows themselves — the chip's place
+            is the mode toggle's, the title stays a control strip. */}
+        <div className="ml-auto shrink-0">
+          <CapitalChip
+            cash={funds}
+            usable={usable}
+            source={state.capitalSource}
+            fixed={state.capitalFixed}
+            percent={state.capitalPercent}
+            onSource={(source) => saveCapital({ capitalSource: source })}
+            onFixed={(value) => saveCapital({ capitalFixed: value })}
+            onPercent={(value) => saveCapital({ capitalPercent: value })}
+          />
+        </div>
         {optionsMode && (
           <Select value={expiry} onValueChange={setExpiry} disabled={expiries.length === 0}>
             <SelectTrigger className="h-6 w-[104px] shrink-0 px-1.5 text-[10px]">
@@ -942,112 +960,17 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
 
       {/* ── Add strip: strikes for options, stock search otherwise ──────── */}
       {optionsMode ? (
-        <div className="flex shrink-0 items-center gap-1 border-b bg-muted/30 px-2 py-1">
-          <div className="flex overflow-hidden rounded border">
-            {(['CE', 'PE'] as const).map((value) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => setSide(value)}
-                className={cn(
-                  'px-2 py-0.5 text-[10px] font-semibold transition-colors',
-                  side === value
-                    ? value === 'CE'
-                      ? 'bg-emerald-600 text-white'
-                      : 'bg-red-600 text-white'
-                    : 'bg-background text-muted-foreground hover:bg-accent'
-                )}
-              >
-                {value}
-              </button>
-            ))}
-          </div>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-5 px-1.5 text-[10px]"
-            disabled={!atm}
-            onClick={() => addStrikes([atm as number])}
-            title="Add ATM strike"
-          >
-            ATM
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-5 w-9 px-0 text-[10px] font-bold"
-            onClick={() => setDir((value) => (value === 1 ? -1 : 1))}
-            title={`Picks go ${dir === 1 ? 'above' : 'below'} ATM — ${dirLabel} for ${side}`}
-          >
-            {dirLabel}
-          </Button>
-          {OFFSET_BUTTONS.map((offset) => (
-            <Button
-              key={offset}
-              size="sm"
-              variant="outline"
-              className="h-5 min-w-5 px-1 text-[10px]"
-              disabled={!atm || !interval}
-              onClick={() => addStrikes(offsetStrikes([offset]))}
-              title={`Add ${dirLabel} ${offset} (${dir === 1 ? 'above' : 'below'} ATM)`}
-            >
-              {offset}
-            </Button>
-          ))}
-          <Popover open={nOpen} onOpenChange={setNOpen}>
-            <PopoverTrigger asChild>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-5 px-1.5 text-[10px] font-semibold"
-                disabled={!atm || !interval}
-                title="Add N strikes from ATM"
-              >
-                ×N
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-44 p-2" align="end">
-              <p className="mb-1 text-[10px] text-muted-foreground">
-                {nCount} strikes {dir === 1 ? 'above' : 'below'} ATM
-              </p>
-              <Input
-                autoFocus
-                type="number"
-                min={1}
-                max={10}
-                value={nCount}
-                onChange={(e) =>
-                  setNCount(Math.min(10, Math.max(1, Math.floor(Number(e.target.value) || 1))))
-                }
-                className="h-7 text-xs"
-              />
-              <Button size="sm" className="mt-1 h-6 w-full text-[11px]" onClick={addN}>
-                Add {nCount} strike{nCount === 1 ? '' : 's'}
-              </Button>
-            </PopoverContent>
-          </Popover>
-          <Popover open={customOpen} onOpenChange={setCustomOpen}>
-            <PopoverTrigger asChild>
-              <Button size="sm" variant="outline" className="ml-auto h-5 px-1" title="Custom strike">
-                <CirclePlus className="h-3 w-3" />
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-40 p-2" align="end">
-              <Input
-                autoFocus
-                type="number"
-                value={custom}
-                onChange={(e) => setCustom(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && addCustom()}
-                placeholder="Strike…"
-                className="h-7 text-xs"
-              />
-              <Button size="sm" className="mt-1 h-6 w-full text-[11px]" onClick={addCustom}>
-                Add strike
-              </Button>
-            </PopoverContent>
-          </Popover>
-        </div>
+        <OffsetStrip
+          side={side}
+          onSide={setSide}
+          atm={atm}
+          interval={interval}
+          dir={dir}
+          onDir={setDir}
+          dirLabel={dirLabel}
+          onAddStrikes={addStrikes}
+          className="flex shrink-0 items-center gap-1 border-b bg-muted/30 px-2 py-1"
+        />
       ) : (
         <div className="flex shrink-0 items-center gap-1 border-b bg-muted/30 px-2 py-1">
           <span className="text-[10px] text-muted-foreground">
@@ -1107,7 +1030,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                 rows={ladder.ce}
                 atm={atm}
                 interval={interval}
-                capital={funds}
+                capital={usable}
                 quotes={quotes}
                 chain={chain}
                 underlying={underlying}
@@ -1123,14 +1046,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                     return next
                   })
                 }
-                onToggle={(symbol) =>
-                  updateRow('CE', symbol, (row) => {
-                    const toggled = { ...row, enabled: !row.enabled }
-                    return normalizeSideWeights(
-                      ladder.ce.map((r) => (r.symbol === symbol ? toggled : r))
-                    ).find((r) => r.symbol === symbol) ?? toggled
-                  })
-                }
+                onToggle={(symbol) => patchRows('CE', toggleSideRow(ladder.ce, symbol))}
                 onWeight={(symbol, value) =>
                   patchRows('CE', slideSideWeight(ladder.ce, symbol, value))
                 }
@@ -1159,6 +1075,11 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                   void placeOrders([{ symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty }])
                 }}
                 onChart={(row) => onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })}
+                onQuit={(symbol) => quitRow('CE', symbol)}
+                onDepth={(symbol) => {
+                  const row = ladder.ce.find((r) => r.symbol === symbol)
+                  if (row) openDepthTab({ symbol: row.symbol, exchange: row.exchange })
+                }}
               />
             </ResizablePanel>
             <ResizableHandle withHandle />
@@ -1168,7 +1089,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                 rows={ladder.pe}
                 atm={atm}
                 interval={interval}
-                capital={funds}
+                capital={usable}
                 quotes={quotes}
                 chain={chain}
                 underlying={underlying}
@@ -1184,14 +1105,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                     return next
                   })
                 }
-                onToggle={(symbol) =>
-                  updateRow('PE', symbol, (row) => {
-                    const toggled = { ...row, enabled: !row.enabled }
-                    return normalizeSideWeights(
-                      ladder.pe.map((r) => (r.symbol === symbol ? toggled : r))
-                    ).find((r) => r.symbol === symbol) ?? toggled
-                  })
-                }
+                onToggle={(symbol) => patchRows('PE', toggleSideRow(ladder.pe, symbol))}
                 onWeight={(symbol, value) =>
                   patchRows('PE', slideSideWeight(ladder.pe, symbol, value))
                 }
@@ -1220,6 +1134,11 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                   void placeOrders([{ symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty }])
                 }}
                 onChart={(row) => onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })}
+                onQuit={(symbol) => quitRow('PE', symbol)}
+                onDepth={(symbol) => {
+                  const row = ladder.pe.find((r) => r.symbol === symbol)
+                  if (row) openDepthTab({ symbol: row.symbol, exchange: row.exchange })
+                }}
               />
             </ResizablePanel>
           </ResizablePanelGroup>
@@ -1238,7 +1157,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                 ltp={ltpOf(row)}
                 accent={null}
                 offsetLabel={null}
-                capital={funds}
+                capital={usable}
                 pnl={rowPnl(row, positions, sizing)}
                 inChart={charted?.symbol === row.symbol}
                 hasPosition={positions.has(`${row.exchange}:${row.symbol}`)}
@@ -1254,18 +1173,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                     return next
                   })
                 }
-                onToggle={() =>
-                  patchStocks(
-                    equalSplitSide(
-                      normalizeSideWeights(
-                        state.stocks.map((r) =>
-                          r.symbol === row.symbol ? { ...r, enabled: !r.enabled } : r
-                        )
-                      ),
-                      'EQ'
-                    )
-                  )
-                }
+                onToggle={() => patchStocks(toggleSideRow(state.stocks, row.symbol))}
                 onWeight={(value) =>
                   patchStocks(slideSideWeight(state.stocks, row.symbol, value))
                 }
@@ -1292,6 +1200,8 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                   ])
                 }}
                 onChart={() => onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })}
+                onQuit={() => quitRow('EQ', row.symbol)}
+                onDepth={() => openDepthTab({ symbol: row.symbol, exchange: row.exchange })}
               />
             ))}
           </div>
@@ -1300,6 +1210,22 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
 
       {/* ── Action bar: static at the bottom ────────────────────────────── */}
       <div className="shrink-0 border-t bg-muted/30 px-2 py-1.5">
+        {/* The strike picker rides above the deploy buttons too — the trader
+            arming a side from the bottom does not reach back up to the top
+            strip to add the next offset. */}
+        {optionsMode && (
+          <OffsetStrip
+            side={side}
+            onSide={setSide}
+            atm={atm}
+            interval={interval}
+            dir={dir}
+            onDir={setDir}
+            dirLabel={dirLabel}
+            onAddStrikes={addStrikes}
+            className="mb-1 flex shrink-0 items-center gap-1 border-b bg-muted/30 pb-1"
+          />
+        )}
         {optionsMode ? (
           <div className="flex items-center gap-1">
             {btn('deployCE', 'Deploy CE', 'green', () => void fire('BUY', 'CE', 'deployCE', 'Deploy CE'))}
@@ -1503,6 +1429,8 @@ function SidePane(props: {
   onRemove(symbol: string): void
   onFire(symbol: string, action: 'BUY' | 'SELL'): void
   onExit(symbol: string): void
+  onQuit(symbol: string): void
+  onDepth(symbol: string): void
   onChart(row: DeployRow): void
 }) {
   const ltpOfRow = useCallback(
@@ -1561,10 +1489,287 @@ function SidePane(props: {
             onRemove={() => props.onRemove(row.symbol)}
             onFire={(action) => props.onFire(row.symbol, action)}
             onExit={() => props.onExit(row.symbol)}
+            onQuit={() => props.onQuit(row.symbol)}
+            onDepth={() => props.onDepth(row.symbol)}
             onChart={() => props.onChart(row)}
           />
         ))}
       </div>
     </div>
+  )
+}
+
+/* ── the strike picker, shared by the top strip and the action bar ────────── */
+
+const OFFSET_BUTTONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+/**
+ * The CE/PE · ATM · OTM/ITM · 1..10 · ×N · custom picker. It renders twice —
+ * the add strip under the title and, again, directly above the deploy
+ * buttons — so arming a side from the bottom never reaches back up. Each
+ * copy owns its two popovers (×N and custom strike); the side, the
+ * direction and the add itself are shared, so both copies always agree on
+ * what they would add.
+ */
+function OffsetStrip(props: {
+  side: 'CE' | 'PE'
+  onSide(side: 'CE' | 'PE'): void
+  atm: number | null
+  interval: number
+  dir: 1 | -1
+  onDir(dir: 1 | -1): void
+  dirLabel: string
+  onAddStrikes(strikes: number[]): void
+  className: string
+}) {
+  const [nOpen, setNOpen] = useState(false)
+  const [nCount, setNCount] = useState(5)
+  const [customOpen, setCustomOpen] = useState(false)
+  const [custom, setCustom] = useState('')
+  const { atm, interval, dir, side } = props
+
+  const addN = () => {
+    const wanted = strikesForPick(
+      { mode: dir === 1 ? 'above' : 'below', count: nCount },
+      atm,
+      interval
+    )
+    props.onAddStrikes(wanted)
+    setNOpen(false)
+  }
+
+  const addCustom = () => {
+    const strike = Number(custom)
+    if (!Number.isFinite(strike) || strike <= 0) return
+    props.onAddStrikes([strike])
+    setCustom('')
+    setCustomOpen(false)
+  }
+
+  return (
+    <div className={props.className}>
+      <div className="flex overflow-hidden rounded border">
+        {(['CE', 'PE'] as const).map((value) => (
+          <button
+            key={value}
+            type="button"
+            onClick={() => props.onSide(value)}
+            className={cn(
+              'px-2 py-0.5 text-[10px] font-semibold transition-colors',
+              side === value
+                ? value === 'CE'
+                  ? 'bg-emerald-600 text-white'
+                  : 'bg-red-600 text-white'
+                : 'bg-background text-muted-foreground hover:bg-accent'
+            )}
+          >
+            {value}
+          </button>
+        ))}
+      </div>
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-5 px-1.5 text-[10px]"
+        disabled={!atm}
+        onClick={() => props.onAddStrikes([atm as number])}
+        title="Add ATM strike"
+      >
+        ATM
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-5 w-9 px-0 text-[10px] font-bold"
+        onClick={() => props.onDir(dir === 1 ? -1 : 1)}
+        title={`Picks go ${dir === 1 ? 'above' : 'below'} ATM — ${props.dirLabel} for ${side}`}
+      >
+        {props.dirLabel}
+      </Button>
+      {OFFSET_BUTTONS.map((offset) => (
+        <Button
+          key={offset}
+          size="sm"
+          variant="outline"
+          className="h-5 min-w-5 px-1 text-[10px]"
+          disabled={!atm || !interval}
+          onClick={() => {
+            if (atm == null) return
+            props.onAddStrikes([atm + offset * interval * dir])
+          }}
+          title={`Add ${props.dirLabel} ${offset} (${dir === 1 ? 'above' : 'below'} ATM)`}
+        >
+          {offset}
+        </Button>
+      ))}
+      <Popover open={nOpen} onOpenChange={setNOpen}>
+        <PopoverTrigger asChild>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-5 px-1.5 text-[10px] font-semibold"
+            disabled={!atm || !interval}
+            title="Add N strikes from ATM"
+          >
+            ×N
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent className="w-44 p-2" align="end">
+          <p className="mb-1 text-[10px] text-muted-foreground">
+            {nCount} strikes {dir === 1 ? 'above' : 'below'} ATM
+          </p>
+          <Input
+            autoFocus
+            type="number"
+            min={1}
+            max={10}
+            value={nCount}
+            onChange={(e) =>
+              setNCount(Math.min(10, Math.max(1, Math.floor(Number(e.target.value) || 1))))
+            }
+            className="h-7 text-xs"
+          />
+          <Button size="sm" className="mt-1 h-6 w-full text-[11px]" onClick={addN}>
+            Add {nCount} strike{nCount === 1 ? '' : 's'}
+          </Button>
+        </PopoverContent>
+      </Popover>
+      <Popover open={customOpen} onOpenChange={setCustomOpen}>
+        <PopoverTrigger asChild>
+          <Button size="sm" variant="outline" className="ml-auto h-5 px-1" title="Custom strike">
+            <CirclePlus className="h-3 w-3" />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent className="w-40 p-2" align="end">
+          <Input
+            autoFocus
+            type="number"
+            value={custom}
+            onChange={(e) => setCustom(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && addCustom()}
+            placeholder="Strike…"
+            className="h-7 text-xs"
+          />
+          <Button size="sm" className="mt-1 h-6 w-full text-[11px]" onClick={addCustom}>
+            Add strike
+          </Button>
+        </PopoverContent>
+      </Popover>
+    </div>
+  )
+}
+
+/* ── the session capital chip ─────────────────────────────────────────────── */
+
+/** Rupees the way the hedging terminal prints them: ₹12,34,567. */
+const fmtChipMoney = (value: number): string =>
+  value.toLocaleString('en-IN', { maximumFractionDigits: 0 })
+
+/**
+ * The hedging page's Session capital chip, sized for the panel's title:
+ * the usable figure on the button, and inside the popbox the two sources —
+ * a fixed rupee amount clamped to cash, or a percent of cash on a slider.
+ * The choice persists in the deploy book, so a reload keeps the trader's
+ * capital exactly as they left it.
+ */
+function CapitalChip(props: {
+  /** Available cash from the funds snapshot. */
+  cash: number
+  /** The usable capital the percent rows divide (parent-computed). */
+  usable: number
+  source: DeployCapitalSource
+  fixed: number
+  percent: number
+  onSource(source: DeployCapitalSource): void
+  onFixed(value: number): void
+  onPercent(value: number): void
+}) {
+  const overCash = props.source === 'fixed' && props.cash > 0 && props.fixed > props.cash
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          className="h-6 gap-1 px-1.5 text-[10px]"
+          title="Session capital — what the percent rows divide"
+        >
+          <Wallet className="h-3 w-3" />
+          Cap <span className="font-mono tabular-nums">₹{fmtChipMoney(props.usable)}</span>
+          {props.source === 'percent' && (
+            <Badge variant="secondary" className="px-1 py-0 text-[8px]">
+              {props.percent}%
+            </Badge>
+          )}
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-64 p-3" align="end">
+        <p className="mb-2 text-[11px] font-semibold">Session capital</p>
+        <div className="mb-2 flex gap-1">
+          <Button
+            size="sm"
+            variant={props.source === 'fixed' ? 'default' : 'outline'}
+            className="h-6 flex-1 text-[10px]"
+            onClick={() => props.onSource('fixed')}
+          >
+            Fixed ₹
+          </Button>
+          <Button
+            size="sm"
+            variant={props.source === 'percent' ? 'default' : 'outline'}
+            className="h-6 flex-1 text-[10px]"
+            onClick={() => props.onSource('percent')}
+          >
+            % of cash
+          </Button>
+        </div>
+        {props.source === 'fixed' ? (
+          <div>
+            <Input
+              type="number"
+              value={props.fixed || ''}
+              min={0}
+              step={1000}
+              max={props.cash > 0 ? props.cash : undefined}
+              onChange={(e) => props.onFixed(Math.max(0, Number(e.target.value) || 0))}
+              className="h-7 text-xs"
+              aria-label="Fixed capital"
+            />
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              {props.cash > 0
+                ? `Up to cash ₹${fmtChipMoney(props.cash)}`
+                : 'Cash unknown until funds load'}
+            </p>
+            {overCash && (
+              <p className="mt-0.5 text-[10px] text-amber-600">
+                Above available cash — sizing uses the clamped amount.
+              </p>
+            )}
+          </div>
+        ) : (
+          <label className="block">
+            <span className="text-[10px] text-muted-foreground">
+              {props.percent}% of cash
+              {props.cash > 0 ? ` = ₹${fmtChipMoney((props.cash * props.percent) / 100)}` : ''}
+            </span>
+            <input
+              type="range"
+              min={1}
+              max={100}
+              value={props.percent}
+              onChange={(e) => props.onPercent(Number(e.target.value))}
+              className="mt-1 w-full accent-primary"
+            />
+          </label>
+        )}
+        <p className="mt-2 border-t pt-2 text-[11px]">
+          Usable{' '}
+          <span className="font-mono font-semibold">₹{fmtChipMoney(props.usable)}</span>
+        </p>
+        <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
+          Each side's enabled rows split the usable capital by their % weights — the sliders keep
+          every side summing to 100.
+        </p>
+      </PopoverContent>
+    </Popover>
   )
 }

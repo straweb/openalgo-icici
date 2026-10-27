@@ -84,6 +84,38 @@ export const LAYOUTS: LayoutPreset[] = [
     areas: '"a b c d" "e f g h"',
     cells: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
   },
+  {
+    id: 'grid2x3',
+    label: '2 × 3',
+    cols: '1fr 1fr',
+    rows: '1fr 1fr 1fr',
+    areas: '"a b" "c d" "e f"',
+    cells: ['a', 'b', 'c', 'd', 'e', 'f'],
+  },
+  {
+    id: 'grid2x4',
+    label: '2 × 4',
+    cols: '1fr 1fr',
+    rows: '1fr 1fr 1fr 1fr',
+    areas: '"a b" "c d" "e f" "g h"',
+    cells: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
+  },
+  {
+    id: 'grid2x5',
+    label: '2 × 5',
+    cols: '1fr 1fr',
+    rows: '1fr 1fr 1fr 1fr 1fr',
+    areas: '"a b" "c d" "e f" "g h" "i j"',
+    cells: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'],
+  },
+  {
+    id: 'grid5x2',
+    label: '5 × 2',
+    cols: '1fr 1fr 1fr 1fr 1fr',
+    rows: '1fr 1fr',
+    areas: '"a b c d e" "f g h i j"',
+    cells: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'],
+  },
 ]
 
 /**

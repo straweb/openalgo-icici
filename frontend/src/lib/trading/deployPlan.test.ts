@@ -8,6 +8,7 @@ import {
   equalSplitSide,
   ensureSideWeights,
   firingRows,
+  fnoBaseSymbol,
   hydrateDeployState,
   normalizeSideWeights,
   reconcileConstructed,
@@ -18,6 +19,8 @@ import {
   slideSideWeight,
   stockRowFromSearch,
   autoLots,
+  toggleSideRow,
+  usableSessionCapital,
 } from './deployPlan'
 import type { OptionChainResponse } from '@/types/option-chain'
 
@@ -198,6 +201,108 @@ describe('the weight engine', () => {
     const fixed = ensureSideWeights(state)
     expect(fixed.books[key]?.ce.map((r) => r.weight)).toEqual([50, 50])
     expect(fixed.books[key]?.pe).toEqual([])
+  })
+
+  it('sliding off a 100% row re-levels the collapsed others evenly', () => {
+    // One row at 100 collapses the rest to 0; a proportional re-level of
+    // zeros stays zero, so the remainder must split evenly instead.
+    const rows = equalSplitSide(rowsFromStrikes(chain, 'CE', [24400, 24500]).rows, 'CE')
+    const pinned = slideSideWeight(rows, rows[0].symbol, 100)
+    expect(pinned.filter((r) => r.enabled).map((r) => r.weight)).toEqual([100, 0])
+    const relaxed = slideSideWeight(pinned, rows[0].symbol, 40)
+    const total = relaxed.reduce((sum, r) => sum + r.weight, 0)
+    expect(Math.round(total * 10) / 10).toBe(100)
+    const others = relaxed.filter((r) => r.symbol !== rows[0].symbol).map((r) => r.weight)
+    expect(others).toEqual([60])
+  })
+
+  it('toggleSideRow hands a weightless row an even share and keeps the side at 100', () => {
+    const rows = equalSplitSide(rowsFromStrikes(chain, 'CE', [24400, 24500]).rows, 'CE')
+    // A fresh row from the add strip carries weight 0 and starts disabled.
+    const fresh = {
+      symbol: 'NIFTY28OCT2624600CE',
+      exchange: 'NFO',
+      kind: 'option' as const,
+      strike: 24600,
+      optionType: 'CE' as const,
+      lotSize: 75,
+      enabled: false,
+      lots: 0,
+      weight: 0,
+      entry: null,
+      target: null,
+      stoploss: null,
+    }
+    const all = [...rows, fresh]
+    const enabled = toggleSideRow(all, fresh.symbol)
+    const total = enabled.filter((r) => r.enabled).reduce((sum, r) => sum + r.weight, 0)
+    expect(Math.round(total * 10) / 10).toBe(100)
+    expect(enabled.find((r) => r.symbol === fresh.symbol)?.weight).toBeGreaterThan(0)
+    // The rows that carried the side shrank but stay positive.
+    expect(
+      enabled
+        .filter((r) => r.symbol !== fresh.symbol)
+        .every((r) => r.weight > 0 && r.weight < 50)
+    ).toBe(true)
+  })
+
+  it('toggleSideRow renormalises when a row is switched off', () => {
+    const rows = equalSplitSide(rowsFromStrikes(chain, 'CE', [24400, 24500]).rows, 'CE')
+    const off = toggleSideRow(rows, rows[0].symbol)
+    expect(off.find((r) => r.symbol === rows[0].symbol)?.enabled).toBe(false)
+    expect(off.find((r) => r.symbol === rows[1].symbol)?.weight).toBe(100)
+    const backOn = toggleSideRow(off, rows[0].symbol)
+    const total = backOn.filter((r) => r.enabled).reduce((sum, r) => sum + r.weight, 0)
+    expect(Math.round(total * 10) / 10).toBe(100)
+  })
+})
+
+describe('session capital', () => {
+  it('percent mode divides the cash share; 100% reads the whole snapshot', () => {
+    const state = defaultDeployState()
+    expect(usableSessionCapital(state, 250000)).toBe(250000)
+    state.capitalPercent = 25
+    expect(usableSessionCapital(state, 250000)).toBe(62500)
+  })
+
+  it('fixed mode clamps to cash and survives a missing snapshot', () => {
+    const state = defaultDeployState()
+    state.capitalSource = 'fixed'
+    state.capitalFixed = 400000
+    expect(usableSessionCapital(state, 250000)).toBe(250000)
+    expect(usableSessionCapital(state, 0)).toBe(400000)
+    expect(usableSessionCapital(state, Number.NaN)).toBe(400000)
+  })
+
+  it('the capital choice round-trips through hydrate', () => {
+    const state = defaultDeployState()
+    state.capitalSource = 'fixed'
+    state.capitalFixed = 123000
+    state.capitalPercent = 40
+    const back = hydrateDeployState(JSON.parse(JSON.stringify(state)))
+    expect(back.capitalSource).toBe('fixed')
+    expect(back.capitalFixed).toBe(123000)
+    expect(back.capitalPercent).toBe(40)
+    // And a snapshot from before the chip existed keeps the default.
+    const legacy = hydrateDeployState({ books: {}, stocks: [] })
+    expect(legacy.capitalSource).toBe('percent')
+    expect(legacy.capitalPercent).toBe(100)
+  })
+})
+
+describe('fnoBaseSymbol', () => {
+  it('strips the option and future suffixes', () => {
+    expect(fnoBaseSymbol('NIFTY27OCT2624500CE')).toBe('NIFTY')
+    expect(fnoBaseSymbol('BANKNIFTY24DEC2552000PE')).toBe('BANKNIFTY')
+    expect(fnoBaseSymbol('NIFTY27OCT26FUT')).toBe('NIFTY')
+    expect(fnoBaseSymbol('SENSEX19DEC2685000CE')).toBe('SENSEX')
+  })
+
+  it('a plain symbol comes back as itself', () => {
+    expect(fnoBaseSymbol('NIFTY')).toBe('NIFTY')
+    expect(fnoBaseSymbol('MIDCPNIFTY')).toBe('MIDCPNIFTY')
+    expect(fnoBaseSymbol('RELIANCE')).toBe('RELIANCE')
+    expect(fnoBaseSymbol('nifty')).toBe('NIFTY')
   })
 })
 

@@ -28,6 +28,8 @@ describe('dockState', () => {
     localStorage.setItem(DOCK_KEY, 'closed')
     expect(readDockTab()).toBeNull()
     localStorage.setItem(DOCK_KEY, 'depth')
+    expect(readDockTab()).toBe('depth')
+    localStorage.setItem(DOCK_KEY, 'holdings')
     expect(readDockTab()).toBeNull()
   })
 

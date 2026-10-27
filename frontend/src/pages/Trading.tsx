@@ -58,6 +58,7 @@ import {
   type ChartOrderBridgeRef,
 } from '@/components/trading/dock/chartOrderBridge'
 import { DOCK_ID } from '@/components/trading/dock/DockShell'
+import { onDepthRequest } from '@/lib/trading/depthBus'
 import {
   type DockTab,
   escapeTarget,
@@ -340,6 +341,12 @@ function TradingWorkspace({ account }: { account: string | null }) {
    * reason: the books span every symbol, so they belong to no one pane.
    */
   const [dock, setDock] = useState<DockTab | null>(readDockTab)
+  /**
+   * A deploy row's Depth button asks the dock for the Depth tab by name —
+   * the panel and the dock are siblings, so the request rides the bus. The
+   * tab adds the instrument itself; here only the dock opens.
+   */
+  useEffect(() => onDepthRequest(() => setDock('depth')), [])
   /**
    * Which pane a panel click loads into, and whose instrument the watchlist
    * highlights. The first pane until the user touches another, so a click in
@@ -1075,7 +1082,7 @@ function TradingWorkspace({ account }: { account: string | null }) {
           id: 'p0',
           symbol: 'BHEL',
           exchange: 'NSE',
-          interval: '5m',
+          interval: '1m',
           chartType: 'candlestick',
           chart: { version: 1 },
           settings: {},
@@ -1899,6 +1906,7 @@ function TradingWorkspace({ account }: { account: string | null }) {
             apiKey={apiKey}
             onPick={sendToFocusedPane}
             activeSymbol={paneSymbols[focusedPane] ?? null}
+            paneSymbols={paneSymbols}
             tradingLocked={tradingLocked}
             bridge={orderBridge}
           />

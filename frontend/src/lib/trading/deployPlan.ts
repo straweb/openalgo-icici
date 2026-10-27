@@ -56,6 +56,9 @@ export interface DeployRow {
   name?: string
 }
 
+/** Where the panel's session capital comes from — the hedging chip's two modes. */
+export type DeployCapitalSource = 'fixed' | 'percent'
+
 export interface DeployBook {
   /** Keyed by `${optionsExchange}:${underlying}` so two underlyings keep their ladders. */
   books: Record<string, { ce: DeployRow[]; pe: DeployRow[] }>
@@ -64,6 +67,13 @@ export interface DeployBook {
   product: 'MIS' | 'NRML' | 'CNC'
   pricetype: 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
   lots: number
+  /**
+   * The session capital the weight shares divide — the title chip's popbox
+   * edits these. Fixed rupees (clamped to cash) or a percent of cash.
+   */
+  capitalSource: DeployCapitalSource
+  capitalFixed: number
+  capitalPercent: number
   /**
    * The instrument the panel is bound to — the workspace binding, not the
    * chart's. Multi-layout grids let the trader focus any pane without the
@@ -80,7 +90,35 @@ export function bookKey(exchange: string, underlying: string): string {
 export const STOCK_BOOK_KEY = 'EQ:EQ'
 
 export function defaultDeployState(): DeployBook {
-  return { books: {}, stocks: [], product: 'MIS', pricetype: 'MARKET', lots: 1 }
+  return {
+    books: {},
+    stocks: [],
+    product: 'MIS',
+    pricetype: 'MARKET',
+    lots: 1,
+    // Percent of cash at 100 is the no-surprise default: until the trader
+    // opens the chip the panel divides exactly what the funds snapshot shows.
+    capitalSource: 'percent',
+    capitalFixed: 0,
+    capitalPercent: 100,
+  }
+}
+
+/**
+ * The rupees the weight shares divide under the chip's choice: a fixed
+ * allocation clamped to what the account holds, or a percent of cash.
+ * Cash the funds snapshot has not delivered yet reads as 0 — a fixed
+ * capital still works (it is the trader's own number), a percent reads 0
+ * until funds land, which is the honest answer.
+ */
+export function usableSessionCapital(state: DeployBook, cash: number): number {
+  const safeCash = Number.isFinite(cash) && cash > 0 ? cash : 0
+  if (state.capitalSource === 'fixed') {
+    const fixed = Number.isFinite(state.capitalFixed) ? state.capitalFixed : 0
+    return Math.max(0, safeCash > 0 ? Math.min(fixed, safeCash) : fixed)
+  }
+  const pct = Number.isFinite(state.capitalPercent) ? state.capitalPercent : 100
+  return Math.max(0, (safeCash * Math.min(100, Math.max(0, pct))) / 100)
 }
 
 /** Which side of the book (or the stock list) a row belongs to. */
@@ -155,6 +193,12 @@ export function hydrateDeployState(raw: unknown): DeployBook {
     base.pricetype = r.pricetype
   const lots = Number(r.lots)
   if (Number.isFinite(lots) && lots >= 1) base.lots = Math.floor(lots)
+  if (r.capitalSource === 'fixed' || r.capitalSource === 'percent')
+    base.capitalSource = r.capitalSource
+  const fixed = Number(r.capitalFixed)
+  if (Number.isFinite(fixed) && fixed >= 0) base.capitalFixed = fixed
+  const pct = Number(r.capitalPercent)
+  if (Number.isFinite(pct) && pct >= 0 && pct <= 100) base.capitalPercent = pct
   if (typeof r.books === 'object' && r.books !== null) {
     const side = (list: unknown): DeployRow[] =>
       Array.isArray(list)
@@ -244,9 +288,15 @@ export function equalSplitSide(rows: DeployRow[], side: RowSide): DeployRow[] {
 }
 
 /**
- * Slide one row's weight to `value` and rescale its side's other enabled
- * rows so the side still sums to 100. A row pushed to 100 collapses the
- * rest proportionally; a side with a single enabled row always sits at 100.
+ * Slide one row's weight to `value` and re-level its side's other enabled
+ * rows so the side still sums to 100.
+ *
+ * The remainder splits proportionally to what the others carry — but a row
+ * pushed to 100 collapses the rest to 0, and a proportional re-level of
+ * zeros stays zero forever: sliding back down would leave the side short.
+ * So when the others carry nothing (all collapsed, or fresh rows at 0),
+ * the remainder splits evenly across them instead. Either way the side
+ * always reads 100 and every enabled row can fire.
  */
 export function slideSideWeight(rows: DeployRow[], symbol: string, value: number): DeployRow[] {
   const target = rows.find((row) => row.symbol === symbol)
@@ -257,13 +307,50 @@ export function slideSideWeight(rows: DeployRow[], symbol: string, value: number
     (row) => row.symbol !== symbol && row.enabled && sideOfRow(row) === side
   )
   const othersTotal = others.reduce((sum, row) => sum + Math.max(0, row.weight), 0)
+  const remainder = Math.round((100 - clamped) * 10) / 10
+  const evenShare = others.length > 0 ? Math.floor((remainder * 10) / others.length) / 10 : 0
   return rows.map((row) => {
     if (row.symbol === symbol) return { ...row, weight: clamped }
     if (!row.enabled || sideOfRow(row) !== side) return row
-    if (othersTotal <= 0) return { ...row, weight: 0 }
-    const scaled = (Math.max(0, row.weight) / othersTotal) * (100 - clamped)
+    if (othersTotal <= 0) return { ...row, weight: evenShare }
+    const scaled = (Math.max(0, row.weight) / othersTotal) * remainder
     return { ...row, weight: Math.round(scaled * 10) / 10 }
   })
+}
+
+/**
+ * Enable or disable one row and re-level its side back to 100 in the same
+ * stroke — the checkbox's share does not wait for the trader to drag a
+ * slider.
+ *
+ * Enabling a row that carries no weight (fresh from the add strip, or
+ * collapsed away earlier) hands it an even share and shrinks the rows that
+ * were carrying the side; enabling one that still carries a weight folds it
+ * back in with the plain rescale. Disabling renormalises what remains, and
+ * a side whose remainder sums to nothing takes the even split. Every path
+ * leaves the side's enabled weights summing to 100 (a side with no enabled
+ * rows stays untouched — there is nothing to level).
+ */
+export function toggleSideRow(rows: DeployRow[], symbol: string): DeployRow[] {
+  const target = rows.find((row) => row.symbol === symbol)
+  if (!target) return rows
+  const side = sideOfRow(target)
+  const flipped = rows.map((row) =>
+    row.symbol === symbol ? { ...row, enabled: !row.enabled } : row
+  )
+  const enabled = flipped.filter((row) => row.enabled && sideOfRow(row) === side)
+  if (enabled.length === 0) return flipped
+  const total = enabled.reduce((sum, row) => sum + Math.max(0, row.weight), 0)
+  if (total <= 0) return equalSplitSide(flipped, side)
+  // A row switched on with nothing to its name takes an even share out of
+  // the side before the rescale, or the rescale of zeros would leave it 0.
+  const joined = flipped.map((row) => {
+    if (row.symbol !== symbol || !row.enabled || sideOfRow(row) !== side) return row
+    if (Math.max(0, row.weight) > 0) return row
+    const share = Math.floor((100 * 10) / enabled.length) / 10
+    return { ...row, weight: share }
+  })
+  return normalizeSideWeights(joined)
 }
 
 /**
@@ -531,6 +618,20 @@ export function reconcileConstructed(
     }
   })
   return { rows, promoted }
+}
+
+/**
+ * The FNO base of an OpenAlgo derivative symbol: `NIFTY27OCT2624500CE` and
+ * `NIFTY27OCT26FUT` both resolve to `NIFTY`, while a plain symbol
+ * (`NIFTY`, `MIDCPNIFTY`, `RELIANCE`) comes back as itself. The expiry
+ * block is the date the convention always appends (`27OCT26`) — requiring
+ * it is what keeps a plain equity like RELIANCE (which ends in "CE") from
+ * reading as a derivative of "RELIAN".
+ */
+export function fnoBaseSymbol(symbol: string): string {
+  const upper = symbol.trim().toUpperCase()
+  const match = /^(.+?)\d{2}[A-Z]{3}\d{2}\d*(?:CE|PE|FUT)$/i.exec(upper)
+  return match ? match[1] : upper
 }
 
 /** A stock row from a search hit — shares, no strike, weight auto-split. */

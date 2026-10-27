@@ -447,6 +447,12 @@ export interface TerminalCallbacks {
   onIntervalChange?(interval: string): void
   /** The ghost-candle overlay's higher timeframe changed, or was taken off (null). */
   onGhostIntervalChange?(interval: string | null): void
+  /**
+   * The chart's quantity changed from inside the terminal — the capital
+   * percent slider over the Buy/Sell panel — so the host's own qty field
+   * follows instead of showing a number the next click will not send.
+   */
+  onQtyChange?(qty: number): void
   /** The chart type changed from inside the terminal, such as an undo or redo. */
   onChartTypeChange?(chartType: string): void
   onContextMenu?(menu: TerminalContextMenu): void
@@ -1060,6 +1066,14 @@ function nextPaint(): Promise<void> {
   })
 }
 
+/**
+ * The inline SELL·qty·BUY panel's dock geometry, in CSS px — the qty chip's
+ * hover slider anchors to the same box the primitive draws (74/40/42 at the
+ * scale below are the engine's button, chip and panel heights; a mismatch
+ * here puts the hover zone off the chip).
+ */
+const TRADE_PANEL = { x: 14, y: 44, btnW: 74, qtyW: 40, h: 42, scale: 0.72 } as const
+
 export class TradingTerminal {
   /**
    * The higher-timeframe ghost overlay. Created once, re-attached to every
@@ -1203,6 +1217,15 @@ export class TradingTerminal {
   private toolOf: ((id: string) => DrawingTool) | null = null
   private posLine: PriceLine | null = null
   private tradeBtns: BuySellButtonsInstance | null = null
+  /** The capital-percent slider that hovers under the Buy/Sell panel's qty chip. */
+  private qtySlider: HTMLDivElement | null = null
+  private qtyHoverOff: (() => void) | null = null
+  private qtyHideTimer: number | null = null
+  private capitalTimer: number | null = null
+  /** Available cash for the qty slider's lots estimate; 0 until funds land. */
+  private capital = 0
+  /** This chart's share of capital — per pane, default 25%. */
+  private capitalPct = 25
   /** The bar the OHLC readout is currently showing; replayed into the export. */
   private legendBar: Bar | null = null
   private legendTime: number | null = null
@@ -1577,7 +1600,10 @@ export class TradingTerminal {
     this.cb = opts.callbacks
     this.sk = opts.storageKey || 'oa-trading'
     this.preferences = initial ? createWorkspacePanePreferences(initial, this.sk) : opts.preferences
-    this.interval = this.lsGet('interval') || '5m'
+    this.interval = this.lsGet('interval') || '1m'
+    const savedPct = Number(this.lsGet('cappct'))
+    if (Number.isFinite(savedPct) && savedPct >= 1 && savedPct <= 100)
+      this.capitalPct = Math.floor(savedPct)
     this.ctype = this.lsGet('ctype') || 'candlestick'
     this.rangeChoice = parseRangeChoice(this.lsGet('range'))
     this.restoreChartTools()
@@ -2282,6 +2308,180 @@ export class TradingTerminal {
     return this.sym.lots ? `${n}L` : String(n)
   }
 
+  /* ── the qty chip's capital slider ───────────────────────────────────── */
+
+  /**
+   * The qty chip's box in the Buy/Sell panel, in container CSS px — the
+   * hover zone the slider shows under. The chip sits between the SELL and
+   * BUY buttons at the dock margin, at the engine's own geometry.
+   */
+  private qtyChipRect(): { x: number; y: number; w: number; h: number } {
+    const pad = 4
+    return {
+      x: TRADE_PANEL.x + TRADE_PANEL.btnW * TRADE_PANEL.scale + 1 - pad,
+      y: TRADE_PANEL.y - pad,
+      w: TRADE_PANEL.qtyW * TRADE_PANEL.scale + pad * 2,
+      h: TRADE_PANEL.h * TRADE_PANEL.scale + pad * 2,
+    }
+  }
+
+  /**
+   * Lots (or shares) this chart's percent of the available capital buys at
+   * the live price — the same math the deploy panel's weight rows run,
+   * pointed at one chart and its own percent. Never below one lot: the
+   * slider's floor is "trade something", not zero.
+   */
+  private capitalLots(): number {
+    const ltp =
+      this.lastLtp != null
+        ? this.lastLtp
+        : this.rawBars.length
+          ? this.rawBars[this.rawBars.length - 1].close
+          : null
+    if (!ltp || ltp <= 0) return 0
+    const lotsize = this.sym?.lotsize && this.sym.lotsize > 0 ? this.sym.lotsize : 1
+    const unit = this.sym?.lots ? ltp * lotsize : ltp
+    if (unit <= 0) return 0
+    const budget = (this.capital * this.capitalPct) / 100
+    if (budget <= 0) return 0
+    return Math.max(1, Math.floor(budget / unit))
+  }
+
+  /** Fetch the funds snapshot the lots estimate divides. */
+  private async pollCapital(): Promise<void> {
+    try {
+      const j = await this.api<{ data?: Record<string, unknown> }>('funds')
+      const cash = Number(j.data?.availablecash)
+      if (Number.isFinite(cash)) this.capital = Math.max(0, cash)
+    } catch {
+      // The last known capital keeps the estimate honest enough; the next
+      // poll retries.
+    }
+    this.refreshQtySliderText()
+  }
+
+  /** The slider's two readouts: the percent and what it buys right now. */
+  private refreshQtySliderText(): void {
+    const slider = this.qtySlider
+    if (!slider) return
+    const pct = slider.querySelector('[data-pct]')
+    const lots = slider.querySelector('[data-lots]')
+    if (pct) pct.textContent = `${this.capitalPct}%`
+    if (lots) {
+      const n = this.capitalLots()
+      const isLots = this.sym?.lots ?? false
+      lots.textContent =
+        n <= 0
+          ? this.capital > 0
+            ? '—'
+            : 'capital…'
+          : isLots
+            ? `≈ ${n} lot${n === 1 ? '' : 's'}`
+            : `≈ ${n} sh`
+    }
+  }
+
+  /**
+   * Build (once) and sync the slider that hovers under the Buy/Sell panel's
+   * qty chip. Hover is a hit-test on the container's pointer moves — the
+   * chip is canvas-drawn by the engine and ships no DOM to listen to — and
+   * the slider itself sits just below the panel, never over the plot.
+   */
+  private mountQtySlider(): void {
+    if (!this.qtySlider) {
+      const slider = document.createElement('div')
+      slider.setAttribute('data-qty-slider', '1')
+      slider.style.cssText = [
+        'position:absolute',
+        `left:${TRADE_PANEL.x}px`,
+        `top:${Math.round(TRADE_PANEL.y + TRADE_PANEL.h * TRADE_PANEL.scale + 8)}px`,
+        'display:none',
+        'z-index:40',
+        'pointer-events:auto',
+        'background:var(--popover, #18181b)',
+        'color:var(--popover-foreground, #e4e4e7)',
+        'border:1px solid var(--border, #2e2e33)',
+        'border-radius:6px',
+        'padding:4px 8px',
+        'font:500 11px/1.4 ui-sans-serif, system-ui, sans-serif',
+        'box-shadow:0 4px 12px rgba(0,0,0,0.35)',
+        'white-space:nowrap',
+        'align-items:center',
+        'gap:6px',
+      ].join(';')
+      slider.innerHTML =
+        '<span data-pct style="font-weight:600"></span>' +
+        '<input data-range type="range" min="1" max="100" step="1" ' +
+        'style="width:110px;accent-color:var(--primary,#3b82f6);vertical-align:middle" ' +
+        'aria-label="Percent of capital for this chart\'s quantity" />' +
+        '<span data-lots style="font-variant-numeric:tabular-nums;opacity:0.75"></span>'
+      this.container.appendChild(slider)
+      const range = slider.querySelector<HTMLInputElement>('[data-range]')
+      range?.addEventListener('input', () => {
+        const next = Math.min(100, Math.max(1, Math.floor(Number(range.value) || 1)))
+        this.capitalPct = next
+        this.lsSet('cappct', String(next))
+        const n = this.capitalLots()
+        if (n > 0 && n !== this.qty) {
+          this.setQty(n)
+          this.cb.onQtyChange?.(n)
+        }
+        this.refreshQtySliderText()
+      })
+      this.qtySlider = slider
+      // Hover hit-test over the chip; the hide is delayed so the pointer can
+      // travel the few pixels down onto the slider without losing it.
+      const onMove = (e: Event) => {
+        if (this.destroyed || !this.qtySlider) return
+        const rect = this.container.getBoundingClientRect()
+        const x = (e as PointerEvent).clientX - rect.left
+        const y = (e as PointerEvent).clientY - rect.top
+        const chip = this.qtyChipRect()
+        const over =
+          x >= chip.x && x <= chip.x + chip.w && y >= chip.y && y <= chip.y + chip.h
+        if (over) {
+          if (this.qtyHideTimer != null) {
+            window.clearTimeout(this.qtyHideTimer)
+            this.qtyHideTimer = null
+          }
+          const wasHidden = this.qtySlider.style.display === 'none'
+          this.qtySlider.style.display = 'flex'
+          if (wasHidden) {
+            void this.pollCapital()
+            if (this.capitalTimer == null)
+              this.capitalTimer = window.setInterval(() => void this.pollCapital(), 30000)
+          }
+          this.refreshQtySliderText()
+        } else if (this.qtySlider.style.display !== 'none' && this.qtyHideTimer == null) {
+          this.qtyHideTimer = window.setTimeout(() => {
+            if (this.qtySlider) this.qtySlider.style.display = 'none'
+            if (this.capitalTimer != null) {
+              window.clearInterval(this.capitalTimer)
+              this.capitalTimer = null
+            }
+            this.qtyHideTimer = null
+          }, 300)
+        }
+      }
+      this.container.addEventListener('pointermove', onMove)
+      this.qtyHoverOff = () => this.container.removeEventListener('pointermove', onMove)
+    }
+    const range = this.qtySlider.querySelector<HTMLInputElement>('[data-range]')
+    if (range) range.value = String(this.capitalPct)
+    this.refreshQtySliderText()
+  }
+
+  private destroyQtySlider(): void {
+    this.qtyHoverOff?.()
+    this.qtyHoverOff = null
+    if (this.qtyHideTimer != null) window.clearTimeout(this.qtyHideTimer)
+    this.qtyHideTimer = null
+    if (this.capitalTimer != null) window.clearInterval(this.capitalTimer)
+    this.capitalTimer = null
+    this.qtySlider?.remove()
+    this.qtySlider = null
+  }
+
   private marketPrice(): number | null {
     return this.lastLtp != null
       ? this.lastLtp
@@ -2767,16 +2967,22 @@ export class TradingTerminal {
       this.tradeBtns = new BuySellButtons({
         id: 'trade',
         position: 'top-left',
-        margin: { x: 14, y: 44 },
+        margin: { x: TRADE_PANEL.x, y: TRADE_PANEL.y },
         qty: this.qtyChip(),
-        scale: 0.72,
+        scale: TRADE_PANEL.scale,
       })
       if (lp != null) this.tradeBtns.setMark(lp)
       this.applyTradeColors()
       // Order entry is an affordance, not chart content: it is left out of a
       // saved image (see `screenshotExcluded`).
       this.addExcludedPrimitive(this.tradeBtns, 0)
-    } else this.tradeBtns = null
+      // The qty chip's capital slider rides the same dock: hover the chip,
+      // drag the percent of capital, the lot size re-sizes itself.
+      this.mountQtySlider()
+    } else {
+      this.tradeBtns = null
+      this.destroyQtySlider()
+    }
 
     this.chart.subscribeCrosshairMove((e) => {
       this.legendTime = e.bar?.time ?? null
@@ -7441,6 +7647,7 @@ export class TradingTerminal {
   setQty(n: number) {
     this.qty = Math.max(1, Math.floor(n || 1))
     if (this.tradeBtns) this.tradeBtns.setQty(this.qtyChip())
+    this.refreshQtySliderText()
   }
   /**
    * One-Click on or off. Nothing here gates a risk-reducing action: the
@@ -8335,6 +8542,7 @@ export class TradingTerminal {
     this.detachAlerts()
     this.detachObjects()
     this.detachDrawing()
+    this.destroyQtySlider()
     if (this.bookTimer) clearInterval(this.bookTimer)
     this.bookTimer = null
     this.stopLtpFallback()

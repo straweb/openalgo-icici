@@ -1,18 +1,21 @@
 /**
- * The Index tab, from the charting terminal: the hedging terminal's
- * constituent breakdown, following the charted underlying — plus its
- * deploy dialog, wired to this page's ladder.
+ * The Constituents tab (the tab the charting terminal once called Index),
+ * from the hedging terminal: the underlying's cash-market members, live,
+ * plus its deploy dialog wired to this page's ladder.
  *
- * The Deploy-by-level button is the hedging IndexDeployDialog: pick the
- * strikes (ATM, n above/below, or explicit), an optional index entry level,
- * and optional index target/stop. An entry already met — or none — places
- * now and arms the close rows; otherwise the plan arms as a spot-price
- * trigger this page's engine fires, placing exactly these strikes into the
- * deploy ladder. Either way the picked strikes land in the ladder where the
- * trader can see and adjust them.
+ * Which index it follows is decided without the chain snapshot: the deploy
+ * panel's binding first, then the focused chart, then any other open chart
+ * — the first candidate whose FNO base has a constituent set wins. A trader
+ * charting `NSE_INDEX:NIFTY` (no options of its own to read) or a NIFTY CE
+ * still lands on the Nifty 50 table.
+ *
+ * The spot quote is a quotes-feed poll over the index exchanges, so the
+ * table works whether or not the broker's master contract carries the
+ * index's options. Only the level deploy waits for the chain snapshot —
+ * it needs the listed strikes — and it says so without hiding the table.
  */
 
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Rocket } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { IndexPanel } from '@/components/hedging/IndexPanel'
@@ -22,9 +25,15 @@ import {
 } from '@/components/hedging/IndexDeployDialog'
 import { useSpotResolution } from '@/components/trading/dock/useSpotResolution'
 import { newScheduleId, scheduleTriggerLabel } from '@/lib/hedging/scheduler'
+import { constituentsFor } from '@/lib/hedging/indexConstituents'
 import { loadHedgingState, saveHedgingState } from '@/lib/hedging/storage'
 import type { SearchRow } from '@/lib/trading/terminal'
-import { rowsFromStrikes, readDeployState, writeDeployState } from '@/lib/trading/deployPlan'
+import {
+  fnoBaseSymbol,
+  rowsFromStrikes,
+  readDeployState,
+  writeDeployState,
+} from '@/lib/trading/deployPlan'
 import { strikesForPick } from '@/lib/hedging/indexLevels'
 import { entryMet, planCrosses } from '@/lib/trading/tradingFire'
 import { fnoExchangeFor } from '@/types/hedging'
@@ -34,16 +43,112 @@ import { showToast } from '@/utils/toast'
 
 interface Props {
   apiKey: string
-  /** The focused pane's symbol — the underlying whose constituents show. */
+  /** The focused pane's `EXCHANGE:SYMBOL` — one candidate for the index. */
   activeSymbol: string | null
+  /** Every open pane's `EXCHANGE:SYMBOL` — the other candidates. */
+  paneSymbols: Record<string, string | null>
   /** Charts a row in the focused pane, the way a watchlist row does. */
   onPick(row: SearchRow): void
 }
 
-export function IndexTab({ apiKey, activeSymbol, onPick }: Props) {
+const SPOT_POLL_MS = 4000
+const BINDING_POLL_MS = 15000
+
+/** The symbol half of a pane key (`NSE:NIFTY` → `NIFTY`). */
+function symbolOf(key: string | undefined | null): string | null {
+  if (!key) return null
+  const at = key.indexOf(':')
+  return at >= 0 ? key.slice(at + 1) : key
+}
+
+export function IndexTab({ apiKey, activeSymbol, paneSymbols, onPick }: Props) {
   const [dialogOpen, setDialogOpen] = useState(false)
-  // A level deploy wants the ladder around ATM, not a spot answer only.
-  const { chain, spot, error } = useSpotResolution(apiKey, activeSymbol, 50)
+  /**
+   * The deploy panel's binding moves on its own, with no event this tab
+   * could hear — so the persisted book is re-read on a slow stride (it is
+   * one small localStorage read), plus on every chart and mount change.
+   */
+  const [bindingSymbol, setBindingSymbol] = useState<string | null>(() => {
+    const binding = readDeployState().workspace
+    return binding ? binding.symbol : null
+  })
+  useEffect(() => {
+    const read = () => {
+      const binding = readDeployState().workspace
+      setBindingSymbol(binding ? binding.symbol : null)
+    }
+    read()
+    const timer = window.setInterval(read, BINDING_POLL_MS)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  /** The index whose constituents show: first candidate with a member list. */
+  const index = useMemo(() => {
+    const candidates = [bindingSymbol, symbolOf(activeSymbol), ...Object.values(paneSymbols).map(symbolOf)]
+    for (const candidate of candidates) {
+      if (!candidate) continue
+      const base = fnoBaseSymbol(candidate)
+      if (constituentsFor(base)) return base
+    }
+    // Nothing with a member set: keep the focused chart's base so the empty
+    // state can say which underlying it looked for.
+    return symbolOf(activeSymbol) ? fnoBaseSymbol(symbolOf(activeSymbol)!) : null
+  }, [bindingSymbol, activeSymbol, paneSymbols])
+
+  const profile = constituentsFor(index ?? '')
+  const optionsExchange = profile ? fnoExchangeFor(profile.stockExchange) : 'NFO'
+
+  // A level deploy wants the ladder around ATM, not a spot answer only —
+  // this is the one read that waits for the chain snapshot.
+  const { chain, spot: chainSpot, error } = useSpotResolution(
+    apiKey,
+    index,
+    50,
+    profile?.stockExchange ?? 'NSE'
+  )
+
+  /** The spot quote, off the quotes feed — never waiting for the chain. */
+  const [spotQuote, setSpotQuote] = useState<{ exchange: string; ltp: number | undefined } | null>(
+    null
+  )
+  useEffect(() => {
+    if (!index || !profile) {
+      setSpotQuote(null)
+      return
+    }
+    let alive = true
+    const candidates = [
+      `${profile.stockExchange}_INDEX`,
+      profile.stockExchange,
+      ...(profile.stockExchange === 'NSE' ? ['NSE_INDEX', 'NSE'] : ['BSE_INDEX', 'BSE']),
+    ]
+    const poll = async () => {
+      for (const exchange of candidates) {
+        try {
+          const res = await tradingApi.getQuotes(apiKey, index, exchange)
+          if (res.status === 'success' && Number.isFinite(res.data?.ltp)) {
+            if (alive) setSpotQuote({ exchange, ltp: res.data!.ltp })
+            return
+          }
+        } catch {
+          // the next candidate exchange tries on
+        }
+        if (!alive) return
+      }
+    }
+    void poll()
+    const timer = window.setInterval(() => void poll(), SPOT_POLL_MS)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [apiKey, index, profile])
+
+  const spot = useMemo(() => {
+    if (spotQuote) return { symbol: index ?? '', exchange: spotQuote.exchange }
+    if (chainSpot) return chainSpot
+    return null
+  }, [spotQuote, chainSpot, index])
 
   /** The strike interval, read the way the Deploy panel reads its own. */
   const interval = useMemo(() => {
@@ -61,11 +166,10 @@ export function IndexTab({ apiKey, activeSymbol, onPick }: Props) {
    */
   const submitDeploy = useCallback(
     async (plan: IndexDeploySubmit) => {
-      if (!activeSymbol || !chain) {
+      if (!index || !chain) {
         showToast.warning('The chain snapshot has not landed — nothing to deploy yet.')
         return
       }
-      const optionsExchange = fnoExchangeFor('NSE')
       const atm =
         chain.atm_strike ||
         (interval ? Math.round(chain.underlying_ltp / interval) * interval : null)
@@ -76,7 +180,7 @@ export function IndexTab({ apiKey, activeSymbol, onPick }: Props) {
       }
       // Into the ladder first: the trader sees exactly what is armed.
       const state = readDeployState()
-      const key = `${optionsExchange}:${activeSymbol}`
+      const key = `${optionsExchange}:${index}`
       const ladder = state.books[key] ?? { ce: [], pe: [] }
       const existing = plan.side === 'CE' ? ladder.ce : ladder.pe
       const { rows: next, skipped } = rowsFromStrikes(chain, plan.side, planned, existing, optionsExchange)
@@ -164,45 +268,64 @@ export function IndexTab({ apiKey, activeSymbol, onPick }: Props) {
         `Set: ${plan.optionAction} ${plan.side} ×${deployPlan.strikes.length} when ${spot.symbol} ${crosses.target === 'above' ? '≥' : '≤'} ${(plan.entry as number).toLocaleString('en-IN')}. It fires this page's deploy ladder.`
       )
     },
-    [activeSymbol, apiKey, chain, interval, spot]
+    [index, apiKey, chain, interval, spot, optionsExchange]
   )
 
-  if (!activeSymbol) {
+  if (!index) {
     return (
       <p className="p-4 text-center text-[12px] text-muted-foreground">
-        Chart an underlying to break it into its constituents.
+        Chart an index, one of its options, or bind one in the Deploy panel to break it into its
+        constituents.
       </p>
     )
   }
-  if (error && !chain) {
+  if (!profile) {
     return (
-      <div className="p-4 text-center">
-        <p className="text-[12px] text-muted-foreground">{error}</p>
-        <p className="mt-1 text-[10px] text-muted-foreground">
-          The constituents and the level deploy both read the chain snapshot; it lands when the
-          broker's master contract has the index's options.
-        </p>
-      </div>
+      <p className="p-4 text-center text-[12px] text-muted-foreground">
+        No constituent set for <span className="font-mono">{index}</span>.
+      </p>
     )
   }
 
   return (
     <div className="h-full min-h-0">
-      <div className="flex items-center justify-end border-b px-2 py-1">
+      <div className="flex items-center gap-2 border-b px-2 py-1">
+        <span className="text-[10px] text-muted-foreground">
+          Following <span className="font-mono font-semibold text-foreground">{index}</span>
+          {spotQuote?.ltp != null && (
+            <span className="ml-1 font-mono tabular-nums">
+              · {spotQuote.ltp.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+            </span>
+          )}
+        </span>
         <Button
           size="sm"
-          className="h-6 gap-1 bg-emerald-600 px-2 text-[10px] text-white hover:bg-emerald-700"
+          className="ml-auto h-6 gap-1 bg-emerald-600 px-2 text-[10px] text-white hover:bg-emerald-700"
           disabled={!chain}
-          title="Deploy strikes by index level (entry, target, stop)"
+          title={
+            chain
+              ? 'Deploy strikes by index level (entry, target, stop)'
+              : 'Waiting for the chain snapshot — it lands when the master contract has the options'
+          }
           onClick={() => setDialogOpen(true)}
         >
           <Rocket className="h-3 w-3" />
           Deploy by level
         </Button>
       </div>
-      <div className="h-[calc(100%-29px)] min-h-0">
+      {error && !chain && (
+        <p className="border-b bg-muted/40 px-2 py-1 text-[10px] text-muted-foreground">
+          Level deploy reads the chain snapshot; it lands when the broker's master contract has{' '}
+          {index}'s options. The constituents below read the quotes feed and work regardless.
+        </p>
+      )}
+      <div
+        className={
+          error && !chain ? 'h-[calc(100%-58px)] min-h-0' : 'h-[calc(100%-29px)] min-h-0'
+        }
+      >
         <IndexPanel
-          underlying={activeSymbol}
+          underlying={index}
           indexSpot={spot}
           onLoadChart={(pick) =>
             onPick({ symbol: pick.symbol, exchange: pick.exchange, name: pick.name })
@@ -213,7 +336,7 @@ export function IndexTab({ apiKey, activeSymbol, onPick }: Props) {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         spot={spot}
-        spotLtp={chain?.underlying_ltp}
+        spotLtp={chain?.underlying_ltp ?? spotQuote?.ltp}
         atmStrike={chain?.atm_strike}
         strikeInterval={interval || undefined}
         ceShare={loadHedgingState().ceShare}

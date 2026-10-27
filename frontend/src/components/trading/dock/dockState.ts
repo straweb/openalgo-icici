@@ -13,11 +13,15 @@ export const DOCK_TABS = [
   { id: 'positions', label: 'Positions' },
   { id: 'trades', label: 'Trades' },
   { id: 'gtt', label: 'GTT' },
-  // The hedging terminal's dock carries these two books; the charting
-  // terminal reads the same scheduled store, and the Index tab follows the
-  // charted underlying's constituents.
+  // The hedging terminal's dock carries the scheduled book; the charting
+  // terminal reads the same scheduled store, the Constituents tab follows
+  // the underlying's index members, and Depth lists the instruments whose
+  // order books the trader is watching.
   { id: 'scheduled', label: 'Scheduled' },
-  { id: 'index', label: 'Index' },
+  // The id stays 'index' so a remembered tab survives the rename; the label
+  // is what the trader reads, and "constituents" is what the table shows.
+  { id: 'index', label: 'Constituents' },
+  { id: 'depth', label: 'Depth' },
 ] as const
 
 export type DockTab = (typeof DOCK_TABS)[number]['id']

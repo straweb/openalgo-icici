@@ -2,12 +2,16 @@
  * One row of the Deploy panel, drawn the way a trader reads a ladder:
  *
  * Line 1 — what it is: the symbol tile (strike with its ITM/OTM badge, or
- * the stock's name), its price, and to the right the row's P&L plus the
- * Min / Chart / remove actions.
+ * the stock's name), its price with the rupees one lot (or one share)
+ * carries, and to the right the row's P&L plus the Min / Chart / Quit /
+ * Depth / remove actions. Quit shows only while a broker position is open
+ * on the row and flattens that position; Depth loads the instrument into
+ * the dock's depth tab.
  *
- * Line 2 — what it trades: the percent of the funds this row carries — a
- * slider plus a type-in box — the lots (or shares) that percent buys right
- * now, the rupee amount that quantity needs, and the Edit / Exit /
+ * Line 2 — what it trades: the percent of the session capital this row
+ * carries — a slider plus a type-in box, auto-levelled with its side so
+ * the shares always sum to 100 — the lots (or shares) that percent buys
+ * right now, the rupee amount that quantity needs, and the Edit / Exit /
  * Buy / Sell actions.
  *
  * Line 3 — the levels, behind the Edit press: entry, target, stop. The row
@@ -15,7 +19,16 @@
  * order exists on it, and its level badges light when LTP crosses them.
  */
 
-import { ChevronDown, ChevronUp, LineChart, Minimize2, Pencil, X } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronUp,
+  LineChart,
+  ListTree,
+  LogOut,
+  Minimize2,
+  Pencil,
+  X,
+} from 'lucide-react'
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -50,7 +63,11 @@ interface Props {
   onFire(action: 'BUY' | 'SELL'): void
   /** Sell this row's planned quantity (the quick flat, per row). */
   onExit(): void
+  /** Flatten the open broker position on this row (shown only when one exists). */
+  onQuit(): void
   onChart(): void
+  /** Load this instrument into the dock's Depth tab. */
+  onDepth(): void
   onRemove(): void
 }
 
@@ -155,9 +172,22 @@ export function DeployRowItem(props: Props) {
             'w-[52px] shrink-0 text-right font-mono text-[11px] tabular-nums',
             ltp == null && 'text-muted-foreground'
           )}
-          title="Price"
         >
           {ltp != null ? ltp.toFixed(2) : '—'}
+        </span>
+        <span
+          className="w-[62px] shrink-0 text-right font-mono text-[9px] tabular-nums text-muted-foreground"
+          title={
+            ltp != null
+              ? `One ${row.lotSize > 1 ? `lot (${row.lotSize})` : 'share'} at this price`
+              : 'One lot / one share at the live price'
+          }
+        >
+          {ltp != null
+            ? `1 ${row.lotSize > 1 ? 'lot' : 'sh'} ₹${Math.round(ltp * row.lotSize).toLocaleString(
+                'en-IN'
+              )}`
+            : '—'}
         </span>
         <span
           className={cn(
@@ -193,6 +223,26 @@ export function DeployRowItem(props: Props) {
           title="Load this instrument in the chart"
         >
           <LineChart className="h-3 w-3" />
+        </Button>
+        {props.hasPosition && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-5 w-5 shrink-0 px-0 text-amber-600 hover:text-amber-700"
+            onClick={props.onQuit}
+            title="Quit: flatten the open position on this row"
+          >
+            <LogOut className="h-3 w-3" />
+          </Button>
+        )}
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-5 w-5 shrink-0 px-0"
+          onClick={props.onDepth}
+          title="Show market depth in the dock's Depth tab"
+        >
+          <ListTree className="h-3 w-3" />
         </Button>
         <Button
           size="sm"

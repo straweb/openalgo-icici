@@ -49,6 +49,7 @@ const GttTab = lazy(() => import('../GttTab'))
 // this tab saying "Loading" forever — a placeholder the trader could not
 // click past. The code arrives with the dock now, and the tab renders.
 import { ScheduledTab } from './ScheduledTab'
+import { DepthTab } from './DepthTab'
 import { IndexTab } from './IndexTab'
 import { useTradingScheduler } from './useTradingScheduler'
 
@@ -62,6 +63,8 @@ interface Props {
   /** Charts a row in the focused pane, the way a watchlist row does. */
   onPick(row: SearchRow): void
   activeSymbol: string | null
+  /** Every open pane's `EXCHANGE:SYMBOL`, for the Constituents tab's candidates. */
+  paneSymbols: Record<string, string | null>
   /** True while any pane is replaying or picking a replay start. */
   tradingLocked(): boolean
   /** Filled with the books and the actions, for the chart's right-click menu. */
@@ -74,6 +77,7 @@ export function TradingDock({
   apiKey,
   onPick,
   activeSymbol,
+  paneSymbols,
   tradingLocked,
   bridge,
 }: Props) {
@@ -260,8 +264,14 @@ export function TradingDock({
         <ScheduledTab apiKey={apiKey} activeSymbol={activeSymbol} />
       )}
       {tab === 'index' && (
-        <IndexTab apiKey={apiKey} activeSymbol={activeSymbol} onPick={onPick} />
+        <IndexTab
+          apiKey={apiKey}
+          activeSymbol={activeSymbol}
+          paneSymbols={paneSymbols}
+          onPick={onPick}
+        />
       )}
+      {tab === 'depth' && <DepthTab apiKey={apiKey} onPick={onPick} />}
       <ModifyOrderDialog
         order={modifying}
         onOpenChange={(open) => !open && setModifying(null)}

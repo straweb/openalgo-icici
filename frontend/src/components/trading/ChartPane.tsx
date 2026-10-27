@@ -632,6 +632,9 @@ export function ChartPane({
         if (style) setTextReq({ id: r.id, tool: r.tool, style })
       },
       onOrderTicket: (req) => current && setTicket(req),
+      // The chart's capital-percent slider set the quantity; the toolbar's
+      // qty field follows so both show what the next click sends.
+      onQtyChange: (qty) => current && setQty(qty),
     }
 
     const release = () => {

@@ -27,15 +27,19 @@ describe('DockShell', () => {
       'false',
       'false',
       'false',
+      'false',
     ])
     // The badge is a separate text node, so the accessible name has no space.
     expect(screen.getByRole('tab', { name: /^Orders\s*2$/ })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: /^Trades\s*7$/ })).toBeInTheDocument()
     // No count was given for GTT, so it carries no badge, not a zero.
     expect(screen.getByRole('tab', { name: 'GTT' })).toBeInTheDocument()
-    // The hedging terminal's two shared books sit at the end of the strip.
+    // The hedging terminal's shared book, the constituents breakdown (the
+    // tab the charting terminal once called Index) and the depth board sit
+    // at the end of the strip.
     expect(screen.getByRole('tab', { name: 'Scheduled' })).toBeInTheDocument()
-    expect(screen.getByRole('tab', { name: 'Index' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Constituents' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Depth' })).toBeInTheDocument()
     expect(screen.queryByRole('tabpanel')).not.toBeInTheDocument()
   })
 
@@ -56,9 +60,9 @@ describe('DockShell', () => {
     expect(screen.getByRole('tab', { name: /Positions/ })).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('tab', { name: /Positions/ })).toHaveFocus()
     await userEvent.keyboard('{End}')
-    // End is the last tab of the strip — the Index book, since the two
-    // hedging-terminal books joined it.
-    expect(screen.getByRole('tab', { name: 'Index' })).toHaveAttribute('aria-selected', 'true')
+    // End is the last tab of the strip — the Depth board, since the
+    // constituents tab and it joined the two hedging-terminal books.
+    expect(screen.getByRole('tab', { name: 'Depth' })).toHaveAttribute('aria-selected', 'true')
     // ...and one more step wraps to Orders, where the walk started.
     await userEvent.keyboard('{ArrowRight}')
     expect(screen.getByRole('tab', { name: /Orders/ })).toHaveAttribute('aria-selected', 'true')

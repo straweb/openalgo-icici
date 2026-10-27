@@ -8,7 +8,7 @@
  * closes it.
  */
 
-import { Bot, FileCode2, FlaskConical, type LucideIcon, Shapes, Table2 } from 'lucide-react'
+import { Bot, FileCode2, FlaskConical, type LucideIcon, Rocket, Shapes, Table2 } from 'lucide-react'
 import { useEffect, useRef } from 'react'
 import { ChromeIcon, lineStroke24 } from '@/lib/trading/glyphs'
 import { cn } from '@/lib/utils'
@@ -40,6 +40,15 @@ const PANELS = [
     label: 'Option chain',
     icon: Table2,
     hint: 'Strikes for the charted underlying; click one to chart it',
+  },
+  // Beside the option chain, because both are strike tables and the move from
+  // reading strikes to trading them is the one the rail makes shortest. The
+  // ladder follows the charted underlying and the quick actions fire it.
+  {
+    id: 'deploy',
+    label: 'Deploy',
+    icon: Rocket,
+    hint: 'Build a strike ladder and fire it with one tap',
   },
   {
     id: 'objects',

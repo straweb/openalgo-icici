@@ -13,6 +13,11 @@ export const DOCK_TABS = [
   { id: 'positions', label: 'Positions' },
   { id: 'trades', label: 'Trades' },
   { id: 'gtt', label: 'GTT' },
+  // The hedging terminal's dock carries these two books; the charting
+  // terminal reads the same scheduled store, and the Index tab follows the
+  // charted underlying's constituents.
+  { id: 'scheduled', label: 'Scheduled' },
+  { id: 'index', label: 'Index' },
 ] as const
 
 export type DockTab = (typeof DOCK_TABS)[number]['id']

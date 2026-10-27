@@ -38,6 +38,11 @@ const StrategiesPanel = lazy(() =>
 const WatchlistPanel = lazy(() =>
   import('@/components/trading/WatchlistPanel').then((m) => ({ default: m.WatchlistPanel }))
 )
+// The deploy panel builds its strike ladder and fires it; the chain poll and
+// the order routes behind it are wasted on a trader who never opens it.
+const DeployPanel = lazy(() =>
+  import('@/components/trading/DeployPanel').then((m) => ({ default: m.DeployPanel }))
+)
 
 import type { MagnetMode } from 'openalgo-charts/draw'
 import { BacktestPanel } from '@/components/trading/BacktestPanel'
@@ -1736,6 +1741,18 @@ function TradingWorkspace({ account }: { account: string | null }) {
                 apiKey={apiKey}
                 onPick={sendToFocusedPane}
                 activeSymbol={paneSymbols[focusedPane] ?? null}
+              />
+            </Suspense>
+          )}
+          {apiKey && wsUrl && panel === 'deploy' && (
+            <Suspense fallback={null}>
+              <DeployPanel
+                apiKey={apiKey}
+                // Fresh like the Backtest panel's reads: the ladder follows the
+                // chart the trader is looking at, and the revision says when
+                // that answer has changed.
+                getChartContext={readChartContext}
+                chartRevision={chartRevision}
               />
             </Suspense>
           )}

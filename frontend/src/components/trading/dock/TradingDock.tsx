@@ -44,6 +44,12 @@ import { useBlotter } from './useBlotter'
 // The GTT tab carries its own fetch, dialogs and CSV export; nobody pays
 // for it until the tab is opened.
 const GttTab = lazy(() => import('../GttTab'))
+// The same deal for the two books the hedging terminal shares: the scheduled
+// store read and the index breakdown, each with its own fetches behind it.
+const ScheduledTab = lazy(() =>
+  import('./ScheduledTab').then((m) => ({ default: m.ScheduledTab }))
+)
+const IndexTab = lazy(() => import('./IndexTab').then((m) => ({ default: m.IndexTab })))
 
 /** The chart's words, so the dock and the chart refuse in one voice. */
 export const REPLAY_REFUSAL = 'Replay is a simulation. Leave replay to trade.'
@@ -241,6 +247,25 @@ export function TradingDock({
             {/* Its own fetch and dialogs, but the dock's replay lock. */}
             <GttTab refuse={refuse} />
           </div>
+        </Suspense>
+      )}
+      {tab === 'scheduled' && (
+        <Suspense
+          fallback={
+            <div className="p-3 text-[12px] text-muted-foreground">Loading scheduled</div>
+          }
+        >
+          {/* The shared scheduler store read; it manages rows but never fires
+              them — firing needs the hedging board's context, and a second
+              engine here would double-place the batch. */}
+          <ScheduledTab />
+        </Suspense>
+      )}
+      {tab === 'index' && (
+        <Suspense
+          fallback={<div className="p-3 text-[12px] text-muted-foreground">Loading index</div>}
+        >
+          <IndexTab apiKey={apiKey} activeSymbol={activeSymbol} onPick={onPick} />
         </Suspense>
       )}
       <ModifyOrderDialog

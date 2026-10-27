@@ -58,6 +58,12 @@ interface Props {
   /** The spot index, when one is known (price triggers read its LTP). */
   spotSymbol?: { symbol: string; exchange: string } | null
   /**
+   * False hides the Trade toggle: the host page has no stock book for the
+   * Buy/Sell vocabulary to act on (the charting terminal's batches run its
+   * option ladder). Defaults to true — the hedging terminal keeps the toggle.
+   */
+  allowStockTarget?: boolean
+  /**
    * What the batch will act on, per Trade toggle — shown on the dialog so
    * the armed verb's target is never a guess. Both entries may be equal
    * (a stock workspace trades one book).
@@ -223,7 +229,7 @@ export function SchedulerDialog(props: Props) {
         </div>
 
         {/* Target: option panels or the underlying itself (F&O only) */}
-        {props.mode === 'fno' && (
+        {props.mode === 'fno' && props.allowStockTarget !== false && (
           <div className="flex items-center gap-1">
             <span className="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
               Trade
@@ -414,7 +420,12 @@ export function SchedulerDialog(props: Props) {
 }
 
 /** Build a persisted row from a dialog submission. */
-export function scheduledFromSubmission(submission: SchedulerSubmit, mode: Mode): ScheduledOrder {
+export function scheduledFromSubmission(
+  submission: SchedulerSubmit,
+  mode: Mode,
+  /** Which terminal arms it — its own engine will be the one to fire it. */
+  origin: 'hedging' | 'trading' = 'hedging'
+): ScheduledOrder {
   return {
     id: submission.id ?? newScheduleId(),
     action: submission.action,
@@ -423,5 +434,6 @@ export function scheduledFromSubmission(submission: SchedulerSubmit, mode: Mode)
     createdAt: Date.now(),
     modeAtCreation: mode,
     target: submission.target ?? 'options',
+    origin,
   }
 }

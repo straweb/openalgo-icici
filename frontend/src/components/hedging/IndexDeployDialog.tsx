@@ -40,6 +40,12 @@ interface Props {
   strikeInterval?: number
   /** CE share of the capital, for the allocation footnote. */
   ceShare: number
+  /**
+   * Replaces the capital footnote when given: a host whose batches fire on
+   * its own ladder (batch lots × lot size) does not split capital, and the
+   * stock sentence would read as a promise the page does not keep.
+   */
+  capitalNote?: string
   onSubmit(plan: IndexDeploySubmit): void
 }
 
@@ -279,9 +285,8 @@ export function IndexDeployDialog(props: Props) {
           </p>
         )}
         <p className="text-[10px] leading-4 text-muted-foreground">
-          Capital: the {side} side's share ({side === 'CE' ? props.ceShare : 100 - props.ceShare}%)
-          splits evenly across the picked strikes. Triggers run in this browser tab while it stays
-          open.
+          {props.capitalNote ??
+            `Capital: the ${side} side's share (${side === 'CE' ? props.ceShare : 100 - props.ceShare}%) splits evenly across the picked strikes. Triggers run in this browser tab while it stays open.`}
         </p>
 
         {error && <p className="text-[11px] text-destructive">{error}</p>}

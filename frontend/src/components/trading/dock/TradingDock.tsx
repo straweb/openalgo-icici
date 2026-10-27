@@ -44,12 +44,13 @@ import { useBlotter } from './useBlotter'
 // The GTT tab carries its own fetch, dialogs and CSV export; nobody pays
 // for it until the tab is opened.
 const GttTab = lazy(() => import('../GttTab'))
-// The same deal for the two books the hedging terminal shares: the scheduled
-// store read and the index breakdown, each with its own fetches behind it.
-const ScheduledTab = lazy(() =>
-  import('./ScheduledTab').then((m) => ({ default: m.ScheduledTab }))
-)
-const IndexTab = lazy(() => import('./IndexTab').then((m) => ({ default: m.IndexTab })))
+// The scheduled book and the index breakdown are static: they are small,
+// and a lazy chunk that fails to load (a stale build, a cached shell) left
+// this tab saying "Loading" forever — a placeholder the trader could not
+// click past. The code arrives with the dock now, and the tab renders.
+import { ScheduledTab } from './ScheduledTab'
+import { IndexTab } from './IndexTab'
+import { useTradingScheduler } from './useTradingScheduler'
 
 /** The chart's words, so the dock and the chart refuse in one voice. */
 export const REPLAY_REFUSAL = 'Replay is a simulation. Leave replay to trade.'
@@ -81,6 +82,10 @@ export function TradingDock({
   const formatCurrency = useMemo(() => makeFormatCurrency(broker), [broker])
   const { orders, positions, trades, isLoading, error, refresh } = useBlotter({ apiKey, appMode })
   const [modifying, setModifying] = useState<DockOrder | null>(null)
+  // The page's scheduler engine: fires the batches armed on this page
+  // against the deploy ladder, dock open or collapsed — an armed 09:20
+  // batch does not care whether the books are on screen.
+  useTradingScheduler(apiKey)
 
   // Live LTP and P&L over the position rows, only while the dock is open:
   // the collapsed strip shows counts, which do not move with the feed.
@@ -250,23 +255,12 @@ export function TradingDock({
         </Suspense>
       )}
       {tab === 'scheduled' && (
-        <Suspense
-          fallback={
-            <div className="p-3 text-[12px] text-muted-foreground">Loading scheduled</div>
-          }
-        >
-          {/* The shared scheduler store read; it manages rows but never fires
-              them — firing needs the hedging board's context, and a second
-              engine here would double-place the batch. */}
-          <ScheduledTab />
-        </Suspense>
+        // The shared scheduler store: rows this page armed fire here, the
+        // hedging terminal's fire there.
+        <ScheduledTab apiKey={apiKey} activeSymbol={activeSymbol} />
       )}
       {tab === 'index' && (
-        <Suspense
-          fallback={<div className="p-3 text-[12px] text-muted-foreground">Loading index</div>}
-        >
-          <IndexTab apiKey={apiKey} activeSymbol={activeSymbol} onPick={onPick} />
-        </Suspense>
+        <IndexTab apiKey={apiKey} activeSymbol={activeSymbol} onPick={onPick} />
       )}
       <ModifyOrderDialog
         order={modifying}

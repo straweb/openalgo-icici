@@ -184,6 +184,12 @@ export interface ScheduledDeployPlan {
   stop?: number | null
   /** Where the target/stop triggers read the index price. */
   spot?: { symbol: string; exchange: string } | null
+  /**
+   * The F&O exchange the strikes trade on. The hedging terminal reads it
+   * from its tab; the charting terminal's engine needs it to find the
+   * ladder (a SENSEX spot would not, alone, say BFO). Absent reads as NFO.
+   */
+  exchange?: string
 }
 
 /**
@@ -205,6 +211,13 @@ export interface ScheduledOrder {
   target?: ScheduleTarget
   /** Present on index-level deploys: fire exactly these strikes. */
   deploy?: ScheduledDeployPlan
+  /**
+   * Which terminal armed the row, so each page's engine fires only its own
+   * batches: the charting terminal's rows run its deploy ladder, the hedging
+   * terminal's run its boards. Absent on rows armed before the split — they
+   * belong to the hedging terminal, where the scheduler was born.
+   */
+  origin?: 'hedging' | 'trading'
 }
 
 export interface HedgingState {

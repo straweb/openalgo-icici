@@ -181,13 +181,22 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision }: Props) {
   /* ── add strips ────────────────────────────────────────────────────────── */
   const addStrikes = useCallback(
     (strikes: number[]) => {
-      const { rows: next } = rowsFromStrikes(chain, side, strikes, rows, optionsExchange)
+      const { rows: next, skipped } = rowsFromStrikes(chain, side, strikes, rows, optionsExchange)
       patchRows(side, next)
+      // A strike the snapshot does not list is not invented — but a click
+      // that adds nothing must say so, or it reads as a dead button.
+      if (skipped.length > 0) {
+        showToast.warning(
+          `${side}: ${skipped.length} strike${skipped.length === 1 ? '' : 's'} not on the chain snapshot (not listed) — the rest added.`
+        )
+      }
     },
     [chain, side, rows, optionsExchange, patchRows]
   )
 
-  const atm = chain?.atm_strike ?? null
+  // The snapshot's ATM anchors the ladder; a broker that omits the field
+  // falls back to the underlying LTP rounded onto the strike grid, so the
+  // strip still works instead of waiting on a field that never lands.
   const interval = useMemo(() => {
     const strikes = chain?.chain.map((row) => row.strike) ?? []
     if (strikes.length < 2) return 0
@@ -195,6 +204,9 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision }: Props) {
     const gaps = sorted.slice(1).map((s, i) => s - sorted[i])
     return Math.min(...gaps.filter((g) => g > 0)) || 0
   }, [chain])
+  const atm =
+    chain?.atm_strike ||
+    (chain?.underlying_ltp && interval ? Math.round(chain.underlying_ltp / interval) * interval : null)
 
   // The ± button inverts what "1..10" and the N picker mean: offsets above or
   // below ATM, exactly the hedging add-strip's behaviour.
@@ -507,6 +519,12 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision }: Props) {
       {chainError && (
         <div className="border-b bg-destructive/10 px-2 py-1 text-[10px] text-destructive">
           {chainError}
+        </div>
+      )}
+      {!atm && underlying && !chainError && (
+        <div className="border-b bg-muted/40 px-2 py-1 text-[10px] text-muted-foreground">
+          Waiting for {underlying}'s chain snapshot — the ATM and offset picks land with it. The{' '}
+          <CirclePlus className="inline h-2.5 w-2.5" /> button adds any strike by hand meanwhile.
         </div>
       )}
 

@@ -44,6 +44,7 @@ import {
   isDue as scheduleIsDue,
   scheduleTriggerLabel,
 } from '@/lib/hedging/scheduler'
+import { claimEngineLock, releaseEngineLock } from '@/lib/hedging/engineLock'
 import {
   loadHedgingState,
   makeOptionRow,
@@ -996,11 +997,23 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
   // The engine tick: quotes and batch actions read through the refs above
   // (marketDataRef / quoteSymbolsRef), so the one-second cadence is stable
   // regardless of how fast the feed re-renders.
+  const schedulerEngineId = useRef(
+    `hedging-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`
+  ).current
+  useEffect(() => {
+    return () => releaseEngineLock('hedging', schedulerEngineId)
+  }, [schedulerEngineId])
   useEffect(() => {
     const timer = window.setInterval(() => {
+      // One engine per terminal, even with the page open in two browser
+      // tabs: the cross-tab lock lets exactly one tab's tick fire. And the
+      // charting terminal's batches belong to that page's engine — its
+      // deploy ladder is a market this terminal's boards cannot speak for.
+      if (!claimEngineLock('hedging', schedulerEngineId)) return
       const now = new Date()
       for (const entry of state.scheduled) {
         if (entry.status !== 'pending') continue
+        if (entry.origin === 'trading') continue
         if (firingSchedules.current.has(entry.id)) continue
         const due = scheduleIsDue(entry, {
           now,

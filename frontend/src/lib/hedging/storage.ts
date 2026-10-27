@@ -250,7 +250,9 @@ export function hydrateState(raw: unknown): HedgingState {
         : DEFAULT_STATE.capital,
     capitalSource,
     capitalBasis:
-      source.capitalBasis === 'withPnl' || source.capitalBasis === 'house'
+      source.capitalBasis === 'withPnl' ||
+      source.capitalBasis === 'house' ||
+      source.capitalBasis === 'available'
         ? source.capitalBasis
         : 'initial',
     capitalPercent:

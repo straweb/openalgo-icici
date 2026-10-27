@@ -18,6 +18,10 @@ import type { CapitalBasis } from '@/types/hedging'
  *   has realized so far. After the first trade the trader is playing with the
  *   house's money — a losing start means no further deployments, never a
  *   top-up.
+ * - `available`: no allocation lock at all. The account's whole available
+ *   cash plus the session's P&L is the usable capital — the trader who does
+ *   not want any of the session arithmetic picks this and lets the full
+ *   account work.
  *
  * Losses and costs enter through the P&L the books report: a flattened
  * position's net result (brokerage and taxes included, as brokers report it)
@@ -65,5 +69,9 @@ export function usableCapital(basis: CapitalBasis, inputs: CapitalInputs): numbe
     case 'house':
       // First deployment spends the allocation; afterwards only realized profit.
       return inputs.deployedOnce ? Math.max(0, realized) : base
+    case 'available':
+      // The whole account works: available cash plus the session P&L, with
+      // no allocated amount locked aside.
+      return Math.max(0, (Number.isFinite(inputs.cash) ? inputs.cash : 0) + pnl)
   }
 }

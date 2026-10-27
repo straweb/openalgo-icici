@@ -101,3 +101,28 @@ describe('usableCapital — house basis', () => {
     ).toBe(100_000)
   })
 })
+
+describe('the available basis — the whole account, no allocation lock', () => {
+  const base = { base: 75_000, cash: 100_000, deployedOnce: false }
+
+  it('spends the entire available cash plus the session P&L', () => {
+    expect(usableCapital('available', { ...base, dayPnl: 9_000, realizedPnl: 6_500 })).toBe(109_000)
+  })
+
+  it('ignores the allocated amount entirely — nothing is locked', () => {
+    expect(
+      usableCapital('available', { base: 10_000, cash: 100_000, dayPnl: 0, realizedPnl: 0, deployedOnce: false })
+    ).toBe(100_000)
+  })
+
+  it('a losing session shrinks what can deploy, never below zero', () => {
+    expect(usableCapital('available', { ...base, dayPnl: -40_000, realizedPnl: -40_000 })).toBe(60_000)
+    expect(usableCapital('available', { ...base, dayPnl: -150_000, realizedPnl: -150_000 })).toBe(0)
+  })
+
+  it('non-finite cash reads as zero so the P&L alone cannot invent money', () => {
+    expect(
+      usableCapital('available', { ...base, cash: Number.NaN, dayPnl: 5_000, realizedPnl: 5_000 })
+    ).toBe(5_000)
+  })
+})

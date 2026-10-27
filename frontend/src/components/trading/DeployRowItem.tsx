@@ -1,13 +1,14 @@
 /**
  * One row of the Deploy panel, drawn the way a trader reads a ladder:
  *
- * Line 1 — what it is: the symbol tile (strike with its ATM/ITM/OTM badge,
- * or the stock's name), its price, and to the right the row's P&L plus the
- * Close / Min / Chart actions.
+ * Line 1 — what it is: the symbol tile (strike with its ITM/OTM badge, or
+ * the stock's name), its price, and to the right the row's P&L plus the
+ * Min / Chart / remove actions.
  *
- * Line 2 — what it trades: the percent of the funds this row carries and
- * the lots (or shares) that percent buys right now, the live LTP, and the
- * Edit / Exit / Buy / Sell actions.
+ * Line 2 — what it trades: the percent of the funds this row carries — a
+ * slider plus a type-in box — the lots (or shares) that percent buys right
+ * now, the rupee amount that quantity needs, and the Edit / Exit /
+ * Buy / Sell actions.
  *
  * Line 3 — the levels, behind the Edit press: entry, target, stop. The row
  * lights when its instrument is the charted one, when a position or a live
@@ -18,7 +19,7 @@ import { ChevronDown, ChevronUp, LineChart, Minimize2, Pencil, X } from 'lucide-
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { autoLots, type DeployRow } from '@/lib/trading/deployPlan'
+import { autoLots, rowRequired, type DeployRow } from '@/lib/trading/deployPlan'
 import { cn } from '@/lib/utils'
 
 const fmtINR = (value: number): string => {
@@ -49,8 +50,6 @@ interface Props {
   onFire(action: 'BUY' | 'SELL'): void
   /** Sell this row's planned quantity (the quick flat, per row). */
   onExit(): void
-  /** Flatten the broker position on this symbol, whatever its size. */
-  onClosePosition(): void
   onChart(): void
   onRemove(): void
 }
@@ -100,6 +99,7 @@ export function DeployRowItem(props: Props) {
   const manual = row.lots > 0
   const autoLotCount = autoLots(row, ltp, props.capital)
   const qty = manual ? row.lots * row.lotSize : autoLotCount * row.lotSize
+  const required = rowRequired(row, ltp, props.capital)
   const showLevels = !props.collapsed && editOpen
   const perUnit = row.lotSize > 1 ? `${row.lotSize}/lot` : 'sh'
   return (
@@ -145,7 +145,7 @@ export function DeployRowItem(props: Props) {
         {props.offsetLabel && (
           <span
             className="shrink-0 rounded bg-muted px-1 text-[8px] font-semibold text-muted-foreground"
-            title="Offset from ATM"
+            title="Moneyness — ITM: in the money, OTM: out of the money. The at-the-money strike reads ITM on calls, OTM on puts."
           >
             {props.offsetLabel}
           </span>
@@ -172,20 +172,6 @@ export function DeployRowItem(props: Props) {
         >
           {props.pnl != null ? fmtINR(props.pnl) : '—'}
         </span>
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-5 shrink-0 px-1 text-[9px]"
-          disabled={!props.hasPosition}
-          onClick={props.onClosePosition}
-          title={
-            props.hasPosition
-              ? 'Close this position at the market'
-              : 'No open position on this instrument'
-          }
-        >
-          Close
-        </Button>
         <Button
           size="sm"
           variant="ghost"
@@ -219,7 +205,7 @@ export function DeployRowItem(props: Props) {
         </Button>
       </div>
 
-      {/* Line 2: sizing + ltp + trade actions */}
+      {/* Line 2: sizing (slider + percent) + required amount + trade actions */}
       {!props.collapsed && (
         <div className="mt-0.5 flex flex-wrap items-center gap-1">
           <span
@@ -239,6 +225,16 @@ export function DeployRowItem(props: Props) {
             />
             <span className="text-[9px] text-muted-foreground">%</span>
           </span>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={0.5}
+            value={Math.min(100, Math.max(0, row.weight))}
+            onChange={(e) => props.onWeight(Number(e.target.value))}
+            className="h-1 w-14 shrink-0 cursor-pointer accent-sky-600"
+            aria-label="Weight percent slider"
+          />
           <span
             className="min-w-[58px] font-mono text-[10px] tabular-nums"
             title={
@@ -259,11 +255,11 @@ export function DeployRowItem(props: Props) {
           <span
             className={cn(
               'font-mono text-[10px] tabular-nums',
-              ltp == null ? 'text-muted-foreground' : ''
+              required <= 0 ? 'text-muted-foreground' : 'text-foreground'
             )}
-            title="Live price"
+            title="Amount required to buy this row's quantity at the live price"
           >
-            {ltp != null ? ltp.toFixed(2) : 'LTP —'}
+            {required > 0 ? `≈ ${fmtINR(required)}` : '≈ ₹0'}
           </span>
           <div className="ml-auto flex items-center gap-1">
             <Button

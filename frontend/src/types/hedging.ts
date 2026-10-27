@@ -32,8 +32,10 @@ export type SideMode = 'percentage' | 'fixed'
  * - house   : the first deployment of the session spends the full allocated
  *             capital; every deployment after that may only spend the profit
  *             the session has realized (trading with the house's money).
+ * - available: no allocation at all — the whole available cash plus the
+ *             session's P&L is the usable capital, nothing is locked.
  */
-export type CapitalBasis = 'initial' | 'withPnl' | 'house'
+export type CapitalBasis = 'initial' | 'withPnl' | 'house' | 'available'
 /** How the allocated capital itself is picked: a rupee amount or % of cash. */
 export type CapitalSource = 'fixed' | 'percent'
 export type HedgingProduct = 'MIS' | 'NRML' | 'CNC'

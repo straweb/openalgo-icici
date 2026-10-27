@@ -83,6 +83,7 @@ const BASIS_LABEL: Record<CapitalBasis, string> = {
   initial: 'Initial',
   withPnl: '+ P&L',
   house: 'House',
+  available: 'All',
 }
 
 /**
@@ -103,6 +104,8 @@ const BASIS_HINT: Record<CapitalBasis, string> = {
   withPnl: 'Allocation plus session P&L — profit recycles into new trades at any time.',
   house:
     'First deployment spends the allocation; after that only the profit the session has realized can be deployed.',
+  available:
+    'No allocation lock: the entire available cash plus the session P&L is what this session can deploy.',
 }
 
 interface Props {

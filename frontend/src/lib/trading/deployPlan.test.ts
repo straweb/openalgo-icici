@@ -13,6 +13,7 @@ import {
   reconcileConstructed,
   rowsFromStrikes,
   rowQty,
+  rowRequired,
   sideOfRow,
   slideSideWeight,
   stockRowFromSearch,
@@ -268,5 +269,63 @@ describe('v2 books hydrate forward', () => {
     expect(row?.kind).toBe('option')
     expect(row?.weight).toBe(0)
     expect(row?.entry).toBeNull()
+  })
+})
+
+describe('the workspace binding', () => {
+  it('the bound underlying survives a hydrate round-trip', () => {
+    const state = defaultDeployState()
+    state.workspace = { symbol: 'NIFTY', exchange: 'NSE_INDEX' }
+    const back = hydrateDeployState(JSON.parse(JSON.stringify(state)))
+    expect(back.workspace).toEqual({ symbol: 'NIFTY', exchange: 'NSE_INDEX' })
+  })
+
+  it('a book saved before the binding reads as unbound', () => {
+    expect(hydrateDeployState({ books: {}, stocks: [] }).workspace).toBeUndefined()
+  })
+
+  it('a malformed binding is dropped, not half-kept', () => {
+    expect(hydrateDeployState({ workspace: { exchange: 'NSE' } }).workspace).toBeUndefined()
+    expect(hydrateDeployState({ workspace: { symbol: '' } }).workspace).toBeUndefined()
+  })
+
+  it('a binding without an exchange defaults to NSE', () => {
+    expect(hydrateDeployState({ workspace: { symbol: 'RELIANCE' } }).workspace).toEqual({
+      symbol: 'RELIANCE',
+      exchange: 'NSE',
+    })
+  })
+})
+
+describe('rowRequired — the amount a row needs', () => {
+  const row = (over: Partial<Parameters<typeof rowRequired>[0]> = {}): Parameters<typeof rowRequired>[0] => ({
+    symbol: 'NIFTY28OCT2624500CE',
+    exchange: 'NFO',
+    kind: 'option',
+    strike: 24500,
+    optionType: 'CE',
+    lotSize: 75,
+    enabled: true,
+    lots: 0,
+    weight: 50,
+    entry: null,
+    target: null,
+    stoploss: null,
+    ...over,
+  })
+
+  it('quantity x ltp for a weight-sized row', () => {
+    // budget 50% of 200000 = 100000; per lot 250 x 75 = 18750 → 5 lots = 375 qty
+    expect(rowRequired(row(), 250, 200_000)).toBe(375 * 250)
+  })
+
+  it('manual lots override the weight', () => {
+    expect(rowRequired(row({ lots: 2 }), 250, 200_000)).toBe(150 * 250)
+  })
+
+  it('no price or an unaffordable row reads as zero, never NaN', () => {
+    expect(rowRequired(row(), undefined, 200_000)).toBe(0)
+    expect(rowRequired(row(), 0, 200_000)).toBe(0)
+    expect(rowRequired(row({ weight: 0, lots: 0 }), 250, 200_000)).toBe(0)
   })
 })

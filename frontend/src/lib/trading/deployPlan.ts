@@ -64,6 +64,13 @@ export interface DeployBook {
   product: 'MIS' | 'NRML' | 'CNC'
   pricetype: 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
   lots: number
+  /**
+   * The instrument the panel is bound to — the workspace binding, not the
+   * chart's. Multi-layout grids let the trader focus any pane without the
+   * panel following it; only the title combobox moves this binding, and it
+   * survives a reload.
+   */
+  workspace?: { symbol: string; exchange: string }
 }
 
 export function bookKey(exchange: string, underlying: string): string {
@@ -90,6 +97,16 @@ function nullableNum(value: unknown): number | null {
   if (value === null || value === undefined) return null
   const n = Number(value)
   return Number.isFinite(n) && n > 0 ? n : null
+}
+
+function hydrateWorkspace(raw: unknown): DeployBook['workspace'] | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const r = raw as Record<string, unknown>
+  if (typeof r.symbol !== 'string' || r.symbol.length === 0) return undefined
+  return {
+    symbol: r.symbol,
+    exchange: typeof r.exchange === 'string' && r.exchange ? r.exchange : 'NSE',
+  }
 }
 
 function hydrateRow(raw: unknown, defaultKind: RowKind): DeployRow | null {
@@ -157,6 +174,7 @@ export function hydrateDeployState(raw: unknown): DeployBook {
       .filter((row): row is DeployRow => row !== null)
       .map((row) => ({ ...row, kind: 'stock' as const }))
   }
+  base.workspace = hydrateWorkspace(r.workspace)
   return base
 }
 
@@ -288,6 +306,16 @@ export function rowQty(row: DeployRow, ltp: number | undefined, capital: number)
   const lots = row.lots > 0 ? row.lots : autoLots(row, ltp, capital)
   if (lots <= 0) return 0
   return lots * row.lotSize
+}
+
+/**
+ * The rupees this row needs to buy its planned quantity at the live price —
+ * the sizing row's number (quantity x LTP), 0 when nothing can be sized.
+ */
+export function rowRequired(row: DeployRow, ltp: number | undefined, capital: number): number {
+  const qty = rowQty(row, ltp, capital)
+  if (qty <= 0 || ltp === undefined || !Number.isFinite(ltp) || ltp <= 0) return 0
+  return qty * ltp
 }
 
 /* ── symbols built before the chain lands ────────────────────────────────── */

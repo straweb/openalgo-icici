@@ -11,10 +11,16 @@
  *
  * Nothing waits for the chain snapshot: the ATM and the offset picks come
  * from the underlying's live quote on the underlying's default strike grid
- * (the chain's own spacing overrides it the moment it lands). Strikes added
+ * (the chain's own spacing overrides it the moment it lands). A missed
+ * snapshot is a poll away — the panel never banners it. Strikes added
  * before the snapshot arrives carry the OpenAlgo symbol convention
  * (`NIFTY09NOV2617350CE`) and the reconcile pass swaps each for the chain's
  * exact listed symbol when the snapshot comes in.
+ *
+ * The panel binds to the workspace, not to the focused chart: multi-layout
+ * grids can move the trader's focus pane without moving what this panel
+ * trades. Only the title combobox (or the FNO/Equity switch beside it)
+ * changes the binding, and the binding survives a reload.
  *
  * Sizing is capital-weighted the hedging engine's way: every side — CALLS,
  * PUTS and the stock list — divides the funds across its enabled rows, and
@@ -61,6 +67,7 @@ import {
   bookKey,
   chainLtp,
   constructedRows,
+  defaultLotSize,
   defaultStrikeStep,
   equalSplitSide,
   ensureSideWeights,
@@ -106,8 +113,8 @@ interface Props {
   apiKey: string
   /**
    * The focused pane's instrument, read fresh like the Backtest panel reads
-   * its own: the ladder follows the chart the trader is looking at, and the
-   * revision tells the panel when that answer has changed.
+   * its own — used ONLY to seed the workspace binding at mount and to light
+   * the row that is on the chart. The binding itself never follows it.
    */
   getChartContext(): ChartContext | null
   chartRevision: number
@@ -140,6 +147,16 @@ const NO_BUSY: Record<BusyKey, boolean> = {
 
 export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: Props) {
   const [state, setState] = useState<DeployBook>(() => ensureSideWeights(readDeployState()))
+  /**
+   * The workspace binding — the panel's own instrument. Seeded from the
+   * persisted state (or the charted one at mount), then moved only by the
+   * title combobox; focusing another pane never moves it.
+   */
+  const [workspace, setWorkspace] = useState<{ symbol: string; exchange: string } | null>(
+    () => state.workspace ?? getChartContext()
+  )
+  /** FNO / Equity switch: auto until the trader flips it for this underlying. */
+  const [modeOverride, setModeOverride] = useState<'auto' | 'fno' | 'equity'>('auto')
   const [side, setSide] = useState<'CE' | 'PE'>('CE')
   const [dir, setDir] = useState<1 | -1>(1)
   const [chain, setChain] = useState<OptionChainResponse | null>(null)
@@ -150,7 +167,8 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   const [custom, setCustom] = useState('')
   const [customOpen, setCustomOpen] = useState(false)
   const [busy, setBusy] = useState<Record<BusyKey, boolean>>(NO_BUSY)
-  const [chainError, setChainError] = useState<string | null>(null)
+  const [expiryNotice, setExpiryNotice] = useState<string | null>(null)
+  const [expiryFailed, setExpiryFailed] = useState(false)
   const [underlyingLtp, setUnderlyingLtp] = useState<number | undefined>(undefined)
   const [quotes, setQuotes] = useState<Record<string, number>>({})
   const [funds, setFunds] = useState(0)
@@ -171,20 +189,34 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     writeDeployState(next)
   }, [])
 
-  /** The charted instrument and the options exchange its derivatives trade on. */
-  const ctx = useMemo(
+  /** The charted instrument — row highlighting only; the binding never follows it. */
+  const charted = useMemo(
     () => getChartContext(),
     // Deliberate re-read trigger, the Backtest panel's chartRevision contract:
     // the chart is not a React value, the counter says when to ask again.
     // biome-ignore lint/correctness/useExhaustiveDependencies: revision is the re-read trigger
     [getChartContext, chartRevision]
   )
-  const underlying = ctx?.symbol ?? ''
-  const optionsExchange = useMemo(() => fnoExchangeFor(ctx?.exchange ?? 'NSE'), [ctx?.exchange])
+  const underlying = workspace?.symbol ?? ''
+  const optionsExchange = useMemo(
+    () => fnoExchangeFor(workspace?.exchange ?? 'NSE'),
+    [workspace?.exchange]
+  )
   const key = bookKey(optionsExchange, underlying)
   const ladder = state.books[key] ?? { ce: [], pe: [] }
-  /** Options when the underlying lists them; a stock list when it does not. */
-  const optionsMode = expiries.length > 0
+  /** Options when the underlying lists them — or when the trader flips to FNO. */
+  const optionsMode =
+    modeOverride === 'fno' ? true : modeOverride === 'equity' ? false : expiries.length > 0
+
+  /** The title combobox is the only thing that moves the binding. */
+  const bindWorkspace = useCallback((pick: { symbol: string; exchange: string }) => {
+    setWorkspace(pick)
+    setState((previous) => {
+      const next: DeployBook = { ...previous, workspace: pick }
+      writeDeployState(next)
+      return next
+    })
+  }, [])
 
   const patchRows = useCallback(
     (side: 'CE' | 'PE', rows: DeployRow[]) => {
@@ -213,7 +245,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     })
   }, [])
 
-  /* ── expiries, then the chain ─────────────────────────────────────────── */
+  /* ── expiries, then the chain ───────────────────────────────────── */
   const loadExpiries = useCallback(async () => {
     if (!underlying) return
     try {
@@ -221,10 +253,12 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
       const list = res.data ?? []
       setExpiries(list)
       setExpiry((current) => (current && list.includes(current) ? current : (list[0] ?? '')))
-      setChainError(list.length === 0 ? `${underlying} has no option chain listed` : null)
+      setExpiryFailed(false)
+      setExpiryNotice(list.length === 0 ? `${underlying} has no option chain listed` : null)
     } catch {
       setExpiries([])
-      setChainError(`Could not load expiries for ${underlying}`)
+      setExpiryFailed(true)
+      setExpiryNotice(`Could not load expiries for ${underlying}`)
     }
   }, [underlying, optionsExchange])
 
@@ -232,23 +266,33 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     setChain(null)
     setExpiries([])
     setExpiry('')
-    setChainError(null)
+    setExpiryNotice(null)
+    setExpiryFailed(false)
     setUnderlyingLtp(undefined)
+    setModeOverride('auto')
     void loadExpiries()
   }, [loadExpiries])
 
+  // A transient expiry miss retries quietly — the mode detection and the
+  // expiry select both hang off this one list, so it must land.
+  useEffect(() => {
+    if (!underlying || !expiryFailed) return
+    const timer = window.setInterval(() => void loadExpiries(), 15000)
+    return () => window.clearInterval(timer)
+  }, [underlying, expiryFailed, loadExpiries])
+
+  /**
+   * The chain snapshot, polled. A missed or failed poll keeps the last good
+   * chain and stays silent: the ATM and the picks work off the live quote,
+   * so an intermittent broker hiccup never becomes a red banner.
+   */
   const loadChain = useCallback(async () => {
     if (!underlying || !expiry) return
     try {
       const res = await optionChainApi.getOptionChain(apiKey, underlying, optionsExchange, expiry, 50)
-      if (res.status === 'success') {
-        setChain(res)
-        setChainError(null)
-      } else {
-        setChainError(res.message || 'Chain snapshot unavailable')
-      }
+      if (res.status === 'success') setChain(res)
     } catch {
-      setChainError('Chain snapshot unavailable')
+      // the next poll retries; the quote-driven picks keep working meanwhile
     }
   }, [apiKey, underlying, optionsExchange, expiry])
 
@@ -291,7 +335,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     let alive = true
     const poll = async () => {
       const candidates: string[] = []
-      if (ctx?.exchange) candidates.push(ctx.exchange)
+      if (workspace?.exchange) candidates.push(workspace.exchange)
       for (const fallback of ['NSE_INDEX', 'NSE']) {
         if (!candidates.includes(fallback)) candidates.push(fallback)
       }
@@ -315,7 +359,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
       alive = false
       window.clearInterval(timer)
     }
-  }, [apiKey, underlying, ctx?.exchange])
+  }, [apiKey, underlying, workspace?.exchange])
 
   /* ── row quotes: the ladder's prices off the chain AND the quotes feed ── */
   const rowSymbols = useMemo(() => {
@@ -426,6 +470,12 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     [quotes, chain]
   )
   const sizing = useMemo(() => ({ capital: funds, ltpOf }), [funds, ltpOf])
+  /** One lot (or one share) of the bound underlying, in rupees, for the title. */
+  const titleLotSize = optionsMode
+    ? chain?.chain[0]?.ce?.lotsize ||
+      chain?.chain[0]?.pe?.lotsize ||
+      defaultLotSize(underlying)
+    : 1
 
   /* ── add strips ───────────────────────────────────────────────────────── */
   const addStrikes = useCallback(
@@ -458,7 +508,10 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   )
 
   // The ± button inverts what "1..10" and the N picker mean: offsets above or
-  // below ATM, exactly the hedging add-strip's behaviour.
+  // below ATM, exactly the hedging add-strip's behaviour — named in the
+  // option's own terms, a call goes OTM above the spot, a put goes ITM.
+  const dirLabel = side === 'CE' ? (dir === 1 ? 'OTM' : 'ITM') : dir === 1 ? 'ITM' : 'OTM'
+
   const offsetStrikes = (offsets: number[]) => {
     if (!atm || !interval) return []
     return offsets.map((offset) => atm + offset * interval * dir)
@@ -639,19 +692,6 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     }
   }, [optionsMode, ladder, state.lots, sizing, placeOrders, fireStocks])
 
-  const closeRowPosition = useCallback(
-    async (row: DeployRow) => {
-      try {
-        const res = await tradingApi.closePosition(row.symbol, row.exchange, state.product)
-        if (res.status === 'success') showToast.success(`Close ${row.symbol}: position closed`)
-        else showToast.error(`Close ${row.symbol}: ${res.message || 'failed'}`)
-      } catch {
-        showToast.error(`Close ${row.symbol}: failed`)
-      }
-    },
-    [state.product]
-  )
-
   /* ── Schedule: the dock's dialog, pointed at this panel's ladder ──────── */
   const spot = useMemo(() => {
     if (chain?.underlying_symbol) {
@@ -661,8 +701,8 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
       }
     }
     if (!underlying) return null
-    return { symbol: underlying, exchange: ctx?.exchange === 'NSE' ? 'NSE' : 'NSE_INDEX' }
-  }, [chain, underlying, optionsExchange, ctx?.exchange])
+    return { symbol: underlying, exchange: workspace?.exchange === 'NSE' ? 'NSE' : 'NSE_INDEX' }
+  }, [chain, underlying, optionsExchange, workspace?.exchange])
 
   const submitSchedule = useCallback(
     (submission: SchedulerSubmit) => {
@@ -815,15 +855,55 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
         <span className="text-[12px] font-semibold">Deploy</span>
         <SymbolCombobox
           apiKey={apiKey}
-          current={underlying ? { symbol: underlying, exchange: ctx?.exchange ?? optionsExchange } : null}
-          onPick={(hit) =>
+          current={workspace}
+          onPick={(hit) => {
+            bindWorkspace({ symbol: hit.symbol, exchange: hit.exchange })
             onPick({ symbol: hit.symbol, exchange: hit.exchange, name: hit.name })
-          }
+          }}
           placeholder="NIFTY, RELIANCE, TCS…"
         />
+        {/* FNO / Equity: what this panel trades — the ladder or the stock list. */}
+        <div
+          className="flex shrink-0 overflow-hidden rounded border"
+          title="FNO trades the option ladder; Equity trades the stock list"
+        >
+          {(['FNO', 'EQ'] as const).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => setModeOverride(mode === 'FNO' ? 'fno' : 'equity')}
+              className={cn(
+                'px-1.5 py-0.5 text-[9px] font-semibold transition-colors',
+                (mode === 'FNO') === optionsMode
+                  ? 'bg-sky-700 text-white'
+                  : 'bg-background text-muted-foreground hover:bg-accent'
+              )}
+            >
+              {mode}
+            </button>
+          ))}
+        </div>
+        <span
+          className="ml-auto shrink-0 font-mono text-[10px] tabular-nums"
+          title={
+            optionsMode
+              ? 'The underlying LTP and the rupees one lot of it carries'
+              : 'The LTP and the rupees one share carries'
+          }
+        >
+          {underlyingLtp != null
+            ? underlyingLtp.toLocaleString('en-IN', { maximumFractionDigits: 2 })
+            : '—'}
+          {underlyingLtp != null && (
+            <span className="ml-1 text-muted-foreground">
+              · {optionsMode ? '1 lot' : '1 sh'} ₹
+              {(underlyingLtp * titleLotSize).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+            </span>
+          )}
+        </span>
         {optionsMode && (
           <Select value={expiry} onValueChange={setExpiry} disabled={expiries.length === 0}>
-            <SelectTrigger className="ml-auto h-6 w-[104px] px-1.5 text-[10px]">
+            <SelectTrigger className="h-6 w-[104px] shrink-0 px-1.5 text-[10px]">
               <SelectValue placeholder="Expiry" />
             </SelectTrigger>
             <SelectContent className="text-[11px]">
@@ -848,9 +928,9 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
         )}
       </div>
 
-      {chainError && optionsMode && (
-        <div className="border-b bg-destructive/10 px-2 py-1 text-[10px] text-destructive">
-          {chainError}
+      {expiryNotice && (
+        <div className="border-b bg-amber-500/10 px-2 py-1 text-[10px] text-amber-700">
+          {expiryNotice}
         </div>
       )}
       {optionsMode && underlying && !atm && (
@@ -895,11 +975,11 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
           <Button
             size="sm"
             variant="outline"
-            className="h-5 w-5 px-0 text-[10px] font-bold"
+            className="h-5 w-9 px-0 text-[10px] font-bold"
             onClick={() => setDir((value) => (value === 1 ? -1 : 1))}
-            title={`Offsets go ${dir === 1 ? 'above' : 'below'} ATM`}
+            title={`Picks go ${dir === 1 ? 'above' : 'below'} ATM — ${dirLabel} for ${side}`}
           >
-            {dir === 1 ? '+' : '−'}
+            {dirLabel}
           </Button>
           {OFFSET_BUTTONS.map((offset) => (
             <Button
@@ -909,7 +989,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
               className="h-5 min-w-5 px-1 text-[10px]"
               disabled={!atm || !interval}
               onClick={() => addStrikes(offsetStrikes([offset]))}
-              title={`Add ATM ${dir === 1 ? '+' : '−'}${offset}`}
+              title={`Add ${dirLabel} ${offset} (${dir === 1 ? 'above' : 'below'} ATM)`}
             >
               {offset}
             </Button>
@@ -1034,7 +1114,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                 positions={positions}
                 orderKeys={orderKeys}
                 collapsed={collapsed}
-                chartSymbol={ctx?.symbol ?? null}
+                chartSymbol={charted?.symbol ?? null}
                 onToggleCollapse={(symbol) =>
                   setCollapsed((previous) => {
                     const next = new Set(previous)
@@ -1078,10 +1158,6 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                   }
                   void placeOrders([{ symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty }])
                 }}
-                onClosePosition={(symbol) => {
-                  const row = ladder.ce.find((r) => r.symbol === symbol)
-                  if (row) void closeRowPosition(row)
-                }}
                 onChart={(row) => onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })}
               />
             </ResizablePanel>
@@ -1099,7 +1175,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                 positions={positions}
                 orderKeys={orderKeys}
                 collapsed={collapsed}
-                chartSymbol={ctx?.symbol ?? null}
+                chartSymbol={charted?.symbol ?? null}
                 onToggleCollapse={(symbol) =>
                   setCollapsed((previous) => {
                     const next = new Set(previous)
@@ -1143,10 +1219,6 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                   }
                   void placeOrders([{ symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty }])
                 }}
-                onClosePosition={(symbol) => {
-                  const row = ladder.pe.find((r) => r.symbol === symbol)
-                  if (row) void closeRowPosition(row)
-                }}
                 onChart={(row) => onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })}
               />
             </ResizablePanel>
@@ -1168,7 +1240,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                 offsetLabel={null}
                 capital={funds}
                 pnl={rowPnl(row, positions, sizing)}
-                inChart={ctx?.symbol === row.symbol}
+                inChart={charted?.symbol === row.symbol}
                 hasPosition={positions.has(`${row.exchange}:${row.symbol}`)}
                 hasOrder={orderKeys.has(`${row.exchange}:${row.symbol}`)}
                 targetHit={row.target != null && ltpOf(row) != null && (ltpOf(row) as number) >= row.target}
@@ -1219,7 +1291,6 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                     { symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty },
                   ])
                 }}
-                onClosePosition={() => void closeRowPosition(row)}
                 onChart={() => onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })}
               />
             ))}
@@ -1274,9 +1345,10 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
             </>
           )}
           <span
-            className="ml-auto font-mono text-[10px] tabular-nums text-muted-foreground"
-            title="Available cash the percent shares divide"
+            className="ml-auto flex items-baseline gap-1 font-mono text-[10px] tabular-nums text-muted-foreground"
+            title="Available capital the percent shares divide"
           >
+            <span className="text-[9px] font-semibold uppercase">Avail</span>
             ₹{funds.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
           </span>
           {optionsMode && (
@@ -1385,7 +1457,12 @@ function rowPnl(
   return (ltp - row.entry) * qty
 }
 
-/** "ATM" / "ITM 2" / "OTM 3", read from the row's own option type. */
+/**
+ * The moneyness badge, in the option's own terms: a CALL above the spot is
+ * OTM (and the at-the-money strike itself reads ITM), a PUT above the spot
+ * is ITM (and the at-the-money strike itself reads OTM). Steps carry their
+ * distance — "OTM 3" is three strikes past the money on that side.
+ */
 function sideOffsetLabel(
   row: DeployRow,
   atm: number | null,
@@ -1393,9 +1470,12 @@ function sideOffsetLabel(
 ): string | null {
   if (row.kind !== 'option' || atm == null || !interval) return null
   const off = Math.round((row.strike - atm) / interval)
-  if (off === 0) return 'ATM'
-  const itm = row.optionType === 'CE' ? off < 0 : off > 0
-  return `${itm ? 'ITM' : 'OTM'} ${Math.abs(off)}`
+  if (row.optionType === 'CE') {
+    if (off === 0) return 'ITM'
+    return off > 0 ? `OTM ${off}` : `ITM ${Math.abs(off)}`
+  }
+  if (off === 0) return 'OTM'
+  return off > 0 ? `ITM ${off}` : `OTM ${Math.abs(off)}`
 }
 
 /* ── one side's pane ─────────────────────────────────────────────────────── */
@@ -1423,7 +1503,6 @@ function SidePane(props: {
   onRemove(symbol: string): void
   onFire(symbol: string, action: 'BUY' | 'SELL'): void
   onExit(symbol: string): void
-  onClosePosition(symbol: string): void
   onChart(row: DeployRow): void
 }) {
   const ltpOfRow = useCallback(
@@ -1482,7 +1561,6 @@ function SidePane(props: {
             onRemove={() => props.onRemove(row.symbol)}
             onFire={(action) => props.onFire(row.symbol, action)}
             onExit={() => props.onExit(row.symbol)}
-            onClosePosition={() => props.onClosePosition(row.symbol)}
             onChart={() => props.onChart(row)}
           />
         ))}

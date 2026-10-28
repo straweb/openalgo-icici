@@ -28,6 +28,16 @@
  * its percent buys at the live price. The action bar sits static at the
  * bottom: deploy / close per side, the two swaps (leave one side, enter the
  * other), exit all, Schedule and Deploy by level.
+ *
+ * A row's entry level is the price its BUY rests at: deploy it and the
+ * order sits on the broker as a LIMIT at that level — never a market print
+ * with the exchange's protection added on top. The row's target and stop
+ * ride along as a bracket: the dock's engine watches the entry, and the
+ * moment it fills the target goes out as a resting LIMIT and the stop as a
+ * resting SL-M on the closing side, sized to what the position actually
+ * holds; when the position leaves again, the close that is still working
+ * is pulled. The watch lives in the panel's book, so it survives a reload
+ * and works with the panel closed.
  */
 
 import {
@@ -65,6 +75,7 @@ import {
 import { strikesForPick } from '@/lib/hedging/indexLevels'
 import { newScheduleId, scheduleActionLabel } from '@/lib/hedging/scheduler'
 import { loadHedgingState, saveHedgingState } from '@/lib/hedging/storage'
+import { planBracket } from '@/lib/trading/bracket'
 import type { ChartContext } from '@/lib/trading/chartContract'
 import {
   bookKey,
@@ -106,7 +117,7 @@ import {
 } from '@/lib/trading/levelDeploy'
 import { armLadderBatch, armPastMiss } from '@/lib/trading/scheduleArm'
 import type { SearchRow } from '@/lib/trading/terminal'
-import { planCrosses, swapFireOrders } from '@/lib/trading/tradingFire'
+import { planCrosses, rowEntryFields, swapFireOrders } from '@/lib/trading/tradingFire'
 import { cn } from '@/lib/utils'
 import { FNO_UNDERLYING_EXCHANGES, fnoExchangeFor, type ScheduledOrder } from '@/types/hedging'
 import type { OptionChainResponse } from '@/types/option-chain'
@@ -160,6 +171,23 @@ const NO_BUSY: Record<BusyKey, boolean> = {
   exitAll: false,
   buyAll: false,
   sellAll: false,
+}
+
+/**
+ * One order the panel places. A BUY entry that carries the row's level
+ * rides `price` — it rests at the broker as a LIMIT instead of printing at
+ * the market with the exchange's protection — and its row's target/stop
+ * ride along so the bracket engine can attach them on the fill.
+ */
+interface PanelOrder {
+  symbol: string
+  exchange: string
+  action: 'BUY' | 'SELL'
+  quantity: number
+  price?: number
+  entry?: number | null
+  target?: number | null
+  stoploss?: number | null
 }
 
 export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick, onLoadAll }: Props) {
@@ -772,12 +800,58 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick, on
   }, [apiKey, stockAddOpen, stockQuery])
 
   /* ── firing ───────────────────────────────────────────────────────────── */
+  /**
+   * Arm the bracket a filled-later entry needs: the watch that puts the
+   * target and stop on the broker the moment the entry fills, and pulls
+   * the leftover when the position leaves. One watch per symbol — a
+   * re-deployed row supersedes its old watch, an armed one keeps managing
+   * the position it already owns.
+   */
+  const armBracket = useCallback(
+    (order: PanelOrder, product: DeployBook['product'], orderid: string | null) => {
+      if (order.target == null && order.stoploss == null) return
+      if (orderid == null) {
+        showToast.warning(
+          `${order.symbol}: the entry is live but the target/stop could not attach — set them in the order book`
+        )
+        return
+      }
+      const bracket = planBracket({
+        symbol: order.symbol,
+        exchange: order.exchange,
+        action: order.action,
+        quantity: order.quantity,
+        product,
+        entry: order.entry ?? null,
+        target: order.target ?? null,
+        stoploss: order.stoploss ?? null,
+      })
+      if (!bracket) return
+      bracket.entryOrderid = orderid
+      const fresh = readDeployState()
+      writeDeployState({
+        ...fresh,
+        brackets: [
+          ...fresh.brackets.filter(
+            (candidate) =>
+              !(
+                candidate.stage === 'watch' &&
+                candidate.symbol === order.symbol &&
+                candidate.exchange === order.exchange
+              )
+          ),
+          bracket,
+        ],
+      })
+    },
+    []
+  )
+
   const placeOrders = useCallback(
-    async (
-      orders: Array<{ symbol: string; exchange: string; action: 'BUY' | 'SELL'; quantity: number }>
-    ) => {
+    async (orders: PanelOrder[]) => {
       let placed = 0
       let failed = 0
+      let rested = 0
       for (const order of orders) {
         try {
           const res = await tradingApi.placeOrder({
@@ -787,20 +861,29 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick, on
             symbol: order.symbol,
             action: order.action,
             quantity: order.quantity,
-            pricetype: state.pricetype,
+            // An entry level turns the order into the open LIMIT the trader
+            // asked for; the panel's price type governs everything else.
+            pricetype: order.price != null ? 'LIMIT' : state.pricetype,
             product: state.product,
+            price: order.price,
           })
           if (res.status === 'success') {
             placed += 1
             deployedOnceRef.current = true
+            if (order.price != null) rested += 1
+            armBracket(order, state.product, res.data?.orderid ?? null)
           } else failed += 1
         } catch {
           failed += 1
         }
       }
+      if (rested > 0)
+        showToast.info(
+          `${rested} order${rested === 1 ? '' : 's'} resting LIMIT at the entry — target/SL attach the moment they fill`
+        )
       return { placed, failed }
     },
-    [apiKey, state.pricetype, state.product]
+    [apiKey, state.pricetype, state.product, armBracket]
   )
 
   const report = (label: string, placed: number, failed: number) => {
@@ -825,6 +908,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick, on
           exchange: row.exchange,
           action,
           quantity: qty,
+          ...(action === 'BUY' ? rowEntryFields(row) : {}),
         }))
       )
       setBusy((previous) => ({ ...previous, [busyKey]: false }))
@@ -847,6 +931,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick, on
           exchange: row.exchange,
           action,
           quantity: qty,
+          ...(action === 'BUY' ? rowEntryFields(row) : {}),
         }))
       )
       setBusy((previous) => ({ ...previous, [busyKey]: false }))
@@ -857,7 +942,9 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick, on
 
   const runSwap = useCallback(
     async (from: 'CE' | 'PE') => {
-      const orders = swapFireOrders(ladder, from, sizing)
+      // FireOrder carries the entering rows' entry fields flat; placeOrders
+      // reads the same shape, so the swap's buys rest at their levels too.
+      const orders: PanelOrder[] = swapFireOrders(ladder, from, sizing)
       if (orders.length === 0) {
         showToast.warning(
           `Swap ${from}→${from === 'CE' ? 'PE' : 'CE'}: no enabled rows on either side`
@@ -1315,7 +1402,13 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick, on
                     return
                   }
                   void placeOrders([
-                    { symbol: row.symbol, exchange: row.exchange, action, quantity: qty },
+                    {
+                      symbol: row.symbol,
+                      exchange: row.exchange,
+                      action,
+                      quantity: qty,
+                      ...(action === 'BUY' ? rowEntryFields(row) : {}),
+                    },
                   ])
                 }}
                 onExit={(symbol) => {
@@ -1382,7 +1475,13 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick, on
                     return
                   }
                   void placeOrders([
-                    { symbol: row.symbol, exchange: row.exchange, action, quantity: qty },
+                    {
+                      symbol: row.symbol,
+                      exchange: row.exchange,
+                      action,
+                      quantity: qty,
+                      ...(action === 'BUY' ? rowEntryFields(row) : {}),
+                    },
                   ])
                 }}
                 onExit={(symbol) => {
@@ -1456,7 +1555,13 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick, on
                     return
                   }
                   void placeOrders([
-                    { symbol: row.symbol, exchange: row.exchange, action, quantity: qty },
+                    {
+                      symbol: row.symbol,
+                      exchange: row.exchange,
+                      action,
+                      quantity: qty,
+                      ...(action === 'BUY' ? rowEntryFields(row) : {}),
+                    },
                   ])
                 }}
                 onExit={() => {

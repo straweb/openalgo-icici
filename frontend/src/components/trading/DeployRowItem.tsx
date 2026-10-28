@@ -2,11 +2,11 @@
  * One row of the Deploy panel, drawn the way a trader reads a ladder:
  *
  * Line 1 — what it is: the symbol tile (strike with its ITM/OTM badge, or
- * the stock's name), its price with the rupees one lot (or one share)
- * carries, and to the right the row's P&L plus the Min / Chart / Quit /
- * Depth / remove actions. Quit shows only while a broker position is open
- * on the row and flattens that position; Depth loads the instrument into
- * the dock's depth tab.
+ * the stock's name) and its live price, and to the right the row's P&L plus
+ * the Min / Chart / Quit / Depth / remove actions. Quit shows only while a
+ * broker position is open on the row and flattens that position; Depth
+ * loads the instrument into the dock's depth tab. The side never prints —
+ * the pane header (CALLS | PUTS) and the accent bar already say it.
  *
  * Line 2 — what it carries: nothing but the percent slider and its value —
  * auto-levelled with its side so the shares always sum to 100 — which is
@@ -138,8 +138,9 @@ export function DeployRowItem(props: Props) {
       data-symbol={row.symbol}
     >
       {/* Line 1: identity + price + pnl + row actions. One compact token per
-          row: `22800 CE OTM1 0.05/₹3` — strike, side, moneyness, the live
-          price over the rupees one lot (or one share) carries. */}
+          row: `22800 OTM1 0.05` — strike, moneyness, the live price. The
+          side reads from the pane (CALLS | PUTS) and the accent bar; the
+          rupees a lot carries read on line 3, where the size is. */}
       <div className="flex items-center gap-1">
         <input
           type="checkbox"
@@ -161,14 +162,6 @@ export function DeployRowItem(props: Props) {
           {row.kind === 'option' ? (
             <>
               <span className="shrink-0">{row.strike}</span>
-              <span
-                className={cn(
-                  'shrink-0',
-                  row.optionType === 'CE' ? 'text-emerald-600' : 'text-red-600'
-                )}
-              >
-                {row.optionType}
-              </span>
               {props.offsetLabel && (
                 <span className="shrink-0 text-[9px] font-semibold text-muted-foreground">
                   {props.offsetLabel.replace(' ', '')}
@@ -178,14 +171,7 @@ export function DeployRowItem(props: Props) {
           ) : (
             <span className="max-w-[86px] shrink-0 truncate">{row.name || row.symbol}</span>
           )}
-          {ltp != null && (
-            <span className="shrink-0">
-              {ltp.toFixed(2)}
-              <span className="font-normal text-muted-foreground">
-                /₹{Math.round(ltp * row.lotSize).toLocaleString('en-IN')}
-              </span>
-            </span>
-          )}
+          {ltp != null && <span className="shrink-0">{ltp.toFixed(2)}</span>}
         </span>
         <span
           className={cn(

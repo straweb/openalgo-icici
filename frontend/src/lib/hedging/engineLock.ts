@@ -33,7 +33,7 @@ function lockKey(scope: string): string {
  * heartbeat is stale, or storage is refused.
  */
 export function claimEngineLock(
-  scope: 'hedging' | 'trading',
+  scope: 'hedging' | 'trading' | 'trading-bracket',
   instanceId: string,
   now: number = Date.now()
 ): boolean {
@@ -50,7 +50,10 @@ export function claimEngineLock(
 }
 
 /** Drop the lock, but only if this instance still holds it. */
-export function releaseEngineLock(scope: 'hedging' | 'trading', instanceId: string): void {
+export function releaseEngineLock(
+  scope: 'hedging' | 'trading' | 'trading-bracket',
+  instanceId: string
+): void {
   try {
     const key = lockKey(scope)
     const raw = localStorage.getItem(key)
@@ -78,7 +81,7 @@ export function useEngineInstanceId(): string {
  * `claim()`, releases on unmount, and lets the caller decide what a lost
  * claim means (usually: skip the tick quietly).
  */
-export function useEngineLock(scope: 'hedging' | 'trading') {
+export function useEngineLock(scope: 'hedging' | 'trading' | 'trading-bracket') {
   const id = useEngineInstanceId()
   useEffect(() => {
     return () => releaseEngineLock(scope, id)

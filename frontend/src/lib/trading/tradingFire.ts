@@ -1,5 +1,5 @@
-import { firingRows, type DeployRow, type Sizing } from '@/lib/trading/deployPlan'
-import { levelCrosses, type LevelCross } from '@/lib/hedging/indexLevels'
+import { type LevelCross, levelCrosses } from '@/lib/hedging/indexLevels'
+import { type DeployRow, firingRows, type Sizing } from '@/lib/trading/deployPlan'
 import type { ScheduledDeployPlan, ScheduledOrder } from '@/types/hedging'
 
 /**
@@ -22,6 +22,34 @@ export interface FireOrder {
   exchange: string
   action: 'BUY' | 'SELL'
   quantity: number
+  /**
+   * A BUY entry rests at the row's level when the row carries one — the
+   * open order the trader asked for, not a market print. SELL legs (the
+   * exits, the leaving half of a swap) never carry it.
+   */
+  price?: number
+  /** The row's levels riding a BUY entry, for the panel's bracket arming. */
+  entry?: number | null
+  target?: number | null
+  stoploss?: number | null
+}
+
+/**
+ * The entry fields a BUY order carries from a row — nothing on a SELL leg,
+ * and nothing at all for a row without levels, so a plain order stays a
+ * plain order on the wire.
+ */
+export function rowEntryFields(
+  row: DeployRow
+): Pick<FireOrder, 'price' | 'entry' | 'target' | 'stoploss'> {
+  const fields: Pick<FireOrder, 'price' | 'entry' | 'target' | 'stoploss'> = {}
+  if (row.entry != null) {
+    fields.price = row.entry
+    fields.entry = row.entry
+  }
+  if (row.target != null) fields.target = row.target
+  if (row.stoploss != null) fields.stoploss = row.stoploss
+  return fields
 }
 
 /** One underlying's ladder, the shape a book key holds. */
@@ -62,6 +90,7 @@ export function ladderFireOrders(
       exchange: row.exchange,
       action: plan.optionAction,
       quantity: qty,
+      ...(plan.optionAction === 'BUY' ? rowEntryFields(row) : {}),
     })
   }
   return orders
@@ -87,7 +116,13 @@ export function swapFireOrders(
     orders.push({ symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty })
   }
   for (const { row, qty } of firingRows(entering, sizing)) {
-    orders.push({ symbol: row.symbol, exchange: row.exchange, action: 'BUY', quantity: qty })
+    orders.push({
+      symbol: row.symbol,
+      exchange: row.exchange,
+      action: 'BUY',
+      quantity: qty,
+      ...rowEntryFields(row),
+    })
   }
   return orders
 }
@@ -148,7 +183,10 @@ export function planFireOrders(
   fallbackRows: DeployRow[]
 ): FireOrder[] {
   const byStrike = new Map<number, DeployRow>()
-  for (const row of [...(ladder ? (plan.side === 'CE' ? ladder.ce : ladder.pe) : []), ...fallbackRows]) {
+  for (const row of [
+    ...(ladder ? (plan.side === 'CE' ? ladder.ce : ladder.pe) : []),
+    ...fallbackRows,
+  ]) {
     if (row.optionType !== plan.side) continue
     if (!byStrike.has(row.strike)) byStrike.set(row.strike, row)
   }

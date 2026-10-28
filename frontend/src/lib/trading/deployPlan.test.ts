@@ -506,6 +506,41 @@ describe('v2 books hydrate forward', () => {
   })
 })
 
+describe('brackets hydrate forward', () => {
+  it('a book saved before brackets reads with an empty watch list', () => {
+    const back = hydrateDeployState({ books: {}, stocks: [] })
+    expect(back.brackets).toEqual([])
+  })
+
+  it('saved brackets survive a round-trip, junk entries drop', () => {
+    const state = defaultDeployState()
+    state.brackets = [
+      {
+        id: 'brk-1',
+        symbol: 'NIFTY27OCT2624500CE',
+        exchange: 'NFO',
+        action: 'BUY',
+        quantity: 65,
+        product: 'NRML',
+        entry: 40,
+        target: 80,
+        stoploss: 20,
+        entryOrderid: 'ord-1',
+        stage: 'watch',
+        closeTarget: null,
+        closeStop: null,
+        attempts: 0,
+        createdAt: 1_000,
+      },
+    ]
+    const back = hydrateDeployState(JSON.parse(JSON.stringify(state)))
+    expect(back.brackets).toHaveLength(1)
+    expect(back.brackets[0]).toMatchObject({ id: 'brk-1', stage: 'watch', target: 80 })
+    const junk = hydrateDeployState({ brackets: [{ nope: true }, 5] })
+    expect(junk.brackets).toEqual([])
+  })
+})
+
 describe('the workspace binding', () => {
   it('the bound underlying survives a hydrate round-trip', () => {
     const state = defaultDeployState()

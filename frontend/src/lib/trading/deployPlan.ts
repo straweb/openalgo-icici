@@ -1,4 +1,5 @@
 import { clampedBase, usableCapital } from '@/lib/hedging/capital'
+import { type DeployBracket, hydrateBrackets } from '@/lib/trading/bracket'
 import type { CapitalBasis } from '@/types/hedging'
 import type { OptionChainResponse } from '@/types/option-chain'
 
@@ -103,6 +104,13 @@ export interface DeployBook {
    * survives a reload.
    */
   workspace?: { symbol: string; exchange: string }
+  /**
+   * The entry brackets the panel armed: resting entry orders whose target
+   * and stop go to the broker the moment the entry fills, and the OCO
+   * cleanup when the position leaves. Survives a reload; the dock's
+   * bracket engine works them whether the panel is open or not.
+   */
+  brackets: DeployBracket[]
 }
 
 export function bookKey(exchange: string, underlying: string): string {
@@ -127,6 +135,7 @@ export function defaultDeployState(): DeployBook {
     // until the trader touches the chip the panel divides exactly what the
     // funds snapshot shows, never the session's P&L on top.
     capitalBasis: 'initial',
+    brackets: [],
   }
 }
 
@@ -291,6 +300,7 @@ export function hydrateDeployState(raw: unknown): DeployBook {
       .map((row) => ({ ...row, kind: 'stock' as const }))
   }
   base.workspace = hydrateWorkspace(r.workspace)
+  base.brackets = hydrateBrackets(r.brackets)
   return base
 }
 

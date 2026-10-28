@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import type { DeployRow } from '@/lib/trading/deployPlan'
 import type { ScheduledOrder } from '@/types/hedging'
-import { entryMet, ladderFireOrders, planCrosses, planFireOrders, planForLadderBatch, swapFireOrders } from './tradingFire'
+import {
+  entryMet,
+  ladderFireOrders,
+  planCrosses,
+  planFireOrders,
+  planForLadderBatch,
+  swapFireOrders,
+} from './tradingFire'
 
 /**
  * What a due batch places, pinned without a DOM: the ladder's enabled rows
@@ -44,7 +51,9 @@ const entry = (action: ScheduledOrder['action']): ScheduledOrder =>
     modeAtCreation: 'fno',
   }) as ScheduledOrder
 
-const plan = (parts: Partial<Parameters<typeof ladderFireOrders>[2]>): Parameters<typeof ladderFireOrders>[2] =>
+const plan = (
+  parts: Partial<Parameters<typeof ladderFireOrders>[2]>
+): Parameters<typeof ladderFireOrders>[2] =>
   ({
     side: 'CE',
     strikes: [],
@@ -54,7 +63,11 @@ const plan = (parts: Partial<Parameters<typeof ladderFireOrders>[2]>): Parameter
 
 describe('ladderFireOrders', () => {
   it('buys every enabled row of the plan side with their own lots', () => {
-    const orders = ladderFireOrders(ladder, entry('deployA'), plan({ side: 'CE', optionAction: 'BUY' }))
+    const orders = ladderFireOrders(
+      ladder,
+      entry('deployA'),
+      plan({ side: 'CE', optionAction: 'BUY' })
+    )
     expect(orders).toEqual([
       { symbol: 'NIFTY27OCT2624500CE', exchange: 'NFO', action: 'BUY', quantity: 2 * 65 },
       { symbol: 'NIFTY27OCT2624600CE', exchange: 'NFO', action: 'BUY', quantity: 1 * 65 },
@@ -123,7 +136,15 @@ describe('swapFireOrders', () => {
     const sizing = { capital: 130000, ltpOf: (r: DeployRow) => (r.optionType === 'CE' ? 100 : 50) }
     const even = {
       ce: [row({ symbol: 'NIFTY27OCT2624500CE', strike: 24500, weight: 50, lots: 0 })],
-      pe: [row({ symbol: 'NIFTY27OCT2624500PE', strike: 24500, optionType: 'PE' as const, weight: 50, lots: 0 })],
+      pe: [
+        row({
+          symbol: 'NIFTY27OCT2624500PE',
+          strike: 24500,
+          optionType: 'PE' as const,
+          weight: 50,
+          lots: 0,
+        }),
+      ],
     }
     // CE share: 65000 / (100x65) = 10 lots; PE share: 65000 / (50x65) = 20 lots
     const orders = swapFireOrders(even, 'CE', sizing)
@@ -182,7 +203,12 @@ describe('entryMet', () => {
 
 describe('planFireOrders', () => {
   it('resolves plan strikes from the ladder rows, honoring per-row lots', () => {
-    const orders = planFireOrders(ladder, 1, plan({ side: 'CE', optionAction: 'BUY', strikes: [24600] }), [])
+    const orders = planFireOrders(
+      ladder,
+      1,
+      plan({ side: 'CE', optionAction: 'BUY', strikes: [24600] }),
+      []
+    )
     expect(orders).toEqual([
       { symbol: 'NIFTY27OCT2624600CE', exchange: 'NFO', action: 'BUY', quantity: 65 },
     ])
@@ -204,5 +230,92 @@ describe('planFireOrders', () => {
   it('skips strikes neither the ladder nor the chain lists', () => {
     const orders = planFireOrders(ladder, 1, plan({ strikes: [99999] }), [])
     expect(orders).toEqual([])
+  })
+})
+
+describe('rowEntryFields — the entry a BUY rests at', () => {
+  it('rides the row level and levels on the BUY legs only', () => {
+    const withLevels = {
+      ce: [
+        row({
+          symbol: 'NIFTY27OCT2624500CE',
+          strike: 24500,
+          lots: 2,
+          entry: 40,
+          target: 80,
+          stoploss: 20,
+        }),
+      ],
+      pe: [],
+    }
+    const orders = ladderFireOrders(withLevels, entry('deployA'), plan({ optionAction: 'BUY' }))
+    expect(orders).toEqual([
+      {
+        symbol: 'NIFTY27OCT2624500CE',
+        exchange: 'NFO',
+        action: 'BUY',
+        quantity: 2 * 65,
+        price: 40,
+        entry: 40,
+        target: 80,
+        stoploss: 20,
+      },
+    ])
+    // the same ladder closed: SELL legs carry no entry fields at all
+    const closed = ladderFireOrders(withLevels, entry('closeA'), plan({ optionAction: 'SELL' }))
+    expect(closed).toEqual([
+      { symbol: 'NIFTY27OCT2624500CE', exchange: 'NFO', action: 'SELL', quantity: 2 * 65 },
+    ])
+  })
+
+  it('arms a market-entry bracket with the target alone — no price on the wire', () => {
+    const targetOnly = {
+      ce: [row({ symbol: 'NIFTY27OCT2624500CE', strike: 24500, lots: 2, target: 80 })],
+      pe: [],
+    }
+    const orders = ladderFireOrders(targetOnly, entry('deployA'), plan({ optionAction: 'BUY' }))
+    expect(orders[0].price).toBeUndefined()
+    expect(orders[0].target).toBe(80)
+    expect(orders[0].entry).toBeUndefined()
+  })
+
+  it('leaves plain rows plain — a level-less order stays a plain order', () => {
+    const orders = ladderFireOrders(ladder, entry('deployA'), plan({ optionAction: 'BUY' }))
+    expect(orders).toEqual([
+      { symbol: 'NIFTY27OCT2624500CE', exchange: 'NFO', action: 'BUY', quantity: 2 * 65 },
+      { symbol: 'NIFTY27OCT2624600CE', exchange: 'NFO', action: 'BUY', quantity: 1 * 65 },
+    ])
+  })
+
+  it('swap entering buys rest at their levels; the leaving sells do not', () => {
+    const withLevels = {
+      ce: [row({ symbol: 'NIFTY27OCT2624500CE', strike: 24500, lots: 2, entry: 40 })],
+      pe: [
+        row({
+          symbol: 'NIFTY27OCT2624500PE',
+          strike: 24500,
+          optionType: 'PE' as const,
+          lots: 1,
+          entry: 55,
+          target: 90,
+        }),
+      ],
+    }
+    const orders = swapFireOrders(withLevels, 'CE')
+    expect(orders[0]).toEqual({
+      symbol: 'NIFTY27OCT2624500CE',
+      exchange: 'NFO',
+      action: 'SELL',
+      quantity: 2 * 65,
+    })
+    expect(orders[1]).toEqual({
+      symbol: 'NIFTY27OCT2624500PE',
+      exchange: 'NFO',
+      action: 'BUY',
+      quantity: 1 * 65,
+      price: 55,
+      entry: 55,
+      target: 90,
+    })
   })
 })

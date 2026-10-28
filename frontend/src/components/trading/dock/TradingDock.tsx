@@ -19,14 +19,15 @@ import {
   type DockOrder,
   type DockPosition,
   isWorking,
-  realisedFromTrades,
   parsePosition,
+  realisedFromTrades,
   sumOpenPnl,
 } from './blotter'
 import type { ChartOrderBridgeRef } from './chartOrderBridge'
 import { DockShell } from './DockShell'
 import type { DockTab } from './dockState'
 import { ModifyOrderDialog, type ModifyValues, sendsPrice, sendsTrigger } from './ModifyOrderDialog'
+import { OrdersTable } from './OrdersTable'
 import {
   apiErrorMessage,
   cancelAllDockOrders,
@@ -35,7 +36,6 @@ import {
   closeDockPosition,
   type OrderActionContext,
 } from './orderActions'
-import { OrdersTable } from './OrdersTable'
 import { PnlStrip } from './PnlStrip'
 import { PositionsTable } from './PositionsTable'
 import { TradesTable } from './TradesTable'
@@ -44,13 +44,15 @@ import { useBlotter } from './useBlotter'
 // The GTT tab carries its own fetch, dialogs and CSV export; nobody pays
 // for it until the tab is opened.
 const GttTab = lazy(() => import('../GttTab'))
+
+import { DepthTab } from './DepthTab'
+import { IndexTab } from './IndexTab'
 // The scheduled book and the index breakdown are static: they are small,
 // and a lazy chunk that fails to load (a stale build, a cached shell) left
 // this tab saying "Loading" forever — a placeholder the trader could not
 // click past. The code arrives with the dock now, and the tab renders.
 import { ScheduledTab } from './ScheduledTab'
-import { DepthTab } from './DepthTab'
-import { IndexTab } from './IndexTab'
+import { useBracketEngine } from './useBracketEngine'
 import { useTradingScheduler } from './useTradingScheduler'
 
 /** The chart's words, so the dock and the chart refuse in one voice. */
@@ -90,6 +92,10 @@ export function TradingDock({
   // against the deploy ladder, dock open or collapsed — an armed 09:20
   // batch does not care whether the books are on screen.
   useTradingScheduler(apiKey)
+  // The bracket engine beside it: the deploy panel's resting entry orders
+  // get their target and stop the moment they fill, and the leftover close
+  // pulled when the position leaves — panel open or not.
+  useBracketEngine(apiKey)
 
   // Live LTP and P&L over the position rows, only while the dock is open:
   // the collapsed strip shows counts, which do not move with the feed.

@@ -43,6 +43,13 @@ const WatchlistPanel = lazy(() =>
 const DeployPanel = lazy(() =>
   import('@/components/trading/DeployPanel').then((m) => ({ default: m.DeployPanel }))
 )
+// The global chart settings pull the terminal's full settings machinery —
+// loaded only when the dialog first opens, like the panels above.
+const GlobalChartSettingsDialog = lazy(() =>
+  import('@/components/trading/GlobalChartSettingsDialog').then((m) => ({
+    default: m.GlobalChartSettingsDialog,
+  }))
+)
 
 import type { MagnetMode } from 'openalgo-charts/draw'
 import { BacktestPanel } from '@/components/trading/BacktestPanel'
@@ -272,6 +279,12 @@ function TradingWorkspace({ account }: { account: string | null }) {
    * pane asks first.
    */
   const [armed, setArmed] = useState<boolean>(readArmed)
+  /**
+   * The workspace-level chart settings — the dialog that fans a change out
+   * to every open pane. Beside the One-Click switch, which is its neighbor
+   * in kind: both are properties of the workspace, not of one pane.
+   */
+  const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false)
   /**
    * One group for the whole workspace, created once and kept for the life of
    * the page. Panes join it as their charts are built and re-join after every
@@ -1543,6 +1556,22 @@ function TradingWorkspace({ account }: { account: string | null }) {
       <IndicatorTemplates key={account} {...workspaceCatalog} target={panelTarget} />
       <ToolbarDivider />
       {armedControl}
+      <Tip
+        tip={{
+          title: 'Global chart settings',
+          sub: 'Interval, type, volume, grid, studies — applied to every open chart',
+        }}
+      >
+        <button
+          type="button"
+          aria-label="Global chart settings"
+          aria-pressed={globalSettingsOpen}
+          className={cn(TB_BTN, TB_ICON, globalSettingsOpen && TB_ON)}
+          onClick={() => setGlobalSettingsOpen((v) => !v)}
+        >
+          <ChromeIcon id="settings" />
+        </button>
+      </Tip>
     </>
   )
 
@@ -1820,6 +1849,8 @@ function TradingWorkspace({ account }: { account: string | null }) {
             <Suspense fallback={null}>
               <DeployPanel
                 apiKey={apiKey}
+                // The index chart's live feed rides the page's WebSocket proxy.
+                wsUrl={wsUrl}
                 // Fresh like the Backtest panel's reads: the ladder follows the
                 // chart the trader is looking at, and the revision says when
                 // that answer has changed.
@@ -1978,6 +2009,23 @@ function TradingWorkspace({ account }: { account: string | null }) {
             tradingLocked={tradingLocked}
             bridge={orderBridge}
           />
+        )}
+
+        {/* The workspace's chart settings, read live so panes opened while the
+            dialog stands are included in every fan-out. */}
+        {globalSettingsOpen && (
+          <Suspense fallback={null}>
+            <GlobalChartSettingsDialog
+              open={globalSettingsOpen}
+              onClose={() => setGlobalSettingsOpen(false)}
+              getTerminals={() =>
+                Object.values(terminalsRef.current).filter(
+                  (t): t is NonNullable<typeof t> => t != null
+                )
+              }
+              getFocused={() => panelTarget()}
+            />
+          </Suspense>
         )}
       </div>
     </ChartOrderBridgeContext.Provider>

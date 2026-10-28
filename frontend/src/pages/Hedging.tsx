@@ -53,6 +53,7 @@ import {
   saveHedgingState,
 } from '@/lib/hedging/storage'
 import { pickKind, planUnderlyingTabs } from '@/lib/hedging/underlyingTab'
+import { currentOrderMode, resolveOrderPricing } from '@/lib/trading/orderMode'
 import type {
   HedgingInstrument,
   HedgingState,
@@ -633,19 +634,34 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
       quantity: number,
       overridePricetype?: 'MARKET' | 'LIMIT',
       price?: number
-    ): MultilegLeg => ({
-      legid: row.id,
-      symbol: row.symbol,
-      exchange: row.exchange,
-      action,
-      quantity,
-      pricetype: overridePricetype ?? (row.entry != null ? 'LIMIT' : state.pricetype),
-      product: state.product,
-      ...(overridePricetype === 'LIMIT' || row.entry != null
-        ? { price: price ?? row.entry ?? 0 }
-        : {}),
-    }),
-    [state.pricetype, state.product]
+    ): MultilegLeg => {
+      // The global order mode prices every leg the same way the deploy panel
+      // does: an entry level rests at its level in LIMIT mode, the priced
+      // modes (MPP buffer, live price) resolve against the row's live quote,
+      // and MARKET prints. An explicit override (a dialog's own price type)
+      // still wins.
+      const { mode, mppPercent } = currentOrderMode()
+      const resolved = resolveOrderPricing({
+        action,
+        mode,
+        mppPercent,
+        entry: row.entry,
+        ltp: marketDataRef.current.get(`${row.exchange}:${row.symbol}`)?.data.ltp,
+      })
+      const pricetype: 'MARKET' | 'LIMIT' = overridePricetype ?? resolved.pricetype
+      const wirePrice = price ?? (mode === 'limit' ? row.entry : resolved.price)
+      return {
+        legid: row.id,
+        symbol: row.symbol,
+        exchange: row.exchange,
+        action,
+        quantity,
+        pricetype,
+        product: state.product,
+        ...(pricetype === 'LIMIT' ? { price: wirePrice ?? 0 } : {}),
+      }
+    },
+    [state.product]
   )
 
   const markBusy = useCallback((id: string, busy: boolean) => {

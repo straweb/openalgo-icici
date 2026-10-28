@@ -31,7 +31,6 @@ import {
   type AlertsDocument,
   type Bar,
   type BarsRequest,
-  BuySellButtons,
   CandleBuilder,
   ChartObjects,
   type ChartTheme,
@@ -171,7 +170,6 @@ export interface TerminalPriceLineSpec {
   /** Dotted stroke — the monitoring-level look, vs solid for fills. */
   dotted?: boolean
 }
-type BuySellButtonsInstance = InstanceType<typeof BuySellButtons>
 type TradeFeedInstance = InstanceType<typeof OpenAlgoTradeFeed>
 type DrawingControllerInstance = InstanceType<typeof DrawingController>
 
@@ -312,6 +310,7 @@ import {
 } from './legend'
 import { fileForScriptId, isScriptInstance } from './openscriptFiles'
 import { loadOpenScriptStudies, SCRIPT_ALERT_EVENT } from './openscriptStudies'
+import { currentOrderMode, type ResolvedPricing, resolveOrderPricing } from './orderMode'
 import { profileIntervalSupported, selectProfileInterval } from './profileIntervals'
 import { ProfileLayer, type ProfileMenuAction } from './profileLayer'
 import {
@@ -1067,12 +1066,11 @@ function nextPaint(): Promise<void> {
 }
 
 /**
- * The inline SELL·qty·BUY panel's dock geometry, in CSS px — the qty chip's
- * hover slider anchors to the same box the primitive draws (74/40/42 at the
- * scale below are the engine's button, chip and panel heights; a mismatch
- * here puts the hover zone off the chip).
+ * The SELL · slider · BUY strip's dock, in CSS px — top-left, just below the
+ * OHLC legend. Only the origin survives from the old canvas panel's geometry:
+ * the DOM strip measures itself.
  */
-const TRADE_PANEL = { x: 14, y: 44, btnW: 74, qtyW: 40, h: 42, scale: 0.72 } as const
+const TRADE_PANEL = { x: 14, y: 44 } as const
 
 export class TradingTerminal {
   /**
@@ -1216,24 +1214,20 @@ export class TradingTerminal {
   /** The tier's tool registry, for a tool's own defaults; null until it loads. */
   private toolOf: ((id: string) => DrawingTool) | null = null
   private posLine: PriceLine | null = null
-  private tradeBtns: BuySellButtonsInstance | null = null
-  /** The capital-percent slider that hovers under the Buy/Sell panel's qty chip. */
-  private qtySlider: HTMLDivElement | null = null
-  private qtyHoverOff: (() => void) | null = null
-  private qtyHideTimer: number | null = null
-  /** True between pointerdown and pointerup on the range — a drag never hides it. */
-  private qtySliderDrag = false
+  /**
+   * The capital-percent slider lives INSIDE the one-click panel — B · slider
+   * · S in one strip, no hover dance. These fields feed its math: the funds
+   * poll and the pane's own share of the capital.
+   */
   private capitalTimer: number | null = null
   /**
-   * The one-click instant panel — the DOM twin of the canvas SELL·qty·BUY
-   * that fires a market order the moment it is pressed (NRML on the
-   * derivative segments, MIS on cash equity). Visible only while One-Click
-   * is armed and the toolbar toggle keeps it on.
+   * The one-click panel — the chart's single Buy/Sell strip, docked top-left:
+   * SELL at the bid, the capital-percent slider in the middle (always on it,
+   * never a hover reveal), BUY at the ask. One-Click armed, a press fires the
+   * global order mode's order at once; disarmed, it opens the order ticket.
    */
   private instantPanel: HTMLDivElement | null = null
   private instantPanelOn = true
-  /** The classic canvas Buy/Sell panel's toggle (the toolbar hides either). */
-  private tradePanelOn = true
   /**
    * The open position's box, docked top-right: side, size, average, live
    * P&L, an instant CLOSE, and the SL/TP levels the drag handles set.
@@ -2349,22 +2343,7 @@ export class TradingTerminal {
     return this.sym.lots ? `${n}L` : String(n)
   }
 
-  /* ── the qty chip's capital slider ───────────────────────────────────── */
-
-  /**
-   * The qty chip's box in the Buy/Sell panel, in container CSS px — the
-   * hover zone the slider shows under. The chip sits between the SELL and
-   * BUY buttons at the dock margin, at the engine's own geometry.
-   */
-  private qtyChipRect(): { x: number; y: number; w: number; h: number } {
-    const pad = 4
-    return {
-      x: TRADE_PANEL.x + TRADE_PANEL.btnW * TRADE_PANEL.scale + 1 - pad,
-      y: TRADE_PANEL.y - pad,
-      w: TRADE_PANEL.qtyW * TRADE_PANEL.scale + pad * 2,
-      h: TRADE_PANEL.h * TRADE_PANEL.scale + pad * 2,
-    }
-  }
+  /* ── the panel's capital slider ─────────────────────────────────────── */
 
   /**
    * Lots (or shares) the given percent of the available capital buys at the
@@ -2410,184 +2389,30 @@ export class TradingTerminal {
     this.refreshQtySliderText()
   }
 
-  /** The slider's readouts: the percent, what it buys now, and the 100% total. */
+  /**
+   * The panel's readouts: the percent, the size a press sends (the toolbar's
+   * own quantity, which the slider drives), and the 100% capacity.
+   */
   private refreshQtySliderText(): void {
-    const slider = this.qtySlider
-    if (!slider) return
-    const pct = slider.querySelector('[data-pct]')
-    const lots = slider.querySelector('[data-lots]')
+    const panel = this.instantPanel
+    if (!panel) return
+    const pct = panel.querySelector('[data-pct]')
+    const lots = panel.querySelector('[data-lots]')
     if (pct) pct.textContent = `${this.capitalPct}%`
     if (lots) {
-      const n = this.capitalLotsAt(this.capitalPct)
       const total = this.capitalLotsAt(100)
       const isLots = this.sym?.lots ?? false
-      const unit = isLots ? 'lot' : 'sh'
-      if (this.capital <= 0) {
-        lots.textContent = 'capital…'
-      } else if (total <= 0) {
-        lots.textContent = '—'
-      } else {
-        // Both numbers, absolute: what this percent buys, and what the whole
-        // capital would. "≈ 1 lot · 12 @ 100%" — never a bare fraction.
-        const shown = Math.max(1, n)
-        lots.textContent = `≈ ${shown} ${unit}${shown === 1 ? '' : 's'} · ${total} @ 100%`
-      }
+      const unit = isLots ? 'L' : 'sh'
+      // What a press sends right now, then what the whole capital would buy:
+      // `2L · 8 @ 100%` — the fired size first, the capacity second.
+      const chip = this.qtyChip()
+      lots.textContent =
+        this.capital <= 0
+          ? `${chip} · capital…`
+          : total <= 0
+            ? `${chip} · —`
+            : `${chip} · ${total}${unit} @ 100%`
     }
-  }
-
-  /**
-   * Build (once) and sync the slider that hovers under the Buy/Sell panel's
-   * qty chip. Hover is a hit-test on the container's pointer moves — the
-   * chip is canvas-drawn by the engine and ships no DOM to listen to — and
-   * the slider itself sits just below the panel, never over the plot.
-   *
-   * The hover zone is the chip OR the slider itself, and a drag on the range
-   * never hides it: the pointer travelling the gap between the two, or
-   * sliding the thumb, used to drop the slider mid-drag — the plot under
-   * the gap picked the gesture up instead.
-   */
-  private mountQtySlider(): void {
-    if (!this.qtySlider) {
-      const slider = document.createElement('div')
-      slider.setAttribute('data-qty-slider', '1')
-      slider.style.cssText = [
-        'position:absolute',
-        `left:${TRADE_PANEL.x}px`,
-        `top:${this.qtySliderTop()}px`,
-        'display:none',
-        'z-index:40',
-        'pointer-events:auto',
-        'background:var(--popover, #18181b)',
-        'color:var(--popover-foreground, #e4e4e7)',
-        'border:1px solid var(--border, #2e2e33)',
-        'border-radius:6px',
-        'padding:4px 8px',
-        'font:500 11px/1.4 ui-sans-serif, system-ui, sans-serif',
-        'box-shadow:0 4px 12px rgba(0,0,0,0.35)',
-        'white-space:nowrap',
-        'align-items:center',
-        'gap:6px',
-      ].join(';')
-      slider.innerHTML =
-        '<span data-pct style="font-weight:600"></span>' +
-        '<input data-range type="range" min="1" max="100" step="1" ' +
-        'style="width:110px;accent-color:var(--primary,#3b82f6);vertical-align:middle" ' +
-        'aria-label="Percent of capital for this chart\'s quantity" />' +
-        '<span data-lots style="font-variant-numeric:tabular-nums;opacity:0.75"></span>'
-      this.container.appendChild(slider)
-      const range = slider.querySelector<HTMLInputElement>('[data-range]')
-      range?.addEventListener('input', () => {
-        const next = Math.min(100, Math.max(1, Math.floor(Number(range.value) || 1)))
-        this.capitalPct = next
-        this.lsSet('cappct', String(next))
-        const n = this.capitalLots()
-        if (n > 0 && n !== this.qty) {
-          this.setQty(n)
-          this.cb.onQtyChange?.(n)
-        }
-        this.refreshQtySliderText()
-      })
-      // A press on the range claims the gesture: the slider stays up — and
-      // the plot never sees the drag — until the button comes back up.
-      range?.addEventListener('pointerdown', () => {
-        this.qtySliderDrag = true
-        if (this.qtyHideTimer != null) {
-          window.clearTimeout(this.qtyHideTimer)
-          this.qtyHideTimer = null
-        }
-      })
-      const releaseDrag = () => {
-        this.qtySliderDrag = false
-      }
-      range?.addEventListener('pointerup', releaseDrag)
-      range?.addEventListener('pointercancel', releaseDrag)
-      slider.addEventListener('pointerenter', () => {
-        if (this.qtyHideTimer != null) {
-          window.clearTimeout(this.qtyHideTimer)
-          this.qtyHideTimer = null
-        }
-      })
-      slider.addEventListener('pointerleave', () => this.scheduleQtySliderHide())
-      this.qtySlider = slider
-      // Hover hit-test over the chip; the hide is delayed so the pointer can
-      // travel the few pixels down onto the slider without losing it.
-      const onMove = (e: Event) => {
-        if (this.destroyed || !this.qtySlider) return
-        const rect = this.container.getBoundingClientRect()
-        const x = (e as PointerEvent).clientX - rect.left
-        const y = (e as PointerEvent).clientY - rect.top
-        const chip = this.qtyChipRect()
-        const overChip = x >= chip.x && x <= chip.x + chip.w && y >= chip.y && y <= chip.y + chip.h
-        const overSlider =
-          this.qtySlider.style.display !== 'none' && this.pointInElement(x, y, this.qtySlider)
-        if (overChip || overSlider) {
-          if (this.qtyHideTimer != null) {
-            window.clearTimeout(this.qtyHideTimer)
-            this.qtyHideTimer = null
-          }
-          const wasHidden = this.qtySlider.style.display === 'none'
-          this.qtySlider.style.display = 'flex'
-          if (wasHidden) {
-            void this.pollCapital()
-            if (this.capitalTimer == null)
-              this.capitalTimer = window.setInterval(() => void this.pollCapital(), 30000)
-          }
-          this.refreshQtySliderText()
-        } else if (this.qtySlider.style.display !== 'none' && this.qtyHideTimer == null) {
-          this.scheduleQtySliderHide()
-        }
-      }
-      this.container.addEventListener('pointermove', onMove)
-      this.qtyHoverOff = () => this.container.removeEventListener('pointermove', onMove)
-    }
-    const range = this.qtySlider.querySelector<HTMLInputElement>('[data-range]')
-    if (range) range.value = String(this.capitalPct)
-    this.refreshQtySliderText()
-  }
-
-  /** Where the slider parks: under the instant panel when it shows, else the panel. */
-  private qtySliderTop(): number {
-    const panelBottom = TRADE_PANEL.y + TRADE_PANEL.h * TRADE_PANEL.scale
-    if (this.instantPanel != null && this.instantPanel.style.display !== 'none') {
-      return Math.round(panelBottom + 38 + 8)
-    }
-    return Math.round(panelBottom + 8)
-  }
-
-  private pointInElement(x: number, y: number, el: HTMLElement): boolean {
-    const rect = el.getBoundingClientRect()
-    const base = this.container.getBoundingClientRect()
-    return (
-      x >= rect.left - base.left &&
-      x <= rect.right - base.left &&
-      y >= rect.top - base.top &&
-      y <= rect.bottom - base.top
-    )
-  }
-
-  /** The delayed hide the pointer's departure arms — a drag disarms it. */
-  private scheduleQtySliderHide(): void {
-    if (this.qtySliderDrag) return
-    if (this.qtyHideTimer != null) return
-    this.qtyHideTimer = window.setTimeout(() => {
-      if (this.qtySlider) this.qtySlider.style.display = 'none'
-      if (this.capitalTimer != null) {
-        window.clearInterval(this.capitalTimer)
-        this.capitalTimer = null
-      }
-      this.qtyHideTimer = null
-    }, 300)
-  }
-
-  private destroyQtySlider(): void {
-    this.qtyHoverOff?.()
-    this.qtyHoverOff = null
-    if (this.qtyHideTimer != null) window.clearTimeout(this.qtyHideTimer)
-    this.qtyHideTimer = null
-    if (this.capitalTimer != null) window.clearInterval(this.capitalTimer)
-    this.capitalTimer = null
-    this.qtySlider?.remove()
-    this.qtySlider = null
   }
 
   /* ── the one-click instant panel + the open-position box ──────────────── */
@@ -2602,11 +2427,15 @@ export class TradingTerminal {
   }
 
   /**
-   * The DOM twin of the canvas SELL·qty·BUY panel, docked just below it:
-   * SELL at the bid, the shared quantity chip, BUY at the ask. A press fires
-   * a market order at once — the one-click requirement — with NRML riding
-   * the derivative segments and MIS the cash ones. It only exists while
-   * One-Click is armed and the toolbar toggle keeps it shown.
+   * The chart's single Buy/Sell strip, docked top-left where the old canvas
+   * primitive sat: SELL at the bid, the capital-percent slider ON the strip
+   * (no hover reveal — it is the middle third of the panel), BUY at the ask,
+   * and the One-Click tag. The slider drives the toolbar's quantity from the
+   * pane's share of the funds; the readout shows the size a press sends and
+   * the 100% capacity. NRML rides the derivative segments, MIS the cash ones.
+   * One-Click armed, a press fires the global order mode's order at once;
+   * disarmed, it opens the order ticket — the old panel's two habits, one
+   * affordance now.
    */
   private mountInstantPanel(): void {
     if (this.instantPanel) return
@@ -2615,7 +2444,7 @@ export class TradingTerminal {
     panel.style.cssText = [
       'position:absolute',
       `left:${TRADE_PANEL.x}px`,
-      `top:${Math.round(TRADE_PANEL.y + TRADE_PANEL.h * TRADE_PANEL.scale + 8)}px`,
+      `top:${TRADE_PANEL.y}px`,
       'display:none',
       'z-index:39',
       'pointer-events:auto',
@@ -2627,22 +2456,29 @@ export class TradingTerminal {
       'box-shadow:0 6px 16px rgba(0,0,0,0.35)',
       'white-space:nowrap',
       'align-items:center',
-      'gap:3px',
+      'gap:4px',
       'font:600 11px/1.2 ui-sans-serif, system-ui, sans-serif',
     ].join(';')
     panel.innerHTML =
-      '<button data-i-sell title="Instant SELL — market order, MIS on equity / NRML on options" ' +
+      '<button data-i-sell title="SELL — the global order mode prices it (One-Click off opens the ticket)" ' +
       'style="border:0;border-radius:6px;cursor:pointer;padding:5px 10px 3px;color:#fff;background:#ef5350;' +
-      'display:flex;flex-direction:column;align-items:center;line-height:1.1">SELL' +
+      'display:flex;flex-direction:column;align-items:center;line-height:1.1">S' +
       '<span data-i-sellpx style="font-weight:400;font-size:9px;opacity:0.9"></span></button>' +
-      '<span data-i-qty title="Quantity — hover for the capital-percent slider" ' +
-      'style="min-width:34px;text-align:center;border-radius:6px;background:var(--muted,#27272a);' +
-      'padding:6px 4px;cursor:default;font-variant-numeric:tabular-nums"></span>' +
-      '<button data-i-buy title="Instant BUY — market order, MIS on equity / NRML on options" ' +
+      '<span data-i-slider title="Drag: the percent of your funds this chart trades with" ' +
+      'style="display:flex;flex-direction:column;align-items:center;gap:1px;padding:0 2px">' +
+      '<span style="display:flex;align-items:center;gap:4px">' +
+      '<span data-pct style="font-weight:600;font-variant-numeric:tabular-nums"></span>' +
+      '<input data-range type="range" min="1" max="100" step="1" ' +
+      'style="width:104px;accent-color:var(--primary,#3b82f6);vertical-align:middle" ' +
+      'aria-label="Percent of capital for this chart\'s quantity" />' +
+      '</span>' +
+      '<span data-lots style="font-weight:400;font-size:9px;font-variant-numeric:tabular-nums;opacity:0.75"></span>' +
+      '</span>' +
+      '<button data-i-buy title="BUY — the global order mode prices it (One-Click off opens the ticket)" ' +
       'style="border:0;border-radius:6px;cursor:pointer;padding:5px 10px 3px;color:#fff;background:#26a69a;' +
-      'display:flex;flex-direction:column;align-items:center;line-height:1.1">BUY' +
+      'display:flex;flex-direction:column;align-items:center;line-height:1.1">B' +
       '<span data-i-buypx style="font-weight:400;font-size:9px;opacity:0.9"></span></button>' +
-      '<span data-i-tag title="One-Click instant order" ' +
+      '<span data-i-tag title="One-Click state" ' +
       'style="margin-left:2px;font-size:9px;color:var(--muted-foreground,#a1a1aa)">1-CLICK</span>'
     const sellBtn = panel.querySelector<HTMLButtonElement>('[data-i-sell]')
     const buyBtn = panel.querySelector<HTMLButtonElement>('[data-i-buy]')
@@ -2654,42 +2490,55 @@ export class TradingTerminal {
       e.preventDefault()
       void this.instantFire('BUY')
     })
-    // The instant chip shares the quantity: hovering it opens the same
-    // capital-percent slider, anchored under THIS panel.
-    const chip = panel.querySelector<HTMLElement>('[data-i-qty]')
-    chip?.addEventListener('pointerenter', () => {
-      if (!this.qtySlider || !this.sym) return
-      if (this.qtyHideTimer != null) {
-        window.clearTimeout(this.qtyHideTimer)
-        this.qtyHideTimer = null
+    // The slider rides the strip. A drag re-sizes the quantity from the
+    // pane's percent of the funds; a press on the range keeps the plot from
+    // seeing the gesture.
+    const range = panel.querySelector<HTMLInputElement>('[data-range]')
+    range?.addEventListener('input', () => {
+      const next = Math.min(100, Math.max(1, Math.floor(Number(range.value) || 1)))
+      this.capitalPct = next
+      this.lsSet('cappct', String(next))
+      const n = this.capitalLots()
+      if (n > 0 && n !== this.qty) {
+        this.setQty(n)
+        this.cb.onQtyChange?.(n)
       }
-      this.qtySlider.style.top = `${this.qtySliderTop()}px`
-      this.qtySlider.style.display = 'flex'
-      void this.pollCapital()
-      if (this.capitalTimer == null)
-        this.capitalTimer = window.setInterval(() => void this.pollCapital(), 30000)
       this.refreshQtySliderText()
     })
-    chip?.addEventListener('pointerleave', () => this.scheduleQtySliderHide())
+    range?.addEventListener('pointerdown', (e) => e.stopPropagation())
+    range?.addEventListener('pointerup', (e) => e.stopPropagation())
     this.container.appendChild(panel)
     this.instantPanel = panel
+    void this.pollCapital()
+    if (this.capitalTimer == null)
+      this.capitalTimer = window.setInterval(() => void this.pollCapital(), 30000)
+    this.applyTradeColors()
     this.syncInstantPanel()
   }
 
   private destroyInstantPanel(): void {
     this.instantPanel?.remove()
     this.instantPanel = null
+    if (this.capitalTimer != null) {
+      window.clearInterval(this.capitalTimer)
+      this.capitalTimer = null
+    }
   }
 
-  /** The instant panel exists only while its toggle is on and One-Click is armed. */
+  /**
+   * The panel exists while its toggle is on and the chart is not replaying —
+   * armed or not. Disarmed it still shows: a press then opens the order
+   * ticket instead of firing, which is exactly what the old canvas panel did.
+   */
   private syncInstantPanel(): void {
     if (!this.instantPanel) return
-    const show = this.instantPanelOn && this.armed && !this.workspaceReplayLocked
+    const show = this.instantPanelOn && !this.workspaceReplayLocked
     this.instantPanel.style.display = show ? 'flex' : 'none'
-    if (show && this.qtySlider) this.qtySlider.style.top = `${this.qtySliderTop()}px`
+    const tag = this.instantPanel.querySelector('[data-i-tag]')
+    if (tag) tag.textContent = this.armed ? '1-CLICK' : 'TICKET'
   }
 
-  /** Keep the instant panel's prices and quantity in step with the canvas panel. */
+  /** Keep the panel's prices and size readout in step with the quote. */
   private instantPrices(bid: number | undefined, ask: number | undefined): void {
     if (!this.instantPanel) return
     const sellPx = this.instantPanel.querySelector('[data-i-sellpx]')
@@ -2699,15 +2548,29 @@ export class TradingTerminal {
   }
 
   private syncInstantQty(): void {
-    if (!this.instantPanel) return
-    const chip = this.instantPanel.querySelector('[data-i-qty]')
-    if (chip) chip.textContent = this.qtyChip()
+    this.refreshQtySliderText()
+  }
+
+  /**
+   * The global order mode's wire shape for this instrument: MARKET, or the
+   * LIMIT the mode computes off the live price (an MPP buffer, the screen
+   * price, or a level). The fallback inside the resolver is a market order,
+   * so a fire never blocks on a missing quote.
+   */
+  private modePricing(side: OrderSide): ResolvedPricing {
+    return resolveOrderPricing({
+      action: side,
+      ...currentOrderMode(),
+      ltp: this.marketPrice(),
+    })
   }
 
   /**
    * The instant panel's fire: the armed path's guards at toolbar-product
-   * independence — a market order right now, NRML on the derivative
-   * segments, MIS on cash equity.
+   * independence — the global order mode prices the order (a LIMIT rides the
+   * live price or its MPP buffer), NRML rides the derivative segments, MIS
+   * the cash ones. One-Click off, the press opens the order ticket instead —
+   * the old Buy/Sell panel's habit, kept on the one panel.
    */
   private async instantFire(side: OrderSide): Promise<void> {
     if (this.refuseWhileReplaying()) return
@@ -2727,7 +2590,20 @@ export class TradingTerminal {
       return
     }
     if (!this.armed) {
-      this.toast('One-Click is off — turn it on in the toolbar to fire instantly', 'err')
+      if (!this.cb.onOrderTicket) {
+        this.toast('One-Click is off — turn it on in the toolbar to fire instantly', 'err')
+        return
+      }
+      this.cb.onOrderTicket(
+        buildOrderTicket({
+          sym: this.sym,
+          qty: this.qty,
+          product: this.instantProduct(),
+          side,
+          type: 'MARKET',
+          price: 0,
+        })
+      )
       return
     }
     const qty = this.orderQty()
@@ -2741,17 +2617,19 @@ export class TradingTerminal {
     const product = this.instantProduct()
     const lotTxt = this.sym.lots ? `${qty / this.sym.lotsize}L (${qty})` : qty
     const summary = `BUY/SELL ${lotTxt} ${this.sym.symbol} · ${product}`.replace('BUY/SELL', side)
+    const pricing = this.modePricing(side)
     try {
       const r = await this.trade.place({
         symbol: this.sym.symbol,
         exchange: this.sym.exchange,
         side,
-        type: 'MARKET',
+        type: pricing.pricetype,
         qty,
         product,
+        price: pricing.price,
         mode: this.tradeMode(),
       })
-      this.toast(`instant ${summary} (id ${r.orderId})`, 'ok')
+      this.toast(`instant ${summary} — ${pricing.note} (id ${r.orderId})`, 'ok')
       this.pollBook()
     } catch (e) {
       this.toast(this.cleanError(e), 'err')
@@ -3202,21 +3080,36 @@ export class TradingTerminal {
     const now = Date.now()
     if (now - this.lastFireAt < ORDER_COOLDOWN_MS) return
     this.lastFireAt = now
+    // An explicit menu choice keeps its type. A MARKET click — the old canvas
+    // buttons' route and the context menu's default — is priced by the global
+    // order mode: LIMIT mode chases the live price, MPP buffers it, LIVE
+    // rests on the screen price, MARKET prints.
+    let wireType: OrderType = type
+    let wirePrice: number | undefined = type === 'MARKET' ? undefined : px
+    let note = ''
+    if (type === 'MARKET') {
+      const pricing: ResolvedPricing = this.modePricing(side)
+      wireType = pricing.pricetype
+      wirePrice = pricing.price
+      note = pricing.note
+    }
     const lotTxt = this.sym.lots ? `${qty / this.sym.lotsize}L (${qty})` : qty
-    const summary = `${side} ${type} ${lotTxt} ${this.sym.symbol}${type === 'MARKET' ? '' : ` @ ${this.fmt(px)}`} · ${this.product}`
+    const summary = `${side} ${wireType} ${lotTxt} ${this.sym.symbol}${
+      wireType === 'MARKET' ? '' : ` @ ${this.fmt(wirePrice ?? 0)}`
+    } · ${this.product}`
     try {
       const r = await this.trade.place({
         symbol: this.sym.symbol,
         exchange: this.sym.exchange,
         side,
-        type,
+        type: wireType,
         qty,
         product: this.product as 'CNC' | 'NRML' | 'MIS',
-        price: type === 'MARKET' ? undefined : px,
-        triggerPrice: type === 'SL' || type === 'SL-M' ? px : undefined,
+        price: wireType === 'MARKET' ? undefined : wirePrice,
+        triggerPrice: wireType === 'SL' || wireType === 'SL-M' ? px : undefined,
         mode: this.tradeMode(),
       })
-      this.toast(`placed ${summary} (id ${r.orderId})`, 'ok')
+      this.toast(`placed ${summary}${note ? ` — ${note}` : ''} (id ${r.orderId})`, 'ok')
       this.pollBook()
     } catch (e) {
       this.toast(this.cleanError(e), 'err')
@@ -3393,8 +3286,7 @@ export class TradingTerminal {
     this.offBranding = null
     // The rebuild wipes the container's DOM: drop the overlay elements first
     // so the mount guards below rebuild them instead of finding detached
-    // ghosts — the slider going dead after a theme change was exactly that.
-    this.destroyQtySlider()
+    // ghosts — the panel going dead after a theme change was exactly that.
     this.destroyInstantPanel()
     this.destroyPosBox()
     if (this.chart) this.chart.destroy()
@@ -3598,40 +3490,15 @@ export class TradingTerminal {
     // takes part in none of that: its tag is drawn straight onto the strip.
     //
     // The price itself is still needed: the Buy/Sell panel marks it.
-    const lp =
-      this.lastLtp != null
-        ? this.lastLtp
-        : this.rawBars.length
-          ? this.rawBars[this.rawBars.length - 1].close
-          : null
 
-    // inline SELL · qty · BUY panel, docked top-left below the OHLC legend.
+    // The chart's one SELL · slider · BUY strip, docked top-left below the
+    // OHLC legend. The canvas Buy/Sell primitive this used to sit beside is
+    // gone — this panel IS the order entry affordance now.
     if (!this.sym!.quoteOnly) {
-      // The toolbar's panel toggles, persisted per pane (both default on).
-      this.tradePanelOn = this.lsGet('tradebtns') !== '0'
+      // The toolbar's panel toggle, persisted per pane (default on).
       this.instantPanelOn = this.lsGet('instantpanel') !== '0'
-      this.tradeBtns = new BuySellButtons({
-        id: 'trade',
-        position: 'top-left',
-        margin: { x: TRADE_PANEL.x, y: TRADE_PANEL.y },
-        qty: this.qtyChip(),
-        scale: TRADE_PANEL.scale,
-      })
-      if (lp != null) this.tradeBtns.setMark(lp)
-      this.applyTradeColors()
-      // Order entry is an affordance, not chart content: it is left out of a
-      // saved image (see `screenshotExcluded`).
-      this.addExcludedPrimitive(this.tradeBtns, 0)
-      this.showTradeButtons(true)
-      // The qty chip's capital slider rides the same dock: hover the chip,
-      // drag the percent of capital, the lot size re-sizes itself.
-      this.mountQtySlider()
-      // The one-click instant panel docks right below the canvas one and
-      // only shows itself once One-Click is armed.
       this.mountInstantPanel()
     } else {
-      this.tradeBtns = null
-      this.destroyQtySlider()
       this.destroyInstantPanel()
       this.destroyPosBox()
     }
@@ -3722,8 +3589,6 @@ export class TradingTerminal {
       }
     )
     this.chart.subscribeClick((id) => {
-      if (id === 'trade:buy') return void this.placeFromMenu('BUY', 'MARKET')
-      if (id === 'trade:sell') return void this.placeFromMenu('SELL', 'MARKET')
       if (id === 'position::close') return void this.exitPosition()
       // The SL/TP handles' ✕: clear the level, cancel the order it sent.
       if (id === 'position:stop::close') return void this.clearPosLevel('stop')
@@ -7360,42 +7225,12 @@ export class TradingTerminal {
   }
 
   /**
-   * The mode marker. A chart replaying August looks exactly like a chart showing
-   * today, and reading a live decision off history is the mistake this prevents,
-   * so it goes on with replay and comes off with it.
+   * Replay's hide/show of the trade affordance. The canvas primitive is gone,
+   * so this rides the one DOM panel, which decides its own visibility from
+   * the replay lock — every old call site keeps working untouched.
    */
-  /**
-   * Take the Buy and Sell buttons off the chart, or put them back.
-   *
-   * Removing rather than grey-ing: the panel quotes a live price, and a live
-   * price sitting over a replayed session is the confusion this exists to
-   * remove, whether or not it can be pressed. `removePrimitive` only marks the
-   * pane dirty, so the chart repaints them away on the next frame.
-   */
-  private showTradeButtons(on: boolean): void {
-    if (!this.chart || !this.tradeBtns) return
-    if (this.workspaceReplayLocked) on = false
-    // The trader's toolbar toggle rides here too: replay forces the panel
-    // off, and a replay exit only brings it back if the toggle keeps it.
-    on = on && this.tradePanelOn
-    if (on) this.chart.addPrimitive(this.tradeBtns, 0)
-    else this.chart.removePrimitive(this.tradeBtns)
-  }
-
-  /**
-   * The toolbar's panel toggles. The classic canvas Buy/Sell and the
-   * one-click instant panel are separate affordances for separate habits:
-   * the ticket keeps the details in front of the trader, the instant panel
-   * is the scalper's fire button — each hides the other's way.
-   */
-  setTradePanelVisible(on: boolean): void {
-    this.tradePanelOn = on
-    this.lsSet('tradebtns', on ? '1' : '0')
-    this.showTradeButtons(true)
-  }
-
-  tradePanelVisible(): boolean {
-    return this.tradePanelOn
+  private showTradeButtons(_on: boolean): void {
+    this.syncInstantPanel()
   }
 
   setInstantPanelVisible(on: boolean): void {
@@ -7408,6 +7243,11 @@ export class TradingTerminal {
     return this.instantPanelOn
   }
 
+  /**
+   * The mode marker. A chart replaying August looks exactly like a chart showing
+   * today, and reading a live decision off history is the mistake this prevents,
+   * so it goes on with replay and comes off with it.
+   */
   private showReplayMark(on: boolean): void {
     if (!this.chart) return
     if (on) {
@@ -7519,14 +7359,13 @@ export class TradingTerminal {
           this.onTick({ symbol: this.sym.symbol, ltp: q.ltp, timeSec: nowSec() })
         if (!this.sym.quoteOnly) this.priceAxis.setQuote(q.bid, q.ask)
         if (
-          this.tradeBtns &&
           typeof q.bid === 'number' &&
           typeof q.ask === 'number' &&
           q.bid > 0 &&
-          q.ask > 0
+          q.ask > 0 &&
+          this.instantPanel
         ) {
           this.depthActive = true
-          this.tradeBtns.setPrices(q.bid, q.ask)
           this.instantPrices(q.bid, q.ask)
         }
         this.cb.onWsState('fallback')
@@ -7552,7 +7391,9 @@ export class TradingTerminal {
     if (this.position && this.posLine) this.posLine.setLeftLabel(this.posLabel())
     // The top-right box's P&L row follows the tick too.
     this.renderPosBoxPnl()
-    if (this.tradeBtns && !this.depthActive) this.tradeBtns.setMark(e.ltp)
+    // No depth? The panel still gets a price to show: the LTP marks both
+    // sides rather than leaving the strip blank on a quote-only feed.
+    if (this.instantPanel && !this.depthActive) this.instantPrices(e.ltp, e.ltp)
     if (this.builder) {
       let u
       try {
@@ -7660,7 +7501,6 @@ export class TradingTerminal {
       this.priceAxis.setQuote(bid, ask)
       if (typeof bid === 'number' && typeof ask === 'number' && bid > 0 && ask > 0) {
         this.depthActive = true
-        if (this.tradeBtns) this.tradeBtns.setPrices(bid, ask)
         this.instantPrices(bid, ask)
       }
       // Depth is the terminal's ONLY subscription for tradeable instruments,
@@ -8359,7 +8199,6 @@ export class TradingTerminal {
   }
   setQty(n: number) {
     this.qty = Math.max(1, Math.floor(n || 1))
-    if (this.tradeBtns) this.tradeBtns.setQty(this.qtyChip())
     this.syncInstantQty()
     this.refreshQtySliderText()
   }
@@ -8380,20 +8219,23 @@ export class TradingTerminal {
     return this.armed
   }
   /**
-   * The Buy and Sell panel says which it is. Armed, the theme's own buy and
+   * The Buy/Sell strip says which it is. Armed, the theme's own buy and
    * sell colours: the click is the order. Off, both are pulled towards the
-   * background so they read as a control that opens something rather than one
-   * that fires. A colour swap on the primitive, not a rebuild: the panel keeps
-   * its prices and its place.
+   * background so they read as a control that opens a ticket rather than one
+   * that fires. A style swap on the live DOM, not a rebuild.
    */
   private applyTradeColors(): void {
-    if (!this.tradeBtns) return
+    const sell = this.instantPanel?.querySelector<HTMLButtonElement>('[data-i-sell]')
+    const buy = this.instantPanel?.querySelector<HTMLButtonElement>('[data-i-buy]')
+    if (!sell || !buy) return
     if (this.armed || !this.chartTheme) {
-      this.tradeBtns.setColors(undefined, undefined)
+      sell.style.background = '#ef5350'
+      buy.style.background = '#26a69a'
       return
     }
     const muted = mutedTradeColors(this.chartTheme)
-    this.tradeBtns.setColors(muted.buy, muted.sell)
+    sell.style.background = muted.sell
+    buy.style.background = muted.buy
   }
   /** The overlay's Try again: repeat the load that drew no chart. */
   retryLoad(): void {
@@ -8523,17 +8365,6 @@ export class TradingTerminal {
   }
 
   /* ── PNG export ───────────────────────────────────────────────────────── */
-
-  /**
-   * Attach a primitive that must never appear in an exported image.
-   *
-   * Anything an image cannot be used for — a button, a drag handle — belongs
-   * here rather than on `addPrimitive` directly. See `screenshotExcluded`.
-   */
-  private addExcludedPrimitive(primitive: IPrimitive, paneIndex = 0) {
-    this.chart?.addPrimitive(primitive, paneIndex)
-    this.screenshotExcluded.push({ primitive, paneIndex })
-  }
 
   /**
    * Save the chart as a PNG.
@@ -9259,7 +9090,6 @@ export class TradingTerminal {
     this.detachAlerts()
     this.detachObjects()
     this.detachDrawing()
-    this.destroyQtySlider()
     this.destroyInstantPanel()
     this.destroyPosBox()
     if (this.bookTimer) clearInterval(this.bookTimer)

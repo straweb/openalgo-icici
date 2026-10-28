@@ -87,8 +87,13 @@ describe('no order can leave the chart while replay owns it', () => {
   })
 
   it('takes the buttons off the chart rather than leaving them live-looking', () => {
+    // The canvas Buy/Sell primitive is gone; the DOM strip is the trade
+    // affordance replay must strip. showTradeButtons delegates to the panel's
+    // own visibility, and that visibility expression excludes a chart the
+    // replay lock owns — the same guarantee, one layer down.
     const body = blockAfter('private showTradeButtons(')
-    expect(body).toContain('removePrimitive')
-    expect(body).toContain('addPrimitive')
+    expect(body).toContain('syncInstantPanel')
+    const panel = blockAfter('private syncInstantPanel(')
+    expect(panel).toContain('!this.workspaceReplayLocked')
   })
 })

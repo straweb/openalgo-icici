@@ -1,11 +1,12 @@
+import { tradingApi } from '@/api/trading'
+import { type StrikePickMode, strikesForPick } from '@/lib/hedging/indexLevels'
 import { newScheduleId } from '@/lib/hedging/scheduler'
-import { rowsFromStrikes, type DeployRow } from '@/lib/trading/deployPlan'
-import { entryMet, planCrosses } from '@/lib/trading/tradingFire'
 import { loadHedgingState, saveHedgingState } from '@/lib/hedging/storage'
+import { type DeployRow, rowsFromStrikes } from '@/lib/trading/deployPlan'
+import { currentOrderMode, fetchLtpMap, resolveOrderPricing } from '@/lib/trading/orderMode'
+import { entryMet, planCrosses } from '@/lib/trading/tradingFire'
 import type { ScheduledOrder } from '@/types/hedging'
 import type { OptionChainResponse } from '@/types/option-chain'
-import { tradingApi } from '@/api/trading'
-import { strikesForPick, type StrikePickMode } from '@/lib/hedging/indexLevels'
 import { showToast } from '@/utils/toast'
 
 /**
@@ -48,7 +49,9 @@ export function resolveLevelPick(input: {
   if (!input.chain) return null
   const atm =
     input.chain.atm_strike ||
-    (input.interval ? Math.round((input.chain.underlying_ltp ?? 0) / input.interval) * input.interval : null)
+    (input.interval
+      ? Math.round((input.chain.underlying_ltp ?? 0) / input.interval) * input.interval
+      : null)
   const planned = strikesForPick(input.plan.pick, atm, input.interval)
   const { rows, skipped } = rowsFromStrikes(
     input.chain,
@@ -88,13 +91,22 @@ export async function placeLevelOrders(input: {
   batchLots: number
   optionAction: 'BUY' | 'SELL'
   product: 'MIS' | 'NRML' | 'CNC'
-  pricetype: 'MARKET' | 'LIMIT' | 'SL' | 'SL-M'
 }): Promise<{ placed: number; failed: number }> {
   let placed = 0
   let failed = 0
+  // The global order mode prices the batch: one quote ask covers the priced
+  // modes, and the resolver's market fallback answers a failed ask.
+  const { mode, mppPercent } = currentOrderMode()
+  const ltps = await fetchLtpMap(input.apiKey, input.picked)
   for (const row of input.picked) {
     const qty = (row.lots || input.batchLots) * row.lotSize
     if (qty <= 0) continue
+    const pricing = resolveOrderPricing({
+      action: input.optionAction,
+      mode,
+      mppPercent,
+      ltp: ltps.get(`${row.exchange}:${row.symbol}`),
+    })
     try {
       const res = await tradingApi.placeOrder({
         apikey: input.apiKey,
@@ -103,8 +115,9 @@ export async function placeLevelOrders(input: {
         symbol: row.symbol,
         action: input.optionAction,
         quantity: qty,
-        pricetype: input.pricetype,
+        pricetype: pricing.pricetype,
         product: input.product,
+        price: pricing.price,
       })
       if (res.status === 'success') placed += 1
       else failed += 1
@@ -157,7 +170,11 @@ export function armCloseRows(
   saveHedgingState({ ...state, scheduled: [...state.scheduled, ...rows] })
   showToast.info(
     `Exits set on ${plan.spot.symbol}: ${rows
-      .map((row) => row.trigger.kind === 'price' ? `${row.trigger.condition === 'above' ? '≥' : '≤'} ${row.trigger.price.toLocaleString('en-IN')}` : '')
+      .map((row) =>
+        row.trigger.kind === 'price'
+          ? `${row.trigger.condition === 'above' ? '≥' : '≤'} ${row.trigger.price.toLocaleString('en-IN')}`
+          : ''
+      )
       .filter(Boolean)
       .join(' · ')}.`
   )

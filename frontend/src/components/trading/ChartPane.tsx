@@ -1,8 +1,8 @@
 // Lucide survives for the context menu's cut glyph and the trade-panel
-// toggles only, which the engine's chrome set has no picture for; they are
+// toggle only, which the engine's chrome set has no picture for; they are
 // drawn at the engine's line weight.
 // Everything else in the toolbar and the menus is the engine's chrome set.
-import { MousePointerClick, Scissors, Zap } from 'lucide-react'
+import { Scissors, Zap } from 'lucide-react'
 import type { ChartObjects, LinkGroup } from 'openalgo-charts'
 import type { MagnetMode } from 'openalgo-charts/draw'
 import type { WorkspacePane } from 'openalgo-charts/workspace'
@@ -384,12 +384,9 @@ export function ChartPane({
 
   const [ready, setReady] = useState(false)
   /**
-   * The two trade panels' visibility, read off the terminal once it boots
-   * (it persists the choice per pane) and pushed back on every toggle. The
-   * classic canvas Buy/Sell and the one-click instant panel hide separately:
-   * the ticket trader and the scalper each keep their own affordance.
+   * The one trade panel's visibility, read off the terminal once it boots
+   * (it persists the choice per pane) and pushed back on every toggle.
    */
-  const [tradePanelOn, setTradePanelOn] = useState(true)
   const [instantPanelOn, setInstantPanelOn] = useState(true)
   /**
    * The load state drawn over the chart: dots for a slow load, a card for no
@@ -750,25 +747,17 @@ export function ChartPane({
     terminalRef.current?.setArmed(armed && !transitionLocked)
   }, [armed, transitionLocked])
 
-  /* ── the trade-panel toggles: read at boot, push on toggle ─────────── */
+  /* ── the trade-panel toggle: read at boot, push on toggle ─────────── */
   // biome-ignore lint/correctness/useExhaustiveDependencies: ready is the trigger — the persisted choice reads once the terminal exists
   useEffect(() => {
     if (!ready) return
-    // Guarded reads: a test double (or a terminal from before the toggles)
-    // ships neither method, and both default to shown.
+    // Guarded read: a test double (or a terminal from before the toggle)
+    // ships no method, and defaults to shown.
     const terminal = terminalRef.current
-    setTradePanelOn(
-      typeof terminal?.tradePanelVisible === 'function' ? terminal.tradePanelVisible() : true
-    )
     setInstantPanelOn(
       typeof terminal?.instantPanelVisible === 'function' ? terminal.instantPanelVisible() : true
     )
   }, [ready])
-  const toggleTradePanel = () => {
-    const next = !tradePanelOn
-    setTradePanelOn(next)
-    terminalRef.current?.setTradePanelVisible(next)
-  }
   const toggleInstantPanel = () => {
     const next = !instantPanelOn
     setInstantPanelOn(next)
@@ -1412,45 +1401,26 @@ export function ChartPane({
             </Tip>
           )}
 
-          {/* The two trade panels' toggles, one icon each: the pointer-click
-              glyph is the classic Buy/Sell (it opens the order ticket when
-              One-Click is off), the bolt is the one-click instant panel. Both
-              default on; each remembers its own off. */}
+          {/* The trade panel's toggle, one icon: the bolt is the SELL · slider
+              · BUY strip — the chart's only Buy/Sell buttons. On by default;
+              it remembers its own off. */}
           {sym && !sym.quoteOnly && (
-            <>
-              <Tip
-                tip={{
-                  title: tradePanelOn ? 'Buy/Sell panel is on' : 'Buy/Sell panel is hidden',
-                  sub: 'Show or hide the on-chart Buy and Sell buttons',
-                }}
+            <Tip
+              tip={{
+                title: instantPanelOn ? 'Buy/Sell panel is on' : 'Buy/Sell panel is hidden',
+                sub: 'The on-chart SELL · slider · BUY strip — a press fires when One-Click is on, opens the ticket when off',
+              }}
+            >
+              <button
+                type="button"
+                aria-label="Toggle the Buy/Sell panel"
+                aria-pressed={instantPanelOn}
+                className={cn(TB_BTN, TB_ICON, instantPanelOn && TB_ON)}
+                onClick={toggleInstantPanel}
               >
-                <button
-                  type="button"
-                  aria-label="Toggle the Buy/Sell panel"
-                  aria-pressed={tradePanelOn}
-                  className={cn(TB_BTN, TB_ICON, tradePanelOn && TB_ON)}
-                  onClick={toggleTradePanel}
-                >
-                  <MousePointerClick className="h-4 w-4" />
-                </button>
-              </Tip>
-              <Tip
-                tip={{
-                  title: instantPanelOn ? 'Instant panel is on' : 'Instant panel is hidden',
-                  sub: 'One-click panel: a press fires a market order — NRML on options, MIS on equity, when One-Click is on',
-                }}
-              >
-                <button
-                  type="button"
-                  aria-label="Toggle the instant one-click panel"
-                  aria-pressed={instantPanelOn}
-                  className={cn(TB_BTN, TB_ICON, instantPanelOn && TB_ON)}
-                  onClick={toggleInstantPanel}
-                >
-                  <Zap className="h-4 w-4" />
-                </button>
-              </Tip>
-            </>
+                <Zap className="h-4 w-4" />
+              </button>
+            </Tip>
           )}
 
           {/* Quantity: the one field in the row keeps a fill, so it reads as editable.

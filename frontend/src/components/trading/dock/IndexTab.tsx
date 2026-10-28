@@ -15,30 +15,29 @@
  * it needs the listed strikes — and it says so without hiding the table.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Rocket } from 'lucide-react'
-import { Button } from '@/components/ui/button'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { tradingApi } from '@/api/trading'
+import { IndexDeployDialog, type IndexDeploySubmit } from '@/components/hedging/IndexDeployDialog'
 import { IndexPanel } from '@/components/hedging/IndexPanel'
-import {
-  IndexDeployDialog,
-  type IndexDeploySubmit,
-} from '@/components/hedging/IndexDeployDialog'
 import { useSpotResolution } from '@/components/trading/dock/useSpotResolution'
-import { newScheduleId, scheduleTriggerLabel } from '@/lib/hedging/scheduler'
+import { Button } from '@/components/ui/button'
 import { constituentsFor } from '@/lib/hedging/indexConstituents'
+import { strikesForPick } from '@/lib/hedging/indexLevels'
+import { newScheduleId, scheduleTriggerLabel } from '@/lib/hedging/scheduler'
 import { loadHedgingState, saveHedgingState } from '@/lib/hedging/storage'
-import type { SearchRow } from '@/lib/trading/terminal'
 import {
+  chainLtp,
   fnoBaseSymbol,
-  rowsFromStrikes,
   readDeployState,
+  rowsFromStrikes,
   writeDeployState,
 } from '@/lib/trading/deployPlan'
-import { strikesForPick } from '@/lib/hedging/indexLevels'
+import { currentOrderMode, resolveOrderPricing } from '@/lib/trading/orderMode'
+import type { SearchRow } from '@/lib/trading/terminal'
 import { entryMet, planCrosses } from '@/lib/trading/tradingFire'
-import { fnoExchangeFor } from '@/types/hedging'
 import type { ScheduledOrder } from '@/types/hedging'
-import { tradingApi } from '@/api/trading'
+import { fnoExchangeFor } from '@/types/hedging'
 import { showToast } from '@/utils/toast'
 
 interface Props {
@@ -84,7 +83,11 @@ export function IndexTab({ apiKey, activeSymbol, paneSymbols, onPick }: Props) {
 
   /** The index whose constituents show: first candidate with a member list. */
   const index = useMemo(() => {
-    const candidates = [bindingSymbol, symbolOf(activeSymbol), ...Object.values(paneSymbols).map(symbolOf)]
+    const candidates = [
+      bindingSymbol,
+      symbolOf(activeSymbol),
+      ...Object.values(paneSymbols).map(symbolOf),
+    ]
     for (const candidate of candidates) {
       if (!candidate) continue
       const base = fnoBaseSymbol(candidate)
@@ -100,12 +103,11 @@ export function IndexTab({ apiKey, activeSymbol, paneSymbols, onPick }: Props) {
 
   // A level deploy wants the ladder around ATM, not a spot answer only —
   // this is the one read that waits for the chain snapshot.
-  const { chain, spot: chainSpot, error } = useSpotResolution(
-    apiKey,
-    index,
-    50,
-    profile?.stockExchange ?? 'NSE'
-  )
+  const {
+    chain,
+    spot: chainSpot,
+    error,
+  } = useSpotResolution(apiKey, index, 50, profile?.stockExchange ?? 'NSE')
 
   /** The spot quote, off the quotes feed — never waiting for the chain. */
   const [spotQuote, setSpotQuote] = useState<{ exchange: string; ltp: number | undefined } | null>(
@@ -183,7 +185,13 @@ export function IndexTab({ apiKey, activeSymbol, paneSymbols, onPick }: Props) {
       const key = `${optionsExchange}:${index}`
       const ladder = state.books[key] ?? { ce: [], pe: [] }
       const existing = plan.side === 'CE' ? ladder.ce : ladder.pe
-      const { rows: next, skipped } = rowsFromStrikes(chain, plan.side, planned, existing, optionsExchange)
+      const { rows: next, skipped } = rowsFromStrikes(
+        chain,
+        plan.side,
+        planned,
+        existing,
+        optionsExchange
+      )
       writeDeployState({
         ...state,
         books: { ...state.books, [key]: { ...ladder, [plan.side === 'CE' ? 'ce' : 'pe']: next } },
@@ -192,7 +200,9 @@ export function IndexTab({ apiKey, activeSymbol, paneSymbols, onPick }: Props) {
         showToast.warning(
           `${plan.side}: ${skipped.length} of ${planned.length} strikes are not on the chain — the rest deployed.`
         )
-      const picked = next.filter((row) => row.optionType === plan.side && planned.includes(row.strike))
+      const picked = next.filter(
+        (row) => row.optionType === plan.side && planned.includes(row.strike)
+      )
       if (picked.length === 0) {
         showToast.warning('Those strikes are not on the chain — nothing to deploy.')
         return
@@ -211,9 +221,19 @@ export function IndexTab({ apiKey, activeSymbol, paneSymbols, onPick }: Props) {
       if (entryMet(plan.entry, crosses, spotLtp)) {
         let placed = 0
         let failed = 0
+        const { mode, mppPercent } = currentOrderMode()
         for (const row of picked) {
           const qty = (row.lots || state.lots) * row.lotSize
           if (qty <= 0) continue
+          // The global order mode prices these too: an index deploy's strikes
+          // carry no entry levels of their own, so LIMIT/LIVE rest at the
+          // option's live price and MPP buffers it by the percent.
+          const pricing = resolveOrderPricing({
+            action: plan.optionAction,
+            mode,
+            mppPercent,
+            ltp: chainLtp(chain, row.symbol),
+          })
           try {
             const res = await tradingApi.placeOrder({
               apikey: apiKey,
@@ -222,8 +242,9 @@ export function IndexTab({ apiKey, activeSymbol, paneSymbols, onPick }: Props) {
               symbol: row.symbol,
               action: plan.optionAction,
               quantity: qty,
-              pricetype: state.pricetype,
+              pricetype: pricing.pricetype,
               product: state.product,
+              price: pricing.price,
             })
             if (res.status === 'success') placed += 1
             else failed += 1
@@ -320,9 +341,7 @@ export function IndexTab({ apiKey, activeSymbol, paneSymbols, onPick }: Props) {
         </p>
       )}
       <div
-        className={
-          error && !chain ? 'h-[calc(100%-58px)] min-h-0' : 'h-[calc(100%-29px)] min-h-0'
-        }
+        className={error && !chain ? 'h-[calc(100%-58px)] min-h-0' : 'h-[calc(100%-29px)] min-h-0'}
       >
         <IndexPanel
           underlying={index}

@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useMarketData } from '@/hooks/useMarketData'
 import { optionChainApi } from '@/api/option-chain'
 import { scalpingApi } from '@/api/scalping'
 import { tradingApi } from '@/api/trading'
+import { useMarketData } from '@/hooks/useMarketData'
 import { useEngineLock } from '@/lib/hedging/engineLock'
 import { isDue, istDateKey, scheduleActionLabel } from '@/lib/hedging/scheduler'
 import { loadHedgingState, saveHedgingState } from '@/lib/hedging/storage'
-import { rowsFromStrikes, readDeployState } from '@/lib/trading/deployPlan'
-import { ladderFireOrders, planFireOrders, type FireOrder } from '@/lib/trading/tradingFire'
+import { readDeployState, rowsFromStrikes } from '@/lib/trading/deployPlan'
+import { currentOrderMode, resolveOrderPricing } from '@/lib/trading/orderMode'
+import { type FireOrder, ladderFireOrders, planFireOrders } from '@/lib/trading/tradingFire'
 import { fnoExchangeFor, type HedgingState, type ScheduledOrder } from '@/types/hedging'
 import { showToast } from '@/utils/toast'
 
@@ -31,19 +32,26 @@ export function useTradingScheduler(apiKey: string) {
   const claimLock = useEngineLock('trading')
 
   /** The distinct price-trigger symbols the pending batches watch. */
-  const [triggerSymbols, setTriggerSymbols] = useState<
-    Array<{ symbol: string; exchange: string }>
-  >([])
+  const [triggerSymbols, setTriggerSymbols] = useState<Array<{ symbol: string; exchange: string }>>(
+    []
+  )
   const triggerKey = useMemo(
-    () => triggerSymbols.map((pick) => `${pick.exchange}:${pick.symbol}`).sort().join('|'),
+    () =>
+      triggerSymbols
+        .map((pick) => `${pick.exchange}:${pick.symbol}`)
+        .sort()
+        .join('|'),
     [triggerSymbols]
   )
   const quoteSymbols = useMemo(
     () =>
-      triggerKey.split('|').filter(Boolean).map((key) => {
-        const [exchange, symbol] = key.split(':')
-        return { symbol, exchange }
-      }),
+      triggerKey
+        .split('|')
+        .filter(Boolean)
+        .map((key) => {
+          const [exchange, symbol] = key.split(':')
+          return { symbol, exchange }
+        }),
     [triggerKey]
   )
   const quotes = useMarketData({ symbols: quoteSymbols, mode: 'LTP' })
@@ -65,7 +73,10 @@ export function useTradingScheduler(apiKey: string) {
         }
       }
       setTriggerSymbols((current) => {
-        const currentKey = current.map((p) => `${p.exchange}:${p.symbol}`).sort().join('|')
+        const currentKey = current
+          .map((p) => `${p.exchange}:${p.symbol}`)
+          .sort()
+          .join('|')
         const nextKey = [...next.keys()].sort().join('|')
         return currentKey === nextKey ? current : [...next.values()]
       })
@@ -119,8 +130,19 @@ export function useTradingScheduler(apiKey: string) {
       }
       let placed = 0
       let failed = 0
+      const { mode, mppPercent } = currentOrderMode()
       for (const order of orders) {
         try {
+          // The global order mode prices the batch: a levelled BUY rests at
+          // its level, the other priced modes ride the page's own quote
+          // feed, and only a priced mode without any price prints market.
+          const pricing = resolveOrderPricing({
+            action: order.action,
+            mode,
+            mppPercent,
+            entry: order.entry ?? order.price,
+            ltp: quotesRef.current.data.get(`${order.exchange}:${order.symbol}`)?.data.ltp,
+          })
           const res = await tradingApi.placeOrder({
             apikey: apiKey,
             strategy: 'SCHEDULED',
@@ -128,8 +150,9 @@ export function useTradingScheduler(apiKey: string) {
             symbol: order.symbol,
             action: order.action,
             quantity: order.quantity,
-            pricetype: state.pricetype,
+            pricetype: pricing.pricetype,
             product: state.product,
+            price: pricing.price,
           })
           if (res.status === 'success') placed += 1
           else failed += 1
@@ -183,12 +206,7 @@ export function useTradingScheduler(apiKey: string) {
 }
 
 /** Write a due row's audit stamp through a fresh read, true when saved. */
-function markRow(
-  state: HedgingState,
-  id: string,
-  daily: boolean,
-  firedAt: number
-): boolean {
+function markRow(state: HedgingState, id: string, daily: boolean, firedAt: number): boolean {
   try {
     saveHedgingState({
       ...state,

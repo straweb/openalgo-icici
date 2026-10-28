@@ -393,6 +393,13 @@ def react_straddlepnl():
     return serve_react_app()
 
 
+# CAS Trade - the expiry-day cas_prediction terminal. Registered explicitly so
+# a logged-out bookmark does not count against Error404Tracker (IP-ban path).
+@react_bp.route("/castrade", strict_slashes=False)
+def react_castrade():
+    return serve_react_app()
+
+
 # Agent - the LLM agent surface. Registered even though React Router would serve
 # it anyway through the 404 fallback: an unregistered path counts against
 # Error404Tracker for unauthenticated visitors, so a bookmark opened while

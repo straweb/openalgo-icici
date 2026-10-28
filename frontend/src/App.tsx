@@ -61,6 +61,7 @@ const ChartTest = lazy(() => import('@/pages/ChartTest'))
 const Playground = lazy(() => import('@/pages/Playground'))
 const Trading = lazy(() => import('@/pages/Trading'))
 const Hedging = lazy(() => import('@/pages/Hedging'))
+const Castrade = lazy(() => import('@/pages/Castrade'))
 const Historify = lazy(() => import('@/pages/Historify'))
 const HistorifyCharts = lazy(() => import('@/pages/HistorifyCharts'))
 
@@ -315,6 +316,11 @@ function App() {
                     three columns and a dock inside a fixed viewport, none of
                     which fits Layout's centred page-scrolling container. */}
                 <Route path="/hedging" element={<Hedging />} />
+                {/* The CAS Trade terminal is the cas_prediction expiry-day
+                    surface: a chart grid plus two rails inside a fixed
+                    viewport, the same application-shell reasoning as
+                    /trading and /hedging. */}
+                <Route path="/castrade" element={<Castrade />} />
                 {/* The agent is an application surface, not a document: the
                     thread scrolls inside a fixed viewport with the composer
                     pinned under it, and a conversation sidebar sits beside it.

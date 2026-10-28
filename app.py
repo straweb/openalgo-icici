@@ -58,6 +58,7 @@ from blueprints.brlogin import brlogin_bp
 from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
+from blueprints.castrade import castrade_bp  # Import CAS Trade (cas_prediction) terminal blueprint
 from blueprints.chart_test import chart_test_bp  # Standalone chart test page (dev/testing only)
 from blueprints.chartink import chartink_bp  # Import the chartink blueprint
 from blueprints.core import core_bp
@@ -341,6 +342,7 @@ def create_app():
     app.register_blueprint(straddle_bp)  # Register straddle chart blueprint
     app.register_blueprint(strategy_chart_bp)  # Register strategy chart blueprint
     app.register_blueprint(custom_straddle_bp)  # Register custom straddle blueprint
+    app.register_blueprint(castrade_bp)  # Register CAS Trade (cas_prediction) terminal blueprint
     app.register_blueprint(vol_surface_bp)  # Register vol surface blueprint
     app.register_blueprint(gex_bp)  # Register GEX blueprint
     app.register_blueprint(strike_profile_bp)  # Register Strike Profile blueprint

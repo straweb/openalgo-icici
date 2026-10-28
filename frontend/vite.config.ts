@@ -42,6 +42,12 @@ export default defineConfig({
         target: 'http://localhost:5000',
         changeOrigin: true,
       },
+      // The CAS Trade page blueprint serves its JSON under /castrade/api,
+      // outside the /api prefix, so the dev server passes it through too.
+      '/castrade': {
+        target: 'http://localhost:5000',
+        changeOrigin: true,
+      },
       // User indicator modules are served by Flask from strategies/indicators,
       // never bundled, so the dev server has to pass them through too.
       '/custom-indicators': {

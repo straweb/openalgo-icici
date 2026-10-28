@@ -149,7 +149,10 @@ export interface CastradeAnalysisData {
   trade_date: string
   is_expiry_day: boolean
   mode: 'live' | 'replay'
-  atm: number
+  atm: number // legacy single-ATM key (CE side)
+  /** Per-side ATM (one-strike-difference): CE = strike at/below spot, PE = at/above. */
+  ce_atm?: number
+  pe_atm?: number
   strike_step: number
   lot_size: number
   window: {
@@ -189,6 +192,8 @@ export interface CastradeAnalysisData {
   feed?: CastradeFeedStatus
   orders?: CastradeOrderRecord[]
   position_qty?: number
+  /** live session: open qty per symbol bought from this page (quick trades) */
+  positions?: Record<string, number>
   server_time?: string
   type?: 'delta'
 }
@@ -251,7 +256,7 @@ export const castradeApi = {
     return response.data
   },
 
-  // --- orders (live session only, locked final pick only) ---
+  // --- orders (live session only, any tradable strike of the universe) ---
 
   placeOrder: async (params: {
     action: 'BUY' | 'SELL'
@@ -260,6 +265,17 @@ export const castradeApi = {
     product?: string
   }): Promise<{ status: 'success' | 'error'; message?: string; orderid?: string }> => {
     const response = await webClient.post('/castrade/api/order', params)
+    return response.data
+  },
+
+  // --- funds for the quick-order sizing slider ---
+
+  getFunds: async (): Promise<{
+    status: 'success' | 'error'
+    message?: string
+    data?: { available: number | null; raw?: Record<string, unknown> }
+  }> => {
+    const response = await webClient.get('/castrade/api/funds')
     return response.data
   },
 }

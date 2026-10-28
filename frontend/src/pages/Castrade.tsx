@@ -27,6 +27,7 @@ import {
   Target,
   TrendingDown,
   TrendingUp,
+  Wallet,
   Zap,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -40,8 +41,8 @@ import type {
   CastradeUnderlying,
 } from '@/api/castrade'
 import { castradeApi } from '@/api/castrade'
-import { useSocketContext } from '@/components/socket/SocketProvider'
 import { AccountControls } from '@/components/layout/AccountControls'
+import { useSocketContext } from '@/components/socket/SocketProvider'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -68,11 +69,19 @@ import { useThemeStore } from '@/stores/themeStore'
  *           walking away from ATM). 15:19/15:20 pattern bars carry a dot
  *           marker on every chart; the winning leg gets BUY/SELL arrows.
  *   RIGHT : the strikes panel (CE rows, a CE/PE divider, PE rows) with each
- *           strike's score, verdict, pattern dots and projected/actual return;
- *           below it the final-trade panel - the ONE strike to buy at 15:21
- *           and sell at 15:29 - with LIVE BUY / SELL buttons that place real
- *           MARKET orders through the broker (live session only), plus the
- *           strategy's decision timeline.
+ *           strike's score, x/20 confidence, pattern dots and projected/actual
+ *           return; in live mode every row also carries quick B/S buttons that
+ *           fire real MARKET orders for that strike; below it the final-trade
+ *           panel - the ONE strike to buy at 15:21 and sell at 15:29 - with
+ *           LIVE BUY / SELL buttons, then the funds-% slider (percent of the
+ *           available amount -> whole lots, feeds the quick buttons' sizing),
+ *           plus the strategy's decision timeline.
+ *
+ * Per-side ATM: each side's ladder is built around its OWN ATM - CE ATM = the
+ * strike at/below the spot, PE ATM = the strike at/above the spot (one strike
+ * apart when the spot sits between two strikes). The cross-side mirror is the
+ * opposite side's OWN ATM, so a red 22750 CE (CE's ATM) mirrors to 22800 PE
+ * (PE's ATM) - never to the OTM 22750 PE that would decay to zero.
  *
  * Two run modes:
  *   - REPLAY  (Analyze): the backend replays the cas_prediction timeline over
@@ -314,7 +323,17 @@ function StrikeChart({
     if (!ready) return
     applyMarkers()
     // eslint-disable-next-line react-hooks/exhaustive-deps -- rebuild markers from the latest leg fields
-  }, [leg.bar_pattern, leg.bar_decision, isWinner, ready, tradeDate, patternBar, decisionBar, entryTime, exitTime])
+  }, [
+    leg.bar_pattern,
+    leg.bar_decision,
+    isWinner,
+    ready,
+    tradeDate,
+    patternBar,
+    decisionBar,
+    entryTime,
+    exitTime,
+  ])
 
   function applyMarkers() {
     const markersApi = markersRef.current
@@ -387,16 +406,28 @@ function shiftMinutes(hhmm: string, delta: number): string {
 // Strikes panel - CE rows, divider, PE rows
 // ---------------------------------------------------------------------------
 
+function confidence20(score: number): number {
+  // The user-facing 0..20 confidence read of a normalized score (-1..+1):
+  // STRONG UP (~+0.9) reads 19/20, MIXED reads ~10/20, STRONG DOWN ~1/20.
+  return Math.max(0, Math.min(20, Math.round(((score + 1) / 2) * 20)))
+}
+
 function StrikeRow({
   leg,
   isWinner,
   patternBar,
   decisionBar,
+  live,
+  onQuickOrder,
+  positionQty,
 }: {
   leg: CastradeLeg
   isWinner: boolean
   patternBar: string
   decisionBar: string
+  live: boolean
+  onQuickOrder: (leg: CastradeLeg, action: 'BUY' | 'SELL') => void
+  positionQty: number
 }) {
   return (
     <div
@@ -429,9 +460,23 @@ function StrikeRow({
           'w-12 shrink-0 rounded px-1 py-0.5 text-center font-mono text-[10px]',
           VERDICT_TONE[leg.verdict] ?? 'bg-muted text-muted-foreground'
         )}
+        title={`score ${leg.score > 0 ? '+' : ''}${leg.score.toFixed(2)} (${leg.verdict})`}
       >
         {leg.score > 0 ? '+' : ''}
         {leg.score.toFixed(2)}
+      </span>
+      <span
+        className={cn(
+          'w-9 shrink-0 text-center font-mono text-[10px] tabular-nums',
+          confidence20(leg.score) >= 15
+            ? 'text-emerald-600 dark:text-emerald-400'
+            : confidence20(leg.score) <= 5
+              ? 'text-red-600 dark:text-red-400'
+              : 'text-muted-foreground'
+        )}
+        title="Confidence out of 20 (normalized window score)"
+      >
+        {confidence20(leg.score)}/20
       </span>
       <span className="flex-1 truncate text-right tabular-nums">
         {leg.premium_at_decision !== null ? fmtPrice(leg.premium_at_decision) : '—'}
@@ -456,6 +501,41 @@ function StrikeRow({
       ) : (
         <span className="w-[42px] shrink-0" />
       )}
+      {live ? (
+        <span className="flex shrink-0 items-center gap-0.5">
+          {positionQty > 0 && (
+            <span
+              className="mr-0.5 rounded bg-amber-500/20 px-1 font-mono text-[9px] text-amber-600 dark:text-amber-400"
+              title="Open qty from this page"
+            >
+              {positionQty}
+            </span>
+          )}
+          <Button
+            size="sm"
+            className="h-5 w-6 rounded px-0 text-[9px] font-bold text-white bg-emerald-600 hover:bg-emerald-600/90"
+            disabled={leg.blocked || !leg.tradable}
+            onClick={() => onQuickOrder(leg, 'BUY')}
+            aria-label={`Quick BUY ${leg.symbol}`}
+            data-testid={`castrade-quick-buy-${leg.side}-${leg.strike}`}
+          >
+            B
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-5 w-6 rounded border-red-500/40 px-0 text-[9px] font-bold text-red-600 hover:bg-red-500/10 dark:text-red-400"
+            disabled={positionQty <= 0}
+            onClick={() => onQuickOrder(leg, 'SELL')}
+            aria-label={`Quick SELL ${leg.symbol}`}
+            data-testid={`castrade-quick-sell-${leg.side}-${leg.strike}`}
+          >
+            S
+          </Button>
+        </span>
+      ) : (
+        <span className="w-[52px] shrink-0" />
+      )}
     </div>
   )
 }
@@ -464,14 +544,19 @@ function StrikesPanel({
   data,
   ceLegs,
   peLegs,
+  onQuickOrder,
 }: {
   data: CastradeAnalysisData
   ceLegs: CastradeLeg[]
   peLegs: CastradeLeg[]
+  onQuickOrder: (leg: CastradeLeg, action: 'BUY' | 'SELL') => void
 }) {
   const winner = data.final_trade
   const isWinner = (leg: CastradeLeg) =>
     !!winner && winner.side === leg.side && winner.strike === leg.strike
+  const live = !!data.live
+  const positions = data.positions ?? {}
+  const posOf = (leg: CastradeLeg) => positions[leg.symbol] ?? 0
 
   return (
     <div className="rounded-lg border bg-card">
@@ -502,10 +587,16 @@ function StrikesPanel({
           <span className="w-14">Strike</span>
           <span className="w-8">19/20</span>
           <span className="w-12">Score</span>
+          <span className="w-9 text-center">Conf</span>
           <span className="flex-1 text-right">Prem</span>
           <span className="w-14 text-right">Proj</span>
           <span className="w-14 text-right">Real</span>
           <span className="w-[42px]" />
+          {live ? (
+            <span className="w-[52px] text-center">B / S</span>
+          ) : (
+            <span className="w-[52px]" />
+          )}
         </div>
 
         <div className="rounded-md bg-emerald-500/5">
@@ -526,6 +617,9 @@ function StrikesPanel({
               isWinner={isWinner(leg)}
               patternBar={data.window.pattern_bar}
               decisionBar={data.window.decision_bar}
+              live={live}
+              onQuickOrder={onQuickOrder}
+              positionQty={posOf(leg)}
             />
           ))}
         </div>
@@ -557,6 +651,9 @@ function StrikesPanel({
               isWinner={isWinner(leg)}
               patternBar={data.window.pattern_bar}
               decisionBar={data.window.decision_bar}
+              live={live}
+              onQuickOrder={onQuickOrder}
+              positionQty={posOf(leg)}
             />
           ))}
         </div>
@@ -839,6 +936,141 @@ function PanelHeader() {
 }
 
 // ---------------------------------------------------------------------------
+// Funds slider - "% of available amount" quick-order sizing, just below the
+// final trade panel (also feeds the strike rows' quick B/S buttons)
+// ---------------------------------------------------------------------------
+
+function FundsSlider({
+  data,
+  lots,
+  onApplyLots,
+}: {
+  data: CastradeAnalysisData
+  lots: number
+  onApplyLots: (n: number) => void
+}) {
+  const [available, setAvailable] = useState<number | null>(null)
+  const [pct, setPct] = useState(25)
+  const [fetching, setFetching] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const isLive = !!data.live
+
+  const refresh = useCallback(async () => {
+    setFetching(true)
+    setErr(null)
+    try {
+      const res = await castradeApi.getFunds()
+      if (res.status === 'success' && res.data) {
+        setAvailable(res.data.available)
+        if (res.data.available === null) setErr('Funds figure unavailable from the broker')
+      } else {
+        setErr(res.message || 'Funds unavailable')
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Funds unavailable')
+    } finally {
+      setFetching(false)
+    }
+  }, [])
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: re-fetch when a new live session starts (session_id change), matching the page's other session-scoped effects
+  useEffect(() => {
+    if (isLive) refresh()
+  }, [isLive, data.session_id, refresh])
+
+  const trade = data.final_trade
+  const leg = trade
+    ? data.legs.find((l) => l.side === trade.side && l.strike === trade.strike)
+    : undefined
+  const premium = leg?.premium_live ?? leg?.premium_at_decision ?? null
+  const lotSize = trade?.lot_size || data.lot_size || 0
+  const deployable = available !== null ? (available * pct) / 100 : null
+  const suggestedLots =
+    deployable !== null && premium && premium > 0 && lotSize > 0
+      ? Math.max(0, Math.floor(deployable / (premium * lotSize)))
+      : null
+  const appliedLots = suggestedLots !== null ? Math.min(20, Math.max(1, suggestedLots)) : null
+
+  return (
+    <div className="rounded-lg border bg-card" data-testid="castrade-funds-slider">
+      <div className="flex items-center justify-between border-b px-3 py-2">
+        <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          <Wallet className="h-3.5 w-3.5" /> Funds %
+        </h3>
+        <div className="flex items-center gap-1.5">
+          {available !== null && (
+            <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+              avail ₹{available.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+            </span>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-5 w-5 px-0"
+            onClick={refresh}
+            disabled={fetching || !isLive}
+            aria-label="Refresh funds"
+          >
+            <RefreshCw className={cn('h-3 w-3', fetching && 'animate-spin')} />
+          </Button>
+        </div>
+      </div>
+      <div className="space-y-1.5 px-3 py-2">
+        <div className="flex items-center gap-2">
+          <input
+            type="range"
+            min={1}
+            max={100}
+            step={1}
+            value={pct}
+            onChange={(e) => setPct(Number.parseInt(e.target.value, 10))}
+            className="h-1.5 flex-1 cursor-pointer accent-amber-500"
+            aria-label="Percent of available funds"
+            data-testid="castrade-funds-range"
+          />
+          <span className="w-10 text-right font-mono text-xs font-semibold tabular-nums">
+            {pct}%
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+          <span className="tabular-nums">
+            {deployable !== null
+              ? `≈ ₹${deployable.toLocaleString('en-IN', { maximumFractionDigits: 0 })} deployed`
+              : isLive
+                ? '—'
+                : 'Go Live to fetch funds'}
+          </span>
+          <span className="tabular-nums">
+            {suggestedLots !== null
+              ? `≈ ${suggestedLots} lot${suggestedLots === 1 ? '' : 's'}${
+                  premium ? ` @ ${fmtPrice(premium)}` : ''
+                }`
+              : ''}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-[9px] leading-snug text-muted-foreground">
+            Quick orders use the Lots stepper below ({lots} now) — Apply syncs it to the slider
+            sizing (1–20 lots cap).
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 shrink-0 px-2 text-[10px]"
+            disabled={appliedLots === null || appliedLots === lots}
+            onClick={() => appliedLots !== null && onApplyLots(appliedLots)}
+            data-testid="castrade-funds-apply"
+          >
+            Apply
+          </Button>
+        </div>
+        {err && <p className="text-[9px] text-red-600 dark:text-red-400">{err}</p>}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Timeline events
 // ---------------------------------------------------------------------------
 
@@ -943,7 +1175,10 @@ function LegChartCard({
 // Live delta merge - fold a `castrade_update` payload into the page state
 // ---------------------------------------------------------------------------
 
-function mergeLiveDelta(prev: CastradeAnalysisData, delta: CastradeAnalysisData): CastradeAnalysisData {
+function mergeLiveDelta(
+  prev: CastradeAnalysisData,
+  delta: CastradeAnalysisData
+): CastradeAnalysisData {
   if (delta.type !== 'delta' || delta.legs[0]?.candles) {
     // Full snapshot (or an unexpected full payload) - replace wholesale.
     return { ...delta, type: undefined }
@@ -967,7 +1202,8 @@ function mergeLiveDelta(prev: CastradeAnalysisData, delta: CastradeAnalysisData)
   })
   // Legs that became tradable after the snapshot (rare) get appended.
   for (const d of delta.legs) {
-    if (!byKey.has(`${d.side}|${d.strike}`)) merged.push({ ...d, candles: d.last_candle ? [d.last_candle] : [] })
+    if (!byKey.has(`${d.side}|${d.strike}`))
+      merged.push({ ...d, candles: d.last_candle ? [d.last_candle] : [] })
   }
   return { ...prev, ...delta, legs: merged, type: undefined }
 }
@@ -1156,26 +1392,28 @@ export default function Castrade() {
     return () => clearInterval(id)
   }, [data?.live, data?.session_id])
 
-  const placeOrder = useCallback(
-    async (action: 'BUY' | 'SELL') => {
-      const trade = data?.final_trade
-      if (!trade) return
-      const qty = Math.max(1, Math.round(trade.lot_size || data?.lot_size || 1)) * config.lots
+  const placeOrderFor = useCallback(
+    async (action: 'BUY' | 'SELL', symbol: string, lotsCount: number) => {
+      if (!symbol) return
+      // Informational qty for the confirm dialog; the backend recomputes
+      // quantity = lots x contract lot size from the master contract.
+      const lotSize = data?.final_trade?.lot_size || data?.lot_size || 1
+      const qty = Math.max(1, Math.round(lotSize)) * lotsCount
       const ok = window.confirm(
-        `${action} ${config.lots} lot(s) = ${qty} qty\n${trade.symbol}\nMARKET / MIS - place the real order?`
+        `${action} ${lotsCount} lot(s) = ${qty} qty\n${symbol}\nMARKET / MIS - place the real order?`
       )
       if (!ok) return
       setOrderBusy(true)
       try {
         const res = await castradeApi.placeOrder({
           action,
-          symbol: trade.symbol,
-          lots: config.lots,
+          symbol,
+          lots: lotsCount,
           product: 'MIS',
         })
         if (res.status === 'success') {
           toast.success(`${action} order placed`, {
-            description: `${trade.symbol} · qty ${qty}${res.orderid ? ` · ID ${res.orderid}` : ''}`,
+            description: `${symbol} · qty ${qty}${res.orderid ? ` · ID ${res.orderid}` : ''}`,
           })
         } else {
           toast.error(`${action} rejected`, { description: res.message })
@@ -1201,7 +1439,23 @@ export default function Castrade() {
         }
       }
     },
-    [data, config.lots]
+    [data]
+  )
+
+  const placeOrder = useCallback(
+    (action: 'BUY' | 'SELL') => {
+      const trade = data?.final_trade
+      if (!trade) return
+      return placeOrderFor(action, trade.symbol, config.lots)
+    },
+    [data, config.lots, placeOrderFor]
+  )
+
+  const quickOrder = useCallback(
+    (leg: CastradeLeg, action: 'BUY' | 'SELL') => {
+      return placeOrderFor(action, leg.symbol, config.lots)
+    },
+    [config.lots, placeOrderFor]
   )
 
   // Live auto-refresh: only when the day is today's and the toggle is on.
@@ -1329,7 +1583,11 @@ export default function Castrade() {
             disabled={liveBusy || !config.expiry}
             title="Start the tick-by-tick live feed session (engine runs on every tick; the pick locks at the decision bar and the BUY/SELL buttons arm)"
           >
-            {liveBusy ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+            {liveBusy ? (
+              <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Zap className="h-3.5 w-3.5" />
+            )}
             Go Live
           </Button>
         )}
@@ -1384,7 +1642,9 @@ export default function Castrade() {
               Spot {fmtPrice(data.spot.at_window_start)} → {fmtPrice(data.spot.at_decision)}
               {data.spot.projected_exit ? ` → ${fmtPrice(data.spot.projected_exit)}*` : ''}
             </span>
-            <span>ATM {fmtStrike(data.atm)}</span>
+            <span>
+              ATM CE {fmtStrike(data.ce_atm ?? data.atm)} · PE {fmtStrike(data.pe_atm ?? data.atm)}
+            </span>
             <span>Step {data.strike_step}</span>
             <span>Lot {data.lot_size}</span>
             {!data.is_expiry_day && (
@@ -1423,9 +1683,10 @@ export default function Castrade() {
                 {config.windowStart}–{config.entryTime}, the {config.entryTime} buy /{' '}
                 {config.exitTime} sell window, the 15:19/15:20 cross-side confirmation and the Cond
                 A crash filter — on 1-minute candles of the 1 ITM + ATM + 6 OTM strikes per side
-                (CE and PE), for any index or F&amp;O chart. Live mode re-runs the engine on every
-                broker tick, locks the single final strike at {config.entryTime} and arms the real
-                BUY / SELL order buttons.
+                (each side built around its OWN ATM: CE = strike at/below spot, PE = strike at/above
+                spot — one strike apart). Live mode re-runs the engine on every broker tick, locks
+                the single final strike at {config.entryTime} and arms the real BUY / SELL buttons —
+                plus quick B/S on every strike row and a funds-% slider for sizing.
               </p>
             </div>
           ) : (
@@ -1478,8 +1739,7 @@ export default function Castrade() {
                 </span>
                 {data.live && (
                   <span>
-                    phase{' '}
-                    <span className="text-foreground/70">{data.phase ?? 'live'}</span>
+                    phase <span className="text-foreground/70">{data.phase ?? 'live'}</span>
                     {data.preview_pick && !data.pick_locked && (
                       <span className="text-amber-600 dark:text-amber-400">
                         {' '}
@@ -1553,13 +1813,18 @@ export default function Castrade() {
         <aside className="flex w-[380px] shrink-0 flex-col gap-2.5 overflow-y-auto border-l p-2.5">
           {data ? (
             <>
-              <StrikesPanel data={data} ceLegs={ceLegs} peLegs={peLegs} />
+              <StrikesPanel data={data} ceLegs={ceLegs} peLegs={peLegs} onQuickOrder={quickOrder} />
               <FinalTradePanel
                 data={data}
                 lots={config.lots}
                 onLotsChange={(n) => setConfig((c) => ({ ...c, lots: n }))}
                 onOrder={placeOrder}
                 orderBusy={orderBusy}
+              />
+              <FundsSlider
+                data={data}
+                lots={config.lots}
+                onApplyLots={(n) => setConfig((c) => ({ ...c, lots: n }))}
               />
               <EventsList events={data.events} />
             </>

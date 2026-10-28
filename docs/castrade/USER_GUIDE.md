@@ -32,16 +32,28 @@ Open it from the sidebar: **CAS Trade** (`/castrade`).
 ## 3. Reading the screen
 
 **Left — charts (CE column left, PE column right).** Every strike of the
-universe has its own 1-minute chart. Each side shows exactly
-**1 ITM + ATM + 6 OTM** strikes (CE: ITM is ATM−1; PE: ITM is ATM+1 — the
-mirrored layout keeps both sides OTM-heavy by design). Charts are ordered ITM,
-ATM, then OTM+1…OTM+6. The dots on each chart are the 15:19 and 15:20 candles
-of the cross-side rule; the winning leg gets BUY/SELL arrows.
+universe has its own 1-minute chart. Each side is built around its **OWN ATM**
+(one-strike-difference convention) and shows exactly **1 ITM + ATM + 6 OTM**
+strikes:
+
+- **CE ATM = the strike at/below the spot** (e.g. spot 22760.75 → CE ATM 22750): everything above it is OTM for calls, everything below is ITM.
+- **PE ATM = the strike at/above the spot** (22800 in the same example): everything below it is OTM for puts, everything above is ITM.
+- The two ATMs are one strike apart; the toolbar strip shows both (`ATM CE x · PE y`).
+
+Charts are ordered ITM, ATM, then OTM+1…OTM+6. The dots on each chart are the
+15:19 and 15:20 candles of the cross-side rule; the winning leg gets BUY/SELL
+arrows.
 
 **Right — Strikes panel.** One row per leg: moneyness tag, strike, the
-15:19/15:20 dot colours, the normalized score, the live premium, the projected
+15:19/15:20 dot colours, the normalized score, an **x/20 confidence** read of
+that score (19/20 ≈ STRONG UP, 10/20 ≈ mixed), the live premium, the projected
 % and (in replay/past sessions) the actual %. The **CE | PE divider** splits the
 sides; Cond A badges show a banned side; the winner row is highlighted.
+
+**Quick B/S buttons (live mode).** Every strike row ends with a green **B** and
+a red **S** button — a quick way to buy or sell THAT strike at the Lots stepper
+size, without waiting for the lock. A small amber count shows qty you already
+hold in that strike from this page. SELL is only enabled while you hold it.
 
 **Right — Final Trade panel.**
 - While the window is still forming (live): the **FORMING** preview card — the
@@ -51,6 +63,12 @@ sides; Cond A badges show a banned side; the winner row is highlighted.
   **BUY** and **SELL** buttons.
 - NO TRADE card when the engine found no qualified entry — that is a valid
   daily outcome, not an error.
+
+**Right — Funds % slider (just below the Final Trade panel).** Reads your
+broker's available funds and sizes orders by percentage of that amount: drag
+1–100%, it shows the deployable amount and the whole-lot equivalent at the
+final pick's premium; **Apply** syncs the Lots stepper (1–20 cap). The quick
+B/S buttons use the same Lots value. The slider never orders by itself.
 
 **Right — Timeline.** The engine's decision log: window open, Cond A events,
 cross-side scan result, side votes, the pick and the lock, your orders.
@@ -72,13 +90,14 @@ reconnect the broker feed and press **Go Live** again.
 
 ## 5. Placing the real orders
 
-1. Set **lots** (1–20) in the Final Trade panel. Quantity = lots × contract lot size, enforced server-side.
-2. **BUY** → a confirmation dialog shows action, lots, quantity, symbol and MARKET/MIS → confirm. The order goes through OpenAlgo's standard order pipeline (same as the REST API), tagged with strategy `castrade`.
+1. Set **lots** (1–20) in the Final Trade panel — or drag the **Funds %** slider below it and press **Apply** to size lots from your available funds (`lots = available × % ÷ (premium × lot size)`).
+2. **BUY** (final pick) → a confirmation dialog shows action, lots, quantity, symbol and MARKET/MIS → confirm. The order goes through OpenAlgo's standard order pipeline (same as the REST API), tagged with strategy `castrade`.
 3. A toast confirms the order with its broker order ID; the panel shows the order line and your open quantity.
 4. **SELL** exits the position — the same MARKET order in the opposite direction. The button only arms while a page-opened position exists.
-5. Safety rails you cannot bypass from the UI:
-   - only the **locked final pick** symbol is tradable on this page;
-   - BUY only inside the entry→exit window and only one open position;
+5. **Quick B/S on any strike row** (live mode): the green **B** / red **S** buttons trade that strike at the Lots stepper size — same pipeline, same rails. BUY is open from 15:15 to 15:29 and only while flat in that strike; SELL only against a page-opened position. Cond-A-banned rows are disabled.
+6. Safety rails you cannot bypass from the UI:
+   - only strikes of the live session universe are tradable on this page;
+   - BUY inside the window-start→exit window, flat-before-long per strike;
    - whole lots, ≤ 20 lots per click;
    - Analyzer Mode ON ⇒ orders land in the sandbox, not the broker.
 
@@ -97,14 +116,16 @@ strategy on history before trusting it live.
 
 From 15:15 the engine scores every leg by candle-vs-candle OHLC transitions
 (UP/DOWN/INSIDE/OUTSIDE + close confirmations, recency-weighted, no
-indicators). Cond A bans any side whose near-ATM premium basket crashed ≥50%
-in the window. A side "wins" only when its vote > +0.30 against the other
-side < −0.30. The **15:19/15:20 cross-side rule** outranks everything: near-ATM
-red while siblings are green at 15:19, still green at 15:20 ⇒ buy the mirror
-strike on the opposite side. Without the pattern, the vote-winner's best
-projected strike wins (projection = intrinsic at `spot + avg_gain × 8 × 0.35`).
-The pick locks at 15:21, BUY MARKET at the 15:21 open, SELL MARKET at the
-15:29 open. Details with exact numbers: `docs/castrade/LOGIC.md`.
+indicators). Cond A bans any side whose near-ATM premium basket (within 2 steps
+of that side's own ATM) crashed ≥50% in the window. A side "wins" only when its
+vote > +0.30 against the other side < −0.30. The **15:19/15:20 cross-side rule**
+outranks everything: a side's own-ATM red while siblings are green at 15:19,
+still green at 15:20 ⇒ buy the **opposite side's own ATM** (22750 CE red ⇒ 22800
+PE — never the OTM 22750 PE that decays to zero). Without the pattern, the
+vote-winner's best projected strike wins (projection = intrinsic at `spot +
+avg_gain × 8 × 0.35`). The pick locks at 15:21, BUY MARKET at the 15:21 open,
+SELL MARKET at the 15:29 open. Details with exact numbers:
+`docs/castrade/LOGIC.md`.
 
 ## 8. Troubleshooting
 
@@ -114,8 +135,10 @@ The pick locks at 15:21, BUY MARKET at the 15:21 open, SELL MARKET at the
 | "No spot reference available" | The broker feed/history for the index is down — check broker login and try again. |
 | "No option candles available for the window" | The broker doesn't serve 1-minute history for those option symbols that day. Try a different date/broker or run live mode only. |
 | FEED OFFLINE badge | Websocket feed not connected: re-login the broker, verify the feed (websocket proxy port), then Go Live again. |
-| "The final pick is not locked yet" on BUY | Wait for the 15:20 bar to close — buttons arm only after the lock. |
-| "This page only trades the final pick" | You tried to trade a strike other than the locked one — by design. |
+| "The final pick is not locked yet" on BUY | Wait for the 15:20 bar to close — the Final Trade BUY arms only after the lock. (Quick B/S buttons on strike rows work from 15:15.) |
+| "Symbol is not a tradable strike of this live session" | The symbol is outside the session's 16-leg universe — start the session for that underlying/expiry first. |
+| Quick BUY disabled on a row | The side is Cond-A-banned, the leg has no data, or you already hold that strike — SELL it first. |
+| Funds slider shows an error | The broker funds API failed — refresh, re-login the broker, or size lots manually with the stepper. |
 | BUY says "Entry window closed" | Past the exit time; the trade window is over. |
 | Charts flat / missing some OTM legs | Those strikes had no ticks/that ladder edge doesn't exist; harmless — the engine skips legs without data. |
 | Order rejected | Read the toast — broker margin, freeze limit or product issues surface there; the order pipeline logs the full response under Traffic Logs. |

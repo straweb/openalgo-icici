@@ -10,12 +10,16 @@ for the tick-by-tick live engine — same functions, same numbers).
 
 ## 1. The strike universe (what is watched)
 
-1. At the window open (15:15) the spot is captured and the **ATM strike** is the closest listed strike to it.
+1. At the window open (15:15) the spot is captured and each side gets its **OWN ATM** (the one-strike-difference convention):
+   - **CE ATM = the listed strike AT/BELOW the spot** (floor strike). It carries the small intrinsic and behaves like the spot for calls — every strike ABOVE it is OTM for CE, every strike BELOW it is ITM.
+   - **PE ATM = the listed strike AT/ABOVE the spot** (ceil strike) — every strike BELOW it is OTM for PE, every strike ABOVE it is ITM.
+   - Example (spot 22760.75, step 50): **CE ATM 22750, PE ATM 22800 — one strike apart.** The old single-shared-ATM build put PE's ladder one wall too low and could recommend 22750 PE (an OTM put that decays to zero) where the correct pick is 22800 PE (PE's ATM).
+   - When the spot sits exactly on a listed strike both sides share that strike.
 2. Strike step comes from the master contract (NIFTY 50, BANKNIFTY 100, …) — nothing is hard-coded.
-3. **Each side (CE and PE) shows exactly: 1 ITM + ATM + 6 OTM strikes.**
-   - CE: ITM = ATM−1, OTM = ATM+1 … ATM+6.
-   - PE (mirrored): ITM = ATM+1, OTM = ATM−1 … ATM−6.
-   - Earlier builds watched ATM−1..ATM+4 on both sides, which made PE look ITM-heavy; the matrix is now symmetric: one ITM leg each, six OTM legs each.
+3. **Each side (CE and PE) shows exactly: 1 ITM + its own ATM + 6 OTM strikes.**
+   - CE: ITM = CE ATM−1, OTM = CE ATM+1 … CE ATM+6.
+   - PE (mirrored): ITM = PE ATM+1, OTM = PE ATM−1 … PE ATM−6.
+   - Earlier builds watched ATM−1..ATM+4 on both sides around ONE shared ATM, which made PE look ITM-heavy; the matrix is now symmetric AND per-side anchored: one ITM leg each, six OTM legs each.
 4. Leg symbols are constructed in OpenAlgo format and verified against the master contract; lot size comes from the contract too.
 5. Works for ANY index or F&O underlying (NFO/BFO/MCX/CDS) — symbol, step and lot are resolved, never assumed.
 
@@ -43,7 +47,7 @@ For each 1-minute bar versus the previous bar of the SAME leg:
 
 ## 4. Cond A — the crash filter (side ban)
 
-1. Per side, the near-ATM basket = the average premium of strikes within 2 × step of ATM (the ITM, ATM and first OTM legs).
+1. Per side, the near-ATM basket = the average premium of strikes within 2 × step of **that side's own ATM** (its ITM, ATM and first OTM legs).
 2. Base = the basket's first window reading. If the basket's LOW drops **50% or more** below the base, that side is **banned for the day**.
 3. A banned side can never win the vote, and a pattern whose red or mirror side is banned is discarded (`REQUIRE_BOTH_SIDES_CLEAN`).
 
@@ -55,9 +59,13 @@ For each 1-minute bar versus the previous bar of the SAME leg:
 
 ## 6. The 15:19 / 15:20 cross-side confirmation (the pattern — highest priority)
 
-1. At the **15:19 close** (pattern bar): the near-ATM strike on one side is **RED** while at least one other strike on that SAME side is **GREEN**.
+1. At the **15:19 close** (pattern bar): the near-ATM strike of one side — **that side's own ATM** — is **RED** while at least one other strike on that SAME side is **GREEN**.
 2. At the **15:20 close** (decision bar): that side must still be green — at least half the greens held.
-3. If both hold → **BUY the MIRROR strike**: the SAME offset strike on the OPPOSITE side (near-ATM CE red + other CEs green ⇒ buy ATM PE; mirrored for puts).
+3. If both hold → **BUY the MIRROR strike = the OPPOSITE side's OWN ATM**:
+   - near-ATM **CE** red (e.g. 22750 CE, CE's ATM) + other CEs green ⇒ buy **PE's ATM** (22800 PE).
+   - near-ATM **PE** red (22800 PE, PE's ATM) + other PEs green ⇒ buy **CE's ATM** (22750 CE).
+   - The mirror is never a same-number strike on the wrong rung: with the per-side ATMs one step apart, opposite-ATM-to-opposite-ATM is the same "behaves like spot" rung on the other side, and it can never recommend the OTM put/call one wall below/above that decays to zero.
+   - Fallback if the opposite ATM leg is missing/untradable: the opposite side's first OTM, then its ITM.
 4. The pattern pick **outranks** the scoring pick.
 5. Either side being Cond-A-banned kills the pattern.
 
@@ -88,11 +96,18 @@ For each 1-minute bar versus the previous bar of the SAME leg:
 
 ## 10. Order safety rails
 
-1. Only the **locked final pick** can be traded from this page — the endpoint rejects any other symbol.
-2. BUY is possible only after the pick locks and before the exit time, one open position at a time; SELL only against the position opened from the page.
+1. Every **tradable strike of the live session universe** (the 16 legs) can be traded from the page — the locked final pick via the Final Trade panel's BUY/SELL, and ANY strike row via its quick **B / S** buttons. Symbols outside the session universe are rejected server-side.
+2. BUY is open from the window start (15:15) until the exit time (15:29) and only while this page is flat in that strike; SELL only against a position opened from this page (per-symbol tracking, so quick trades on different strikes stay independent).
 3. MARKET orders, whole lots, 1–20 lots per click, qty = lots × contract lot size; strategy tag `castrade` keeps broker-side bookkeeping separable.
 4. Analyzer/sandbox mode is honored end-to-end: with it on, "real" buttons route to the sandbox instead of the broker.
-5. Cond A ban, MIN_PREMIUM and the "no vote → no trade" rule are server-side; the buttons cannot override the engine.
+5. Cond A ban (a banned side's rows are disabled), MIN_PREMIUM and the session-universe check are server-side; the buttons cannot override them.
+
+## 11. Quick trade sizing — the funds-% slider
+
+1. Directly below the Final Trade panel sits the **Funds %** slider (1–100%, default 25%). It reads the broker's available funds on session start (refresh button re-reads).
+2. It shows the deployable amount (`available × %`) and the whole-lot equivalent at the final pick's live premium: `lots = floor(deployable / (premium × lot_size))`.
+3. **Apply** syncs the Final Trade panel's Lots stepper to that size (capped 1–20). The quick B/S buttons on the strike rows use the same Lots stepper value.
+4. Nothing is ever ordered by the slider itself — it only sizes the next manual order.
 
 ---
 

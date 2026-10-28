@@ -5,13 +5,17 @@ Standalone validation for the /castrade backend engine
 
 Scenarios:
   1. PATTERN  - 15:19 near-ATM CE red while other CE strikes green, CE still
-                green at 15:20 -> final trade = mirror PE (same strike),
-                entry = open(15:21), exit = open(15:29).
+                green at 15:20 -> final trade = the OPPOSITE side's OWN ATM PE
+                (per-side ATM: spot 22605 -> CE ATM 22600, PE ATM 22650, so the
+                mirror is 22650 PE - never the OTM 22600 PE), entry = open(15:21),
+                exit = open(15:29).
   2. SCORING  - no pattern; CE side wins the vote -> best projected % CE strike.
   3. COND A   - both premium baskets crash > 50% -> both sides banned -> NO TRADE.
   4. PARITY   - _chart_score matches an independent reimplementation of the
                 validated phase-1 algorithm.
   5. FIELDS   - payload is JSON-serializable and carries the chart data.
+  6. SIDE ATMS - the user's one-strike-difference example: spot 22760.75 ->
+                CE ATM 22750 / PE ATM 22800, each side 1 ITM + ATM + 6 OTM.
 
 Run:  python3 scripts/test_castrade_engine.py
 """
@@ -79,8 +83,9 @@ def bar(hh, mm, o, c):
     return {"ts": ts(hh, mm), "o": o, "h": hi, "l": lo, "c": c}
 
 
-STRIKES = [s * 50 for s in range(448, 460)]  # 22400 .. 22950
-ATM = 22600
+STRIKES = [s * 50 for s in range(440, 466)]  # 22000 .. 23250
+ATM = 22600  # CE's ATM (spot 22605 at the window start)
+PE_ATM = 22650  # PE's OWN ATM (ceil strike) - one strike above the CE ATM
 
 
 def sym(strike, side):
@@ -245,7 +250,7 @@ def make_feed():
             (20, 182.8, 181.8),
         ],
     }
-    rally = {22600: (50.0, 96.0)}  # mirror: buy ~50 at 15:21 open, sell ~96 at 15:29
+    rally = {PE_ATM: (50.0, 96.0)}  # mirror: buy ~50 at 15:21 open, sell ~96 at 15:29
     for st, w in pe_window.items():
         e, x = rally.get(st, (w[-1][2] - 0.4, w[-1][2] - 0.8))
         feed[(sym(st, "PE"), "NFO")] = leg_day(st, "PE", w, entry=e, exitp=x)
@@ -266,23 +271,35 @@ def test_pattern():
     )
     assert ok and code == 200, (code, resp)
     d = resp["data"]
+    # Per-side ATMs from spot 22605: CE 22600 (floor), PE 22650 (ceil).
+    assert d["ce_atm"] == 22600.0 and d["pe_atm"] == 22650.0, (d["ce_atm"], d["pe_atm"])
     assert d["pattern"]["found"] is True, d["pattern"]
     assert d["pattern"]["red_side"] == "CE"
     ft = d["final_trade"]
     assert ft, d["no_trade_reason"]
-    assert ft["side"] == "PE" and ft["strike"] == ATM, ft
+    # The mirror is the OPPOSITE side's OWN ATM: 22650 PE, NOT the shared-ATM
+    # legacy answer 22600 PE (an OTM put that would decay to zero).
+    assert ft["side"] == "PE" and ft["strike"] == PE_ATM, ft
+    assert ft["strike"] != ATM, "mirror must not fall back to the shared ATM strike"
     assert ft["source"] == "pattern"
     # entry = open of the 15:21 bar, exit = open of the 15:29 bar
     assert abs(ft["entry_price"] - 50.0) < 1e-6, ft
     assert abs(ft["exit_price"] - 96.0) < 1e-6, ft
     assert abs(ft["pct"] - 92.0) < 0.01, ft  # (96-50)/50*100
-    # mirror premium at decision was 50.6 (>= MIN_PREMIUM)
-    # the PE leg with strike ATM carries the WIN row data
-    pe_atm = next(lg for lg in d["legs"] if lg["side"] == "PE" and lg["strike"] == ATM)
-    assert pe_atm["actual"]["pct"] == ft["pct"]
+    # the PE leg classified ATM carries the WIN row data and the actual outcome
+    pe_atm_leg = next(lg for lg in d["legs"] if lg["side"] == "PE" and lg["moneyness"] == "ATM")
+    assert pe_atm_leg["strike"] == PE_ATM
+    assert pe_atm_leg["actual"]["pct"] == ft["pct"]
+    # per-side moneyness sanity around PE's own ATM: 22700 ITM, 22600 OTM+1
+    pe_itm = next(lg for lg in d["legs"] if lg["side"] == "PE" and lg["moneyness"] == "ITM")
+    assert pe_itm["strike"] == 22700.0, pe_itm
+    pe_otm1 = next(
+        lg for lg in d["legs"] if lg["side"] == "PE" and lg["otm_steps"] == 1
+    )
+    assert pe_otm1["strike"] == 22600.0, pe_otm1
     print(
-        f"  [1] PATTERN -> final trade PE {ft['strike']:g}, entry {ft['entry_price']:.2f} "
-        f"exit {ft['exit_price']:.2f}, {ft['pct']:.1f}%  OK"
+        f"  [1] PATTERN -> final trade PE {ft['strike']:g} (PE's own ATM), "
+        f"entry {ft['entry_price']:.2f} exit {ft['exit_price']:.2f}, {ft['pct']:.1f}%  OK"
     )
     return d
 
@@ -323,14 +340,16 @@ def test_scoring():
 def test_cond_a():
     feed = make_feed()
     # Crash BOTH near-ATM baskets (>50% from first window reading). The Cond A
-    # basket spans strikes within 2 steps of the ATM (22550..22700 here), so
-    # all four must crash for the side average to breach the drop limit.
+    # basket spans strikes within 2 steps of EACH side's own ATM: CE basket
+    # 22550..22700 (CE ATM 22600), PE basket 22550..22750 (PE ATM 22650).
     from datetime import timedelta, timezone
 
     ist = timezone(timedelta(hours=5, minutes=30))
-    for st in (22550, 22600, 22650, 22700):
+    for st in (22550, 22600, 22650, 22700, 22750):
         for side in ("CE", "PE"):
-            bars = feed[(sym(st, side), "NFO")]
+            bars = feed.get((sym(st, side), "NFO"))
+            if not bars:
+                continue
             for b in bars:
                 t = datetime.fromtimestamp(b["ts"], tz=ist)
                 if 15 <= t.minute <= 20:
@@ -350,6 +369,36 @@ def test_cond_a():
     assert "NO TRADE" in " ".join(e["text"] for e in d["events"])
     print("  [3] COND A -> both sides banned, NO TRADE  OK")
     return d
+
+
+def test_side_atms():
+    """The user's one-strike-difference example, spot 22760.75, step 50."""
+    install({})
+    uni = cs._resolve_universe("NIFTY", "NFO", EXPIRY, 22760.75)
+    assert uni["ce_atm"] == 22750.0, uni.get("ce_atm")
+    assert uni["pe_atm"] == 22800.0, uni.get("pe_atm")
+    legs = {(lg["side"], lg["strike"]): lg for lg in uni["legs"]}
+    # CE side: everything above CE's ATM is OTM, everything below is ITM.
+    assert legs[("CE", 22700.0)]["moneyness"] == "ITM"
+    assert legs[("CE", 22750.0)]["moneyness"] == "ATM"
+    for i in range(1, 7):
+        lg = legs[("CE", 22750.0 + 50.0 * i)]
+        assert lg["moneyness"] == "OTM" and lg["otm_steps"] == i, lg
+    # PE side: everything below PE's ATM is OTM, everything above is ITM.
+    assert legs[("PE", 22850.0)]["moneyness"] == "ITM"
+    assert legs[("PE", 22800.0)]["moneyness"] == "ATM"
+    for i in range(1, 7):
+        lg = legs[("PE", 22800.0 - 50.0 * i)]
+        assert lg["moneyness"] == "OTM" and lg["otm_steps"] == i, lg
+    # exactly 16 legs, one ITM each, six OTM each
+    assert len(uni["legs"]) == 16
+    assert sum(1 for lg in uni["legs"] if lg["moneyness"] == "ITM") == 2
+    assert sum(1 for lg in uni["legs"] if lg["moneyness"] == "ATM") == 2
+    assert sum(1 for lg in uni["legs"] if lg["moneyness"] == "OTM") == 12
+    print(
+        "  [6] SIDE ATMS -> spot 22760.75: CE ATM 22750 / PE ATM 22800, "
+        "per side 1 ITM + ATM + 6 OTM  OK"
+    )
 
 
 def test_parity():
@@ -425,4 +474,5 @@ if __name__ == "__main__":
     test_cond_a()
     test_parity()
     test_payload(d1)
+    test_side_atms()
     print("ALL PASSED")

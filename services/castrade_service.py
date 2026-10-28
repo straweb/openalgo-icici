@@ -59,10 +59,16 @@ SIDE_CE = "CE"
 SIDE_PE = "PE"
 
 # Strike matrix: BOTH sides show exactly ONE ITM strike, the ATM strike and
-# SIX OTM strikes. For CE the ITM strike sits below the spot (ATM-1) and the
-# OTM strikes above (ATM+1..ATM+6); for PE it is mirrored - the ITM strike is
-# ATM+1 and the OTM strikes run ATM-1..ATM-6. Offsets are strike-ladder steps
-# relative to ATM, signed toward higher strikes on both sides.
+# SIX OTM strikes - built around each side's OWN ATM (per-side ATM):
+#   CE ATM = the listed strike AT/BELOW the spot (floor strike). It carries the
+#     small intrinsic and behaves like the spot for calls; every strike ABOVE
+#     it is OTM for CE, every strike BELOW it is ITM.
+#   PE ATM = the listed strike AT/ABOVE the spot (ceil strike). Every strike
+#     BELOW it is OTM for PE, every strike ABOVE it is ITM.
+# Example (spot 22760.75, step 50): CE ATM 22750, PE ATM 22800 - one strike
+# apart. CE legs 22700(ITM) 22750(ATM) 22800..23100(OTM); PE legs
+# 22850(ITM) 22800(ATM) 22750..22500(OTM). Offsets are strike-ladder steps
+# relative to the SIDE's ATM, signed toward higher strikes on both sides.
 CE_OFFSETS = [-1, 0, 1, 2, 3, 4, 5, 6]  # 1 ITM, ATM, 6 OTM
 PE_OFFSETS = [1, 0, -1, -2, -3, -4, -5, -6]  # 1 ITM, ATM, 6 OTM (mirrored)
 SIDE_OFFSETS = {SIDE_CE: CE_OFFSETS, SIDE_PE: PE_OFFSETS}
@@ -403,6 +409,21 @@ def _infer_strike_step(strikes: list[float], spot: float) -> float:
     return float(min(diffs))
 
 
+def _side_atm(strikes_sorted: list[float], spot: float, side: str) -> float:
+    """The side's OWN ATM strike (per-side, one-strike-difference convention).
+
+    CE: the closest listed strike AT/BELOW the spot (floor). PE: the closest
+    listed strike AT/ABOVE the spot (ceil). When the spot sits exactly on a
+    listed strike both sides get that same strike. Clamps to the ladder edge
+    when the spot is outside the listed range.
+    """
+    if side == SIDE_CE:
+        below = [s for s in strikes_sorted if s <= spot]
+        return float(below[-1]) if below else float(strikes_sorted[0])
+    above = [s for s in strikes_sorted if s >= spot]
+    return float(above[0]) if above else float(strikes_sorted[-1])
+
+
 def _moneyness(side: str, offset: int) -> tuple[str, int]:
     """Classify a leg for the UI: ('ITM'|'ATM'|'OTM', otm_steps 0..6)."""
     if offset == 0:
@@ -422,8 +443,10 @@ def _resolve_universe(
     """Per side: ONE ITM strike + ATM + SIX OTM strikes, with symbols/lot size.
 
     Everything comes from the master contract: step inferred from the listed
-    strikes, ATM picked as the closest listed strike to the spot, symbols
-    constructed in OpenAlgo format and verified against SymToken.
+    strikes, each side's ATM picked per the per-side convention (CE = strike
+    at/below spot, PE = strike at/above spot - they are one strike apart when
+    the spot is between two strikes), symbols constructed in OpenAlgo format
+    and verified against SymToken.
     """
     ce_strikes = get_available_strikes(underlying, expiry, SIDE_CE, fo_exchange)
     if not ce_strikes:
@@ -434,16 +457,19 @@ def _resolve_universe(
     if step <= 0:
         step = float(FALLBACK_STRIKE_STEPS.get(underlying.upper(), 0)) or 50.0
 
-    # ATM: closest listed strike (works for irregular strike tables too).
-    atm = min(strikes_sorted, key=lambda s: abs(s - spot_ref))
-    atm_idx = strikes_sorted.index(atm)
+    # Per-side ATMs (see module docstring): CE floor strike, PE ceil strike.
+    ce_atm = _side_atm(strikes_sorted, spot_ref, SIDE_CE)
+    pe_atm = _side_atm(strikes_sorted, spot_ref, SIDE_PE)
+    side_atms = {SIDE_CE: ce_atm, SIDE_PE: pe_atm}
 
-    # Walk outward from ATM per side collecting offset strikes that exist.
-    # lo/hi walk independently per side so ladder-edge clamping cannot bleed
-    # across sides.
+    # Walk outward from EACH side's own ATM collecting offset strikes that
+    # exist. lo/hi walk independently per side so ladder-edge clamping cannot
+    # bleed across sides.
     picked: dict[tuple[str, int], float] = {}
     for side in (SIDE_CE, SIDE_PE):
-        lo, hi = atm_idx, atm_idx
+        s_atm = side_atms[side]
+        s_idx = strikes_sorted.index(s_atm)
+        lo, hi = s_idx, s_idx
         for off in SIDE_OFFSETS[side]:
             if off < 0:
                 lo = max(0, lo - 1)
@@ -452,7 +478,7 @@ def _resolve_universe(
                 hi = min(len(strikes_sorted) - 1, hi + 1)
                 picked[(side, off)] = strikes_sorted[hi]
             else:
-                picked[(side, 0)] = atm
+                picked[(side, 0)] = s_atm
 
     expiry_db = f"{expiry[:2]}-{expiry[2:5]}-{expiry[5:]}".upper()
     legs = []
@@ -502,7 +528,9 @@ def _resolve_universe(
             )
 
     return {
-        "atm": float(atm),
+        "atm": float(ce_atm),  # legacy single-ATM key (kept for older clients)
+        "ce_atm": float(ce_atm),
+        "pe_atm": float(pe_atm),
         "strike_step": step,
         "legs": legs,
         "lot_size": lot_size,
@@ -515,11 +543,14 @@ def _resolve_universe(
 # ---------------------------------------------------------------------------
 
 
-def _cond_a_state(legs_by_key: dict, atm: float, step: float, window_bars_by_key: dict) -> dict:
+def _cond_a_state(
+    legs_by_key: dict, side_atms: dict, step: float, window_bars_by_key: dict
+) -> dict:
     """Cond A crash filter over the near-ATM basket per side.
 
-    Base = first window reading of the average near-ATM premium; a side whose
-    basket low falls CRASH_DROP_PCT below the base is banned for the day.
+    Base = first window reading of the average near-ATM premium (near-ATM =
+    within 2 x step of THAT side's own ATM); a side whose basket low falls
+    CRASH_DROP_PCT below the base is banned for the day.
     """
     state = {}
     for side in (SIDE_CE, SIDE_PE):
@@ -530,7 +561,7 @@ def _cond_a_state(legs_by_key: dict, atm: float, step: float, window_bars_by_key
             for key, leg in legs_by_key.items():
                 if leg["side"] != side:
                     continue
-                if abs(leg["strike"] - atm) > 2 * step:
+                if abs(leg["strike"] - side_atms[side]) > 2 * step:
                     continue
                 bars = window_bars_by_key.get(key) or []
                 if i < len(bars):
@@ -572,30 +603,59 @@ def _side_votes(window_bars_by_key: dict, legs_by_key: dict, cond_a: dict) -> di
     return {"ce": ce_total, "pe": pe_total, "winning": winning}
 
 
+def _mirror_leg(
+    legs_by_key: dict, side_atms: dict, opp: str, step: float
+) -> dict | None:
+    """The opposite side's leg to buy when the cross-side pattern fires.
+
+    The mirror is the OPPOSITE SIDE'S OWN ATM strike - with the per-side ATM
+    convention this is exactly the same rung of the ladder as the red side's
+    near-ATM (one strike apart when the spot sits between two strikes), and it
+    is the strike that behaves like the spot on that side. Example (spot
+    22760.75): red at 22750 CE (CE's ATM) -> mirror = 22800 PE (PE's ATM) -
+    never 22750 PE, which is an OTM put on the wrong side of the ladder and
+    would decay to zero. Fallbacks when the ATM leg is missing: the opposite
+    side's first OTM, then its ITM.
+    """
+    atm = side_atms[opp]
+    if opp == SIDE_CE:
+        candidates = [atm, atm + step, atm - step, atm + 2 * step]
+    else:
+        candidates = [atm, atm - step, atm + step, atm - 2 * step]
+    for strike in candidates:
+        leg = legs_by_key.get((strike, opp))
+        if leg is not None and leg.get("tradable", True):
+            return leg
+    return None
+
+
 def _cross_side_pattern(
     legs_by_key: dict,
-    atm: float,
+    side_atms: dict,
+    step: float,
     pattern_hhmm: tuple[int, int],
     decision_hhmm: tuple[int, int],
     cond_a: dict,
 ) -> dict:
     """The 15:19/15:20 red/green cross-side confirmation.
 
-    On one side: near-ATM candle RED at the pattern bar while >=1 other strike
-    on that side is GREEN; at the decision bar that side is still green (at
-    least half the greens held). Entry = the SAME strike on the OPPOSITE side.
+    On one side: that side's near-ATM candle RED at the pattern bar while >=1
+    other strike on that side is GREEN; at the decision bar that side is still
+    green (at least half the greens held). Entry = the OPPOSITE side's OWN ATM
+    strike (see _mirror_leg).
     """
     red_side_ce_first = (SIDE_CE, SIDE_PE)
     for red_side in red_side_ce_first:
         opp = SIDE_PE if red_side == SIDE_CE else SIDE_CE
-        near = legs_by_key.get((atm, red_side))
+        red_atm = side_atms[red_side]
+        near = legs_by_key.get((red_atm, red_side))
         near_bar = near and _bar_at(near["window_bars"], pattern_hhmm)
         if not near_bar:
             continue
         red19 = near_bar["c"] < near_bar["o"]
         greens = []
         for leg in legs_by_key.values():
-            if leg["side"] != red_side or leg["strike"] == atm:
+            if leg["side"] != red_side or leg["strike"] == red_atm:
                 continue
             gb = _bar_at(leg["window_bars"], pattern_hhmm)
             if gb and gb["c"] > gb["o"]:
@@ -622,7 +682,7 @@ def _cross_side_pattern(
                 "reason": "pattern present but a Cond A ban is active",
                 "red_side": red_side,
             }
-        mirror = legs_by_key.get((atm, opp))
+        mirror = _mirror_leg(legs_by_key, side_atms, opp, step)
         if mirror is None or not mirror.get("tradable", True):
             continue
         last_p = mirror["window_bars"][-1]["c"] if mirror["window_bars"] else None
@@ -642,9 +702,9 @@ def _cross_side_pattern(
             "still_green": [g["strike"] for g in still],
             "reason": (
                 f"cross-side: {_fmt_hhmm(pattern_hhmm)} red at near-ATM "
-                f"{atm:g} {red_side} while {len(greens)} strike(s) green, "
+                f"{red_atm:g} {red_side} while {len(greens)} strike(s) green, "
                 f"{_fmt_hhmm(decision_hhmm)} stayed green -> mirror {opp} "
-                f"{mirror['strike']:g}"
+                f"ATM {mirror['strike']:g}"
             ),
         }
     return {"found": False, "reason": "no cross-side red/green pattern", "red_side": None}
@@ -841,7 +901,8 @@ def _run_cas_analysis_inner(
     if "error" in uni:
         return {"status": "error", "message": uni["error"]}, 400
 
-    atm = uni["atm"]
+    ce_atm = uni["ce_atm"]
+    pe_atm = uni["pe_atm"]
     step = uni["strike_step"]
     lot_size = uni["lot_size"]
 
@@ -884,7 +945,8 @@ def _run_cas_analysis_inner(
 
     # --- Cond A + votes -----------------------------------------------------
     window_map = {k: leg["window_bars"] for k, leg in legs_by_key.items()}
-    cond_a = _cond_a_state(legs_by_key, atm, step, window_map)
+    side_atms = {SIDE_CE: ce_atm, SIDE_PE: pe_atm}
+    cond_a = _cond_a_state(legs_by_key, side_atms, step, window_map)
 
     # Spot now (decision bar) and window gain from the deepest-ITM CE closes,
     # exactly like the strategy's projection feed.
@@ -908,14 +970,19 @@ def _run_cas_analysis_inner(
 
     votes = _side_votes(window_map, legs_by_key, cond_a)
 
-    pattern = _cross_side_pattern(legs_by_key, atm, pattern_hhmm, decision_hhmm, cond_a)
+    pattern = _cross_side_pattern(
+        legs_by_key, side_atms, step, pattern_hhmm, decision_hhmm, cond_a
+    )
 
     # --- picks --------------------------------------------------------------
     events: list[dict] = []
     events.append(
         {
             "time": _fmt_hhmm(ws_hhmm),
-            "text": f"Window opens. Spot {spot_ref:.2f} -> ATM {atm:g}, step {step:g}",
+            "text": (
+                f"Window opens. Spot {spot_ref:.2f} -> ATM CE {ce_atm:g} / PE {pe_atm:g}, "
+                f"step {step:g}"
+            ),
         }
     )
     for side in (SIDE_CE, SIDE_PE):
@@ -1167,7 +1234,9 @@ def _run_cas_analysis_inner(
         "trade_date": trade_date,
         "is_expiry_day": is_expiry_day,
         "mode": "live" if is_live else "replay",
-        "atm": atm,
+        "atm": ce_atm,  # legacy single-ATM key (CE side)
+        "ce_atm": ce_atm,
+        "pe_atm": pe_atm,
         "strike_step": step,
         "lot_size": lot_size,
         "window": {

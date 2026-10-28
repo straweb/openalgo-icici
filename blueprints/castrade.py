@@ -11,9 +11,13 @@ resolve the underlying/expiry and run the CAS prediction timeline (scoring +
   services/castrade_live.py - broker feed ticks build the forming 1-minute
   bars, the engine re-runs on every tick and the final pick is pushed to the
   page as socket.io ``castrade_update`` events.
-- ORDERS  (POST /castrade/api/order): BUY/SELL MARKET orders for the session's
-  LOCKED final pick only, via the standard place_order service (honors
-  analyzer/sandbox mode). Strategy tag: "castrade".
+- ORDERS  (POST /castrade/api/order): BUY/SELL MARKET orders for any tradable
+  strike of the live session universe (the final pick via the Final Trade
+  panel, or ANY strike row via its quick B/S buttons), via the standard
+  place_order service (honors analyzer/sandbox mode). Strategy tag:
+  "castrade".
+- FUNDS   (GET  /castrade/api/funds): available funds for the page's
+  "% of available amount" slider that sizes quick orders in whole lots.
 
 Order constants context (same vocabulary as the scalping terminal):
 - Underlying quote exchange : NSE_INDEX / BSE_INDEX (indices), NSE / BSE (stocks)
@@ -29,6 +33,7 @@ from services.castrade_service import (
     DEFAULT_ENTRY_TIME,
     DEFAULT_EXIT_TIME,
     DEFAULT_WINDOW_START,
+    _to_float,
     get_castrade_expiries,
     get_castrade_underlyings,
     run_cas_analysis,
@@ -283,16 +288,69 @@ def _lot_size_for(symbol: str, exchange: str) -> int:
     return int(rec.lotsize)
 
 
+@castrade_bp.route("/castrade/api/funds", methods=["GET"])
+@cross_origin()
+@check_session_validity
+def funds():
+    """Available funds for the quick-order sizing slider.
+
+    Returns the broker's available-cash style figure normalized to one number
+    plus the raw payload. Uses the same path as the dashboard (live broker;
+    in analyzer mode the sandbox answer arrives through place_order anyway,
+    funds stay the real account reading).
+    """
+    try:
+        username, broker, api_key, err = _live_common_guard()
+        if err:
+            return jsonify(err[0]), err[1]
+
+        from database.auth_db import get_auth_token_broker
+        from services.funds_service import get_funds_with_auth
+
+        auth = get_auth_token_broker(api_key)
+        if not auth or not auth[0]:
+            return jsonify({"status": "error", "message": "Broker auth not available"}), 401
+        auth_token = auth[0]
+
+        success, response, status_code = get_funds_with_auth(auth_token, broker, None)
+        if not success:
+            return jsonify(response), status_code
+
+        data = (response or {}).get("data") or {}
+        available = None
+        for key in (
+            "availablecash",
+            "available_margin",
+            "availablemargin",
+            "AvailableMargin",
+            "net",
+            "availablebalance",
+        ):
+            v = _to_float(data.get(key))
+            if v is not None:
+                available = v if available is None else max(available, v)
+        return jsonify(
+            {
+                "status": "success",
+                "data": {"available": available, "raw": data},
+            }
+        ), 200
+    except Exception as e:
+        logger.exception(f"Error in castrade funds API: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @castrade_bp.route("/castrade/api/order", methods=["POST"])
 @cross_origin()
 @check_session_validity
 def order():
-    """Place a MARKET order for the live session's LOCKED final pick.
+    """Place a MARKET order for a strike of the live session.
 
-    Body: action BUY|SELL, symbol (must equal the final pick symbol),
-    lots (1..20), product (MIS default).
-    The order goes through services.place_order_service.place_order, so
-    analyzer/sandbox mode is honored exactly like the REST API.
+    Body: action BUY|SELL, symbol (any tradable strike of the session
+    universe - the final pick OR a strike row's quick trade), lots (1..20),
+    product (MIS default). The order goes through
+    services.place_order_service.place_order, so analyzer/sandbox mode is
+    honored exactly like the REST API.
     """
     try:
         username, _broker, api_key, err = _live_common_guard()
@@ -330,7 +388,10 @@ def order():
         if not allowed:
             return jsonify({"status": "error", "message": why}), 400
 
-        lot_size = _lot_size_for(symbol, sess.fo_exchange)
+        leg = next(
+            (l for l in sess.legs_by_key.values() if l.get("symbol") == symbol), None
+        )
+        lot_size = (leg or {}).get("lot_size") or _lot_size_for(symbol, sess.fo_exchange)
         if lot_size <= 0:
             return jsonify(
                 {"status": "error", "message": f"Unknown symbol or lot size unavailable: {symbol}"}

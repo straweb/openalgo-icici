@@ -122,7 +122,8 @@ class CastradeLiveSession:
 
         self.quote_symbol = ""
         self.quote_exchange = ""
-        self.atm: float = 0.0
+        self.ce_atm: float = 0.0
+        self.pe_atm: float = 0.0
         self.step: float = 0.0
         self.lot_size = 0
 
@@ -143,6 +144,8 @@ class CastradeLiveSession:
         self.no_trade_reason: str | None = None
         self.orders: list[dict] = []
         self.position_qty = 0
+        # Quick-trade bookkeeping: open qty per symbol bought from this page.
+        self.positions: dict[str, int] = {}
 
         self.events: list[dict] = []
         self.expired = False
@@ -282,11 +285,12 @@ class CastradeLiveManager:
                 ),
             }, 400
 
-        # --- strike universe (1 ITM + ATM + 6 OTM per side) ---------------
+        # --- strike universe (per side: 1 ITM + own ATM + 6 OTM) ----------
         uni = _resolve_universe(underlying, fo_exchange, sess.expiry, sess.spot_ref)
         if "error" in uni:
             return {"status": "error", "message": uni["error"]}, 400
-        sess.atm = uni["atm"]
+        sess.ce_atm = uni["ce_atm"]
+        sess.pe_atm = uni["pe_atm"]
         sess.step = uni["strike_step"]
         sess.lot_size = uni["lot_size"] or 0
 
@@ -344,7 +348,7 @@ class CastradeLiveManager:
 
         sess.event(
             f"Live session started: {underlying} {sess.expiry} {trade_date}, "
-            f"ATM {sess.atm:g} step {sess.step:g} lot {sess.lot_size}"
+            f"ATM CE {sess.ce_atm:g} / PE {sess.pe_atm:g} step {sess.step:g} lot {sess.lot_size}"
         )
         if failed:
             sess.event(f"No history candles for {len(failed)} leg(s) - live ticks only")
@@ -510,7 +514,12 @@ class CastradeLiveManager:
                 leg["window_bars"] = sess.window_bars_for(leg)
             window_map = {k: leg["window_bars"] for k, leg in sess.legs_by_key.items()}
 
-            cond_a = _cond_a_state(sess.legs_by_key, sess.atm, sess.step, window_map)
+            cond_a = _cond_a_state(
+                sess.legs_by_key,
+                {SIDE_CE: sess.ce_atm, SIDE_PE: sess.pe_atm},
+                sess.step,
+                window_map,
+            )
 
             # Spot now + window gain: deepest-ITM CE backout (strategy feed),
             # falling back to the underlying feed.
@@ -532,7 +541,12 @@ class CastradeLiveManager:
 
             votes = _side_votes(window_map, sess.legs_by_key, cond_a)
             pattern = _cross_side_pattern(
-                sess.legs_by_key, sess.atm, sess.pattern_hhmm, sess.decision_hhmm, cond_a
+                sess.legs_by_key,
+                {SIDE_CE: sess.ce_atm, SIDE_PE: sess.pe_atm},
+                sess.step,
+                sess.pattern_hhmm,
+                sess.decision_hhmm,
+                cond_a,
             )
 
             spot_hat = None
@@ -742,7 +756,9 @@ class CastradeLiveManager:
             "expiry": sess.expiry,
             "trade_date": sess.trade_date,
             "is_expiry_day": is_expiry_day,
-            "atm": sess.atm,
+            "atm": sess.ce_atm,  # legacy single-ATM key (CE side)
+            "ce_atm": sess.ce_atm,
+            "pe_atm": sess.pe_atm,
             "strike_step": sess.step,
             "lot_size": sess.lot_size,
             "window": {
@@ -813,6 +829,7 @@ class CastradeLiveManager:
             },
             "orders": list(sess.orders[-10:]),
             "position_qty": sess.position_qty,
+            "positions": dict(sess.positions),
             "analyzer_mode": False,
             "server_time": datetime.now(IST_TZ).strftime("%H:%M:%S"),
         }
@@ -890,30 +907,34 @@ class CastradeLiveManager:
     # ------------------------------------------------------------------
 
     def can_trade(self, sess: CastradeLiveSession, action: str, symbol: str) -> tuple[bool, str]:
-        if not sess.pick_locked:
-            return False, "The final pick is not locked yet (wait for the decision bar to close)"
-        if not sess.final_pick:
-            return False, "No qualified trade today - the engine said NO TRADE"
-        if symbol != sess.final_pick["symbol"]:
+        """Gate for placing an order from this page.
+
+        Every tradable strike of the live session universe can be traded
+        (quick BUY/SELL from the strikes panel), not only the locked final
+        pick. Rails: the symbol must belong to the session, BUY is open from
+        the window start until the exit time and only when this page is flat
+        in that strike, SELL only against a position opened from this page.
+        """
+        leg = next(
+            (l for l in sess.legs_by_key.values() if l.get("symbol") == symbol), None
+        )
+        if leg is None or not leg.get("tradable", False):
             return (
                 False,
-                "This page only trades the final pick "
-                f"({sess.final_pick['symbol']}); {symbol} is not it",
+                "Symbol is not a tradable strike of this live session - start a session for it first",
             )
         now_min = sess.ist_minute()
-        entry_min = _minutes(sess.entry_hhmm)
-        exit_min = _minutes(sess.exit_hhmm)
         if action == "BUY":
-            if now_min < entry_min:
-                return False, f"Entry window not open yet (BUY at {sess.final_pick['entry_time']})"
-            if now_min > exit_min:
-                return False, "Entry window closed (past the exit time)"
-            if sess.position_qty > 0:
-                return False, "Position already open - use SELL to exit first"
+            if now_min < _minutes(sess.ws_hhmm):
+                return False, f"BUY opens with the window at {_fmt_hhmm(sess.ws_hhmm)}"
+            if now_min >= _minutes(sess.exit_hhmm):
+                return False, f"BUY closed (past the exit time {_fmt_hhmm(sess.exit_hhmm)})"
+            if sess.positions.get(symbol, 0) > 0:
+                return False, "Already long this strike from this page - SELL it before buying again"
             return True, ""
         if action == "SELL":
-            if sess.position_qty <= 0:
-                return False, "No open position from this page to sell"
+            if sess.positions.get(symbol, 0) <= 0:
+                return False, "No open position in this strike from this page to sell"
             return True, ""
         return False, f"Invalid action: {action}"
 
@@ -926,8 +947,12 @@ class CastradeLiveManager:
             if len(sess.orders) > 50:
                 del sess.orders[: len(sess.orders) - 50]
             if record.get("status") == "success":
+                symbol = record.get("symbol") or ""
                 signed = record.get("quantity", 0) * (1 if record.get("action") == "BUY" else -1)
-                sess.position_qty = max(0, sess.position_qty + signed)
+                new_qty = max(0, sess.positions.get(symbol, 0) + signed)
+                sess.positions[symbol] = new_qty
+                if sess.final_pick and symbol == sess.final_pick.get("symbol"):
+                    sess.position_qty = new_qty
 
     def state(self, username: str, full: bool = False) -> dict | None:
         sess = self._sessions.get(username)

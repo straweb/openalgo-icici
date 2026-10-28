@@ -2,22 +2,29 @@
 CAS Trade Blueprint - expiry-day CAS prediction terminal (/castrade).
 
 Serves ONLY the /castrade page: session-authenticated JSON endpoints that
-resolve the underlying/expiry and run the CAS prediction timeline replay
-(scoring + 15:19/15:20 cross-side confirmation + Cond A + projection) over
-one day of 1-minute candles. All heavy lifting lives in
-services/castrade_service.py; this blueprint holds no strategy logic.
+resolve the underlying/expiry and run the CAS prediction timeline (scoring +
+15:19/15:20 cross-side confirmation + Cond A + projection). Two run modes:
+
+- REPLAY  (POST /castrade/api/analyze): one day of 1-minute candles from the
+  history API, the validated timeline replay. Read-only.
+- LIVE    (POST /castrade/api/live/start): a tick-by-tick session backed by
+  services/castrade_live.py - broker feed ticks build the forming 1-minute
+  bars, the engine re-runs on every tick and the final pick is pushed to the
+  page as socket.io ``castrade_update`` events.
+- ORDERS  (POST /castrade/api/order): BUY/SELL MARKET orders for the session's
+  LOCKED final pick only, via the standard place_order service (honors
+  analyzer/sandbox mode). Strategy tag: "castrade".
 
 Order constants context (same vocabulary as the scalping terminal):
 - Underlying quote exchange : NSE_INDEX / BSE_INDEX (indices), NSE / BSE (stocks)
 - Leg exchange              : NFO / BFO / MCX / CDS
-This page is read-only: it computes and displays the final winning trade
-(buy 15:21, sell 15:29) and never places orders.
 """
 
 from flask import Blueprint, jsonify, request, session
 from flask_cors import cross_origin
 
 from database.auth_db import get_api_key_for_tradingview
+from services.castrade_live import MAX_LOTS, STRATEGY_TAG, get_castrade_live_manager
 from services.castrade_service import (
     DEFAULT_ENTRY_TIME,
     DEFAULT_EXIT_TIME,
@@ -32,6 +39,9 @@ from utils.session import check_session_validity
 logger = get_logger(__name__)
 
 castrade_bp = Blueprint("castrade_bp", __name__, url_prefix="/")
+
+# Absolute per-order sanity ceiling (mirrors the scalping terminal).
+MAX_ORDER_QUANTITY = 100_000
 
 
 def _get_api_key():
@@ -145,4 +155,220 @@ def analyze():
 
     except Exception as e:
         logger.exception(f"Error in castrade analyze API: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# LIVE tick-by-tick session
+# ---------------------------------------------------------------------------
+
+
+def _live_common_guard():
+    """Return (username, broker, api_key) or an error response tuple."""
+    username = session.get("user")
+    broker = session.get("broker")
+    if not username or not broker:
+        return None, None, None, ({"status": "error", "message": "Broker not set in session"}, 400)
+    api_key = _get_api_key()
+    if not api_key:
+        return None, None, None, (
+            {
+                "status": "error",
+                "message": "API key not configured. Generate one at /apikey",
+            },
+            401,
+        )
+    return username, broker, api_key, None
+
+
+def _today_ist() -> str:
+    try:
+        import pytz
+
+        from datetime import datetime as _dt
+
+        return _dt.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    except Exception:  # pragma: no cover
+        from datetime import datetime as _dt
+
+        return _dt.now().strftime("%Y-%m-%d")
+
+
+@castrade_bp.route("/castrade/api/live/start", methods=["POST"])
+@cross_origin()
+@check_session_validity
+def live_start():
+    """Start (or replace) this user's tick-by-tick live session.
+
+    Body: underlying, exchange, expiry (required); trade_date (default today
+    IST); window_start / entry_time / exit_time (defaults 15:15/15:21/15:29).
+    """
+    try:
+        username, broker, api_key, err = _live_common_guard()
+        if err:
+            return jsonify(err[0]), err[1]
+
+        data = request.get_json(silent=True) or {}
+        manager = get_castrade_live_manager()
+        payload, status_code = manager.start(
+            username=username,
+            broker=broker,
+            api_key=api_key,
+            underlying=str(data.get("underlying") or ""),
+            fo_exchange=str(data.get("exchange") or ""),
+            expiry=str(data.get("expiry") or ""),
+            trade_date=str(data.get("trade_date") or "").strip() or _today_ist(),
+            window_start=str(data.get("window_start") or DEFAULT_WINDOW_START),
+            entry_time=str(data.get("entry_time") or DEFAULT_ENTRY_TIME),
+            exit_time=str(data.get("exit_time") or DEFAULT_EXIT_TIME),
+        )
+        return jsonify(payload), status_code
+    except Exception as e:
+        logger.exception(f"Error in castrade live start: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@castrade_bp.route("/castrade/api/live/stop", methods=["POST"])
+@cross_origin()
+@check_session_validity
+def live_stop():
+    """Stop the live session and unsubscribe its symbols from the feed."""
+    try:
+        username, _broker, _api_key, err = _live_common_guard()
+        if err:
+            return jsonify(err[0]), err[1]
+        get_castrade_live_manager().stop(username)
+        return jsonify({"status": "success", "message": "Live session stopped"}), 200
+    except Exception as e:
+        logger.exception(f"Error in castrade live stop: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@castrade_bp.route("/castrade/api/live/state", methods=["GET"])
+@cross_origin()
+@check_session_validity
+def live_state():
+    """Current live snapshot (full on ?full=1, delta otherwise)."""
+    try:
+        username, _broker, _api_key, err = _live_common_guard()
+        if err:
+            return jsonify(err[0]), err[1]
+        sess = get_castrade_live_manager().get(username)
+        if sess is None:
+            return jsonify({"status": "error", "message": "No live session"}), 404
+        full = request.args.get("full") in ("1", "true", "yes")
+        payload = get_castrade_live_manager().state(username, full=full)
+        return jsonify({"status": "success", "data": payload}), 200
+    except Exception as e:
+        logger.exception(f"Error in castrade live state: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# ORDERS - only the locked final pick, MARKET, whole lots
+# ---------------------------------------------------------------------------
+
+
+def _lot_size_for(symbol: str, exchange: str) -> int:
+    from database.symbol import SymToken
+    from database.symbol import db_session as symbol_session
+
+    rec = (
+        symbol_session.query(SymToken)
+        .filter(SymToken.symbol == symbol, SymToken.exchange == exchange)
+        .first()
+    )
+    if not rec or not rec.lotsize or rec.lotsize <= 0:
+        return 0
+    return int(rec.lotsize)
+
+
+@castrade_bp.route("/castrade/api/order", methods=["POST"])
+@cross_origin()
+@check_session_validity
+def order():
+    """Place a MARKET order for the live session's LOCKED final pick.
+
+    Body: action BUY|SELL, symbol (must equal the final pick symbol),
+    lots (1..20), product (MIS default).
+    The order goes through services.place_order_service.place_order, so
+    analyzer/sandbox mode is honored exactly like the REST API.
+    """
+    try:
+        username, _broker, api_key, err = _live_common_guard()
+        if err:
+            return jsonify(err[0]), err[1]
+
+        data = request.get_json(silent=True) or {}
+        action = str(data.get("action") or "").strip().upper()
+        symbol = str(data.get("symbol") or "").strip().upper()
+        product = str(data.get("product") or "MIS").strip().upper()
+        try:
+            lots = int(data.get("lots", 1))
+        except (TypeError, ValueError):
+            lots = 0
+
+        if action not in ("BUY", "SELL"):
+            return jsonify({"status": "error", "message": "action must be BUY or SELL"}), 400
+        if not symbol:
+            return jsonify({"status": "error", "message": "symbol is required"}), 400
+        if product not in ("MIS", "NRML"):
+            return jsonify({"status": "error", "message": "product must be MIS or NRML"}), 400
+        if lots < 1 or lots > MAX_LOTS:
+            return jsonify(
+                {"status": "error", "message": f"lots must be between 1 and {MAX_LOTS}"}
+            ), 400
+
+        manager = get_castrade_live_manager()
+        sess = manager.get(username)
+        if sess is None:
+            return jsonify(
+                {"status": "error", "message": "No live session - start one first"}
+            ), 400
+
+        allowed, why = manager.can_trade(sess, action, symbol)
+        if not allowed:
+            return jsonify({"status": "error", "message": why}), 400
+
+        lot_size = _lot_size_for(symbol, sess.fo_exchange)
+        if lot_size <= 0:
+            return jsonify(
+                {"status": "error", "message": f"Unknown symbol or lot size unavailable: {symbol}"}
+            ), 400
+        quantity = lots * lot_size
+        if quantity > MAX_ORDER_QUANTITY:
+            return jsonify(
+                {"status": "error", "message": "quantity exceeds the safety limit"}
+            ), 400
+
+        from services.place_order_service import place_order
+
+        order_data = {
+            "strategy": STRATEGY_TAG,
+            "symbol": symbol,
+            "exchange": sess.fo_exchange,
+            "action": action,
+            "pricetype": "MARKET",
+            "product": product,
+            "quantity": quantity,
+        }
+        success, response, status_code = place_order(order_data=order_data, api_key=api_key)
+
+        manager.record_order(
+            username,
+            {
+                "time": sess.ist_now().strftime("%H:%M:%S"),
+                "action": action,
+                "symbol": symbol,
+                "quantity": quantity if success else 0,
+                "lots": lots,
+                "product": product,
+                "orderid": (response or {}).get("orderid"),
+                "status": "success" if success else "failed",
+                "message": (response or {}).get("message"),
+            },
+        )
+        return jsonify(response), status_code
+    except Exception as e:
+        logger.exception(f"Error in castrade order API: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500

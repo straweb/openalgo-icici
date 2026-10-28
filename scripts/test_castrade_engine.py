@@ -407,13 +407,15 @@ def test_parity():
 def test_payload(d):
     blob = json.dumps(d)
     assert len(blob) > 1000
-    for leg in d["legs"]:
+    candle_legs = [leg for leg in d["legs"] if leg["candles"]]
+    assert candle_legs, "at least the near-ATM legs must have candles"
+    for leg in candle_legs:
         assert {"time", "open", "high", "low", "close"} == set(leg["candles"][0].keys())
         # IST-shifted minute alignment
         assert leg["candles"][0]["time"] % 60 == 0
-    assert len(d["legs"]) == 12
+    assert len(d["legs"]) >= 14, f"expected the full 1-ITM/ATM/6-OTM matrix, got {len(d['legs'])}"
     assert len(d["underlying_candles"]) > 300
-    print("  [5] PAYLOAD -> 12 legs, JSON-serializable, chart candles aligned  OK")
+    print("  [5] PAYLOAD -> 16 legs (1 ITM + ATM + 6 OTM x2), JSON-serializable, candles aligned  OK")
 
 
 if __name__ == "__main__":

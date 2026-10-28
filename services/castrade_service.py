@@ -3,11 +3,12 @@ CAS Trade Service - expiry-day closing-window CAS prediction, analysis only.
 
 Powers the /castrade page. It ports the validated cas_prediction strategy
 logic (phase-1 OHLC strike picker + the 15:19/15:20 cross-side red/green
-confirmation + Cond A crash filter + intrinsic projection) into a read-only
-service: it fetches 1-minute candles for the underlying and the ATM-1..
-ATM+4 CE/PE legs, replays the strategy timeline on them and returns the
-charts, per-strike analysis and the single final winning trade
-(buy 15:21, sell 15:29).
+confirmation + Cond A crash filter + intrinsic projection) into a service:
+it fetches 1-minute candles for the underlying and the strike universe (per
+side: ONE ITM strike + ATM + SIX OTM strikes), replays the strategy timeline
+on them and returns the charts, per-strike analysis and the single final
+winning trade (buy 15:21, sell 15:29). services/castrade_live.py reuses this
+module's engine functions to run the same timeline tick-by-tick on live feeds.
 
 HARD RULES (identical to the strategy):
 - No indicators, no volume, no OI, no IV. Only candle-vs-candle 1m OHLC.
@@ -57,7 +58,15 @@ IST_TZ = timezone(timedelta(hours=5, minutes=30))
 SIDE_CE = "CE"
 SIDE_PE = "PE"
 
-STRIKE_OFFSETS = [-1, 0, 1, 2, 3, 4]  # ATM-1, ATM, ATM+1..ATM+4
+# Strike matrix: BOTH sides show exactly ONE ITM strike, the ATM strike and
+# SIX OTM strikes. For CE the ITM strike sits below the spot (ATM-1) and the
+# OTM strikes above (ATM+1..ATM+6); for PE it is mirrored - the ITM strike is
+# ATM+1 and the OTM strikes run ATM-1..ATM-6. Offsets are strike-ladder steps
+# relative to ATM, signed toward higher strikes on both sides.
+CE_OFFSETS = [-1, 0, 1, 2, 3, 4, 5, 6]  # 1 ITM, ATM, 6 OTM
+PE_OFFSETS = [1, 0, -1, -2, -3, -4, -5, -6]  # 1 ITM, ATM, 6 OTM (mirrored)
+SIDE_OFFSETS = {SIDE_CE: CE_OFFSETS, SIDE_PE: PE_OFFSETS}
+
 WIN_THRESHOLD = 0.30  # side vote threshold on summed per-leg norms
 TV_OF_DEEP_ITM = 2.0  # assumed time value of the deepest ITM CE (spot backout)
 DECAY = 0.35  # projection decay over the remaining bars
@@ -394,13 +403,23 @@ def _infer_strike_step(strikes: list[float], spot: float) -> float:
     return float(min(diffs))
 
 
+def _moneyness(side: str, offset: int) -> tuple[str, int]:
+    """Classify a leg for the UI: ('ITM'|'ATM'|'OTM', otm_steps 0..6)."""
+    if offset == 0:
+        return "ATM", 0
+    itm = offset < 0 if side == SIDE_CE else offset > 0
+    if itm:
+        return "ITM", 0
+    return "OTM", abs(offset)
+
+
 def _resolve_universe(
     underlying: str,
     fo_exchange: str,
     expiry: str,
     spot_ref: float,
 ) -> dict:
-    """ATM + ATM-1..ATM+4 strikes on both sides with symbols and lot size.
+    """Per side: ONE ITM strike + ATM + SIX OTM strikes, with symbols/lot size.
 
     Everything comes from the master contract: step inferred from the listed
     strikes, ATM picked as the closest listed strike to the spot, symbols
@@ -419,19 +438,21 @@ def _resolve_universe(
     atm = min(strikes_sorted, key=lambda s: abs(s - spot_ref))
     atm_idx = strikes_sorted.index(atm)
 
-    # Walk outward from ATM collecting offset strikes that actually exist.
-    picked: dict[int, float] = {}
-    lo, hi = atm_idx, atm_idx
-    picked[0] = atm
-    for off in STRIKE_OFFSETS:
-        if off == 0:
-            continue
-        if off < 0:
-            lo = max(0, lo - 1)
-            picked[off] = strikes_sorted[lo]
-        else:
-            hi = min(len(strikes_sorted) - 1, hi + 1)
-            picked[off] = strikes_sorted[hi]
+    # Walk outward from ATM per side collecting offset strikes that exist.
+    # lo/hi walk independently per side so ladder-edge clamping cannot bleed
+    # across sides.
+    picked: dict[tuple[str, int], float] = {}
+    for side in (SIDE_CE, SIDE_PE):
+        lo, hi = atm_idx, atm_idx
+        for off in SIDE_OFFSETS[side]:
+            if off < 0:
+                lo = max(0, lo - 1)
+                picked[(side, off)] = strikes_sorted[lo]
+            elif off > 0:
+                hi = min(len(strikes_sorted) - 1, hi + 1)
+                picked[(side, off)] = strikes_sorted[hi]
+            else:
+                picked[(side, 0)] = atm
 
     expiry_db = f"{expiry[:2]}-{expiry[2:5]}-{expiry[5:]}".upper()
     legs = []
@@ -443,9 +464,10 @@ def _resolve_universe(
         logger.exception(f"castrade: symbol DB unavailable: {e}")
         symbol_session = None
 
-    for off in STRIKE_OFFSETS:
-        strike = picked[off]
-        for side in (SIDE_CE, SIDE_PE):
+    for side in (SIDE_CE, SIDE_PE):
+        for off in SIDE_OFFSETS[side]:
+            strike = picked[(side, off)]
+            moneyness, otm_steps = _moneyness(side, off)
             symbol = construct_option_symbol(underlying, expiry, strike, side)
             ls = 0
             exists = True
@@ -469,6 +491,8 @@ def _resolve_universe(
             legs.append(
                 {
                     "offset": off,
+                    "moneyness": moneyness,
+                    "otm_steps": otm_steps,
                     "strike": float(strike),
                     "side": side,
                     "symbol": symbol,
@@ -979,10 +1003,11 @@ def _run_cas_analysis_inner(
 
     # --- assemble the leg payload ------------------------------------------
     # Strike values come straight from the listed ladder (not synthesized),
-    # so the output walks the actual legs keyed by offset + side.
+    # so the output walks the actual legs in the per-side matrix order
+    # (1 ITM, ATM, then the OTMs walking away from ATM).
     legs_out = []
-    for off in STRIKE_OFFSETS:
-        for side in (SIDE_CE, SIDE_PE):
+    for side in (SIDE_CE, SIDE_PE):
+        for off in SIDE_OFFSETS[side]:
             matches = [
                 cand
                 for cand in legs_by_key.values()
@@ -1024,9 +1049,12 @@ def _run_cas_analysis_inner(
                 }
                 for b in bars
             ]
+            moneyness, otm_steps = _moneyness(side, off)
             legs_out.append(
                 {
                     "offset": off,
+                    "moneyness": moneyness,
+                    "otm_steps": otm_steps,
                     "strike": leg["strike"],
                     "side": side,
                     "symbol": leg["symbol"],

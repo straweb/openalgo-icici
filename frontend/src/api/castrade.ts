@@ -50,7 +50,9 @@ export interface CastradeLegActual {
 }
 
 export interface CastradeLeg {
-  offset: number // -1..4 relative to ATM
+  offset: number // signed strike-ladder steps from ATM (higher strikes = positive)
+  moneyness: 'ITM' | 'ATM' | 'OTM' // per-side: CE ITM below spot, PE ITM above
+  otm_steps: number // 0 for ITM/ATM, 1..6 for OTM
   strike: number
   side: 'CE' | 'PE'
   symbol: string
@@ -63,9 +65,12 @@ export interface CastradeLeg {
   bar_pattern: CastradeWindowBar | null // 15:19 bar
   bar_decision: CastradeWindowBar | null // 15:20 bar
   premium_at_decision: number | null
+  premium_live?: number | null // live session: last tick premium
   projected_pct: number | null
   actual: CastradeLegActual | null
   candles: CastradeCandle[]
+  /** live delta only: the newest forming candle of this leg */
+  last_candle?: CastradeCandle
 }
 
 export interface CastradeCondA {
@@ -89,6 +94,7 @@ export interface CastradeFinalTrade {
   side: 'CE' | 'PE'
   strike: number
   symbol: string
+  exchange?: string // live session only (order placement)
   source: 'pattern' | 'scoring'
   reason: string
   entry_time: string
@@ -100,6 +106,33 @@ export interface CastradeFinalTrade {
   projected_pct: number | null
   lot_size: number
   pending: boolean
+}
+
+export interface CastradePreviewPick {
+  side: 'CE' | 'PE'
+  strike: number
+  symbol: string
+  source: 'pattern' | 'scoring'
+  reason: string | null
+}
+
+export interface CastradeOrderRecord {
+  time: string
+  action: 'BUY' | 'SELL'
+  symbol: string
+  quantity: number
+  lots: number
+  product: string
+  orderid?: string | null
+  status: 'success' | 'failed'
+  message?: string | null
+}
+
+export interface CastradeFeedStatus {
+  connected: boolean
+  tick_count: number
+  last_tick_age_sec: number | null
+  symbols: number
 }
 
 export interface CastradeEvent {
@@ -145,6 +178,19 @@ export interface CastradeAnalysisData {
   legs: CastradeLeg[]
   underlying_candles: CastradeCandle[]
   analyzer_mode: boolean
+  // --- live-session extras (absent in replay payloads) ---
+  session_id?: string
+  live?: boolean
+  phase?: 'pre' | 'window' | 'position' | 'done'
+  pick_locked?: boolean
+  preview_pick?: CastradePreviewPick | null
+  preview_source?: 'pattern' | 'scoring' | null
+  preview_reason?: string | null
+  feed?: CastradeFeedStatus
+  orders?: CastradeOrderRecord[]
+  position_qty?: number
+  server_time?: string
+  type?: 'delta'
 }
 
 export interface CastradeAnalysisResponse {
@@ -178,6 +224,42 @@ export const castradeApi = {
 
   analyze: async (params: CastradeAnalyzeParams): Promise<CastradeAnalysisResponse> => {
     const response = await webClient.post<CastradeAnalysisResponse>('/castrade/api/analyze', params)
+    return response.data
+  },
+
+  // --- live tick-by-tick session ---
+
+  liveStart: async (params: CastradeAnalyzeParams): Promise<CastradeAnalysisResponse> => {
+    const response = await webClient.post<CastradeAnalysisResponse>(
+      '/castrade/api/live/start',
+      params
+    )
+    return response.data
+  },
+
+  liveStop: async (): Promise<{ status: string; message?: string }> => {
+    const response = await webClient.post('/castrade/api/live/stop')
+    return response.data
+  },
+
+  liveState: async (
+    full = false
+  ): Promise<{ status: 'success' | 'error'; message?: string; data?: CastradeAnalysisData }> => {
+    const response = await webClient.get('/castrade/api/live/state', {
+      params: full ? { full: 1 } : undefined,
+    })
+    return response.data
+  },
+
+  // --- orders (live session only, locked final pick only) ---
+
+  placeOrder: async (params: {
+    action: 'BUY' | 'SELL'
+    symbol: string
+    lots: number
+    product?: string
+  }): Promise<{ status: 'success' | 'error'; message?: string; orderid?: string }> => {
+    const response = await webClient.post('/castrade/api/order', params)
     return response.data
   },
 }

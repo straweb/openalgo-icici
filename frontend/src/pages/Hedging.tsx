@@ -1109,11 +1109,11 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
   // layout so the three charts have somewhere to land; anything the trader
   // loaded by hand is never touched.
   //
-  // The board's working set is ATM ± 10 strikes: a pristine tab's panels
-  // fill with the full ladder (both sides, equal shares per side) the same
-  // beat its chain lands, so every strike is clickable, chartable and on the
-  // index chart as a dotted rail without any manual adds. Tabs the trader
-  // already built are never touched.
+  // A pristine tab's panel opens with the ATM strikes ONLY — the at-the-
+  // money call and put, equal shares, one row per side. The wider ladder
+  // (ATM ± 10) used to pour in with the chain and bury the ATM row the
+  // trader actually wanted under ten offsets; the add strip is right there
+  // for whoever wants the ladder back.
   const [autoSeed, setAutoSeed] = useState<WorkspaceAutoSeed | null>(null)
   useEffect(() => {
     if (!chain || !fno || !chain.atm_strike) return
@@ -1136,34 +1136,31 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
     }
     if (ctx.options.length === 0) {
       const fresh: HedgingInstrument[] = []
-      for (const row of chain.chain) {
-        if (row.ce?.symbol) {
-          fresh.push(
-            makeOptionRow({
-              symbol: row.ce.symbol,
-              exchange: foExchange,
-              strike: row.strike,
-              optionType: 'CE',
-              lotSize: row.ce.lotsize ?? 1,
-              // Equal shares; the merge's normalize lands each side's
-              // enabled weights at 100 split evenly across the ladder.
-              weight: 1,
-            })
-          )
-        }
-        if (row.pe?.symbol) {
-          fresh.push(
-            makeOptionRow({
-              symbol: row.pe.symbol,
-              exchange: foExchange,
-              strike: row.strike,
-              optionType: 'PE',
-              lotSize: row.pe.lotsize ?? 1,
-              weight: 1,
-            })
-          )
-        }
+      if (atmRow?.ce?.symbol) {
+        fresh.push(
+          makeOptionRow({
+            symbol: atmRow.ce.symbol,
+            exchange: foExchange,
+            strike: chain.atm_strike,
+            optionType: 'CE',
+            lotSize: atmRow.ce.lotsize ?? 1,
+            weight: 1,
+          })
+        )
       }
+      if (atmRow?.pe?.symbol) {
+        fresh.push(
+          makeOptionRow({
+            symbol: atmRow.pe.symbol,
+            exchange: foExchange,
+            strike: chain.atm_strike,
+            optionType: 'PE',
+            lotSize: atmRow.pe.lotsize ?? 1,
+            weight: 1,
+          })
+        )
+      }
+      // The merge's normalize lands the pair at 50 / 50 of the allocation.
       if (fresh.length > 0) patchCtx({ options: normalizeWeights(fresh) })
     }
     pendingAutoSeed.current = null

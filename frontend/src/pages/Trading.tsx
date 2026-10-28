@@ -1,6 +1,6 @@
 import { LayoutGrid, Link2 as LinkIcon } from 'lucide-react'
 import { type ChartObjects, createLinkGroup, type LinkGroup } from 'openalgo-charts'
-import type { WorkspaceDocument, WorkspacePayload } from 'openalgo-charts/workspace'
+import type { WorkspaceDocument, WorkspacePane, WorkspacePayload } from 'openalgo-charts/workspace'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { AccountControls } from '@/components/layout/AccountControls'
@@ -58,7 +58,6 @@ import {
   type ChartOrderBridgeRef,
 } from '@/components/trading/dock/chartOrderBridge'
 import { DOCK_ID } from '@/components/trading/dock/DockShell'
-import { onDepthRequest } from '@/lib/trading/depthBus'
 import {
   type DockTab,
   escapeTarget,
@@ -94,6 +93,8 @@ import { clearLog, fetchLog, type LoggedFire } from '@/lib/trading/alertLog'
 import { alertRuntimeKey, removeWorkspaceAlertRuntime } from '@/lib/trading/alertRuntime'
 import { historyChord } from '@/lib/trading/chartHistory'
 import { hasChartRequest, readChartRequest, withoutChartRequest } from '@/lib/trading/chartLink'
+import type { DeployChartLoad } from '@/lib/trading/deployPlan'
+import { onDepthRequest } from '@/lib/trading/depthBus'
 import { chartMayTakeKey } from '@/lib/trading/drawingKeys'
 import { ChromeIcon, lineStroke24 } from '@/lib/trading/glyphs'
 import {
@@ -1161,6 +1162,70 @@ function TradingWorkspace({ account }: { account: string | null }) {
       setWorkspaceMessage(error instanceof Error ? error.message : String(error))
     }
   }
+  /**
+   * The deploy panel's "Load all": the ladder becomes the grid, two columns
+   * of charts — every active CALL down the left, every active PUT down the
+   * right, one chart row per strike pair, as many rows as the fuller side
+   * has. A side with fewer rows leaves its trailing cells to the underlying
+   * itself, so the grid stays rectangular without inventing instruments.
+   *
+   * The layout is built for the request (a two-column grid N rows tall) and
+   * opened as the workspace payload directly — the payload carries its own
+   * geometry, so it renders without the preset table knowing the id. Every
+   * chart keeps the focused pane's interval, type and volume settings; only
+   * the instrument changes per cell.
+   */
+  const loadDeployCharts = (request: DeployChartLoad) => {
+    if (workspacePending.current) return
+    const rowsCount = Math.min(12, Math.max(request.left.length, request.right.length, 1))
+    const areaRows: string[] = []
+    const cells: string[] = []
+    for (let index = 0; index < rowsCount; index++) {
+      areaRows.push(`"a${index} b${index}"`)
+      cells.push(`a${index}`, `b${index}`)
+    }
+    const preset: LayoutPreset = {
+      id: `deployLadder-${rowsCount}`,
+      label: `CE | PE × ${rowsCount}`,
+      cols: '1fr 1fr',
+      rows: Array.from({ length: rowsCount }, () => '1fr').join(' '),
+      areas: areaRows.join(' '),
+      cells,
+    }
+    try {
+      const current = captureWorkspace()
+      const pick = (side: DeployChartLoad['left'], index: number) =>
+        side[index] ?? request.filler ?? null
+      const panes: WorkspacePane[] = cells.map((_, index) => {
+        const base = current.panes[index] ?? current.panes[0]
+        const load =
+          index % 2 === 0 ? pick(request.left, index >> 1) : pick(request.right, index >> 1)
+        return {
+          ...base,
+          id: `p${index}`,
+          ...(load ? { symbol: load.symbol, exchange: load.exchange } : {}),
+        }
+      })
+      const focusedIndex = current.panes.findIndex((pane) => pane.id === focusedPane)
+      const nextFocus = focusedIndex >= 0 && focusedIndex < panes.length ? `p${focusedIndex}` : 'p0'
+      const payload = capturePresetWorkspace(preset, panes, nextFocus, sync)
+      void workspace
+        .open(
+          payload,
+          async () => {},
+          (grid) => bindAlertRuntime(grid.terminals, activeWorkspaceId, 'seed')
+        )
+        .then(() => {
+          setWorkspaceMessage('Unsaved')
+          autosave.changed()
+        })
+        .catch(() => {})
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setWorkspaceMessage(message)
+      showToast.warning(`Load all: ${message}`)
+    }
+  }
   useEffect(() => {
     if (
       restoreAttempted.current ||
@@ -1763,6 +1828,9 @@ function TradingWorkspace({ account }: { account: string | null }) {
                 // The title combobox and the rows' chart buttons load the
                 // instrument into the focused pane, the watchlist's way.
                 onPick={sendToFocusedPane}
+                // "Load all": the active ladder becomes the two-column grid,
+                // CALLS left and PUTS right, built by the page's layout code.
+                onLoadAll={loadDeployCharts}
               />
             </Suspense>
           )}

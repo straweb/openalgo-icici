@@ -34,6 +34,7 @@ import {
   CalendarClock,
   CirclePlus,
   Layers,
+  LayoutGrid,
   Loader2,
   RefreshCw,
   Rocket,
@@ -68,15 +69,19 @@ import type { ChartContext } from '@/lib/trading/chartContract'
 import {
   bookKey,
   chainLtp,
+  constructedOptionSymbol,
   constructedRows,
   type DeployBook,
   type DeployCapitalBasis,
   type DeployCapitalSource,
+  type DeployChartLoad,
   type DeployRow,
+  defaultLotSize,
   defaultStrikeStep,
   ensureSideWeights,
   equalSplitSide,
   firingRows,
+  foldSeededRows,
   normalizeSideWeights,
   type RowSide,
   readDeployState,
@@ -84,6 +89,7 @@ import {
   rowQty,
   rowsFromStrikes,
   type Sizing,
+  seededSideWeight,
   slideSideWeight,
   stockRowFromSearch,
   toggleSideRow,
@@ -102,7 +108,7 @@ import { armLadderBatch, armPastMiss } from '@/lib/trading/scheduleArm'
 import type { SearchRow } from '@/lib/trading/terminal'
 import { planCrosses, swapFireOrders } from '@/lib/trading/tradingFire'
 import { cn } from '@/lib/utils'
-import { fnoExchangeFor, type ScheduledOrder } from '@/types/hedging'
+import { FNO_UNDERLYING_EXCHANGES, fnoExchangeFor, type ScheduledOrder } from '@/types/hedging'
 import type { OptionChainResponse } from '@/types/option-chain'
 import type { Position } from '@/types/trading'
 import { showToast } from '@/utils/toast'
@@ -125,6 +131,12 @@ interface Props {
   chartRevision: number
   /** Charts an instrument in the focused pane (row chart buttons, picks). */
   onPick(row: SearchRow): void
+  /**
+   * Load the active rows into the chart grid — CALLS down the left column,
+   * PUTS down the right, one chart row per strike pair. The page builds the
+   * layout; the panel only picks what loads.
+   */
+  onLoadAll(request: DeployChartLoad): void
 }
 
 type BusyKey =
@@ -150,7 +162,7 @@ const NO_BUSY: Record<BusyKey, boolean> = {
   sellAll: false,
 }
 
-export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: Props) {
+export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick, onLoadAll }: Props) {
   const [state, setState] = useState<DeployBook>(() => ensureSideWeights(readDeployState()))
   /**
    * The workspace binding — the panel's own instrument. Seeded from the
@@ -160,6 +172,19 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   const [workspace, setWorkspace] = useState<{ symbol: string; exchange: string } | null>(
     () => state.workspace ?? getChartContext()
   )
+  /**
+   * The latest binding, as the async polls see it. Every poll that answers
+   * "for the underlying I was started with" compares against this ref
+   * before touching state — an in-flight NIFTY answer landing after the
+   * trader picked SENSEX is dropped on the floor, which is exactly what
+   * used to leave the strike buttons adding the previous underlying's
+   * strikes.
+   */
+  const underlyingRef = useRef(workspace?.symbol ?? '')
+  const expiryRef = useRef('')
+  useEffect(() => {
+    underlyingRef.current = workspace?.symbol ?? ''
+  }, [workspace?.symbol])
   /** FNO / Equity switch: auto until the trader flips it for this underlying. */
   const [modeOverride, setModeOverride] = useState<'auto' | 'fno' | 'equity'>('auto')
   const [side, setSide] = useState<'CE' | 'PE'>('CE')
@@ -167,6 +192,18 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   const [chain, setChain] = useState<OptionChainResponse | null>(null)
   const [expiry, setExpiry] = useState('')
   const [expiries, setExpiries] = useState<string[]>([])
+  useEffect(() => {
+    expiryRef.current = expiry
+  }, [expiry])
+  /**
+   * Where the expiry ask for the CURRENT underlying stands: loading (the
+   * ask is in flight), ok (a non-empty list landed), empty (the exchange
+   * answered "none listed" — an index with no options at all) or failed
+   * (the ask errored; the quiet 15 s retry keeps trying). The mode
+   * detection waits for it, but only where it must — an index never
+   * waits to look like an index.
+   */
+  const [expiryState, setExpiryState] = useState<'loading' | 'ok' | 'empty' | 'failed'>('loading')
   const [busy, setBusy] = useState<Record<BusyKey, boolean>>(NO_BUSY)
   const [expiryNotice, setExpiryNotice] = useState<string | null>(null)
   const [expiryFailed, setExpiryFailed] = useState(false)
@@ -218,12 +255,36 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   )
   const key = bookKey(optionsExchange, underlying)
   const ladder = state.books[key] ?? { ce: [], pe: [] }
-  /** Options when the underlying lists them — or when the trader flips to FNO. */
+  /**
+   * An index pick trades its option ladder from the first paint: indexes
+   * carry derivatives by definition, so the mode does not wait for the
+   * expiry ask (let alone the chain snapshot) to say so — the ATM and the
+   * round buttons come up off the live quote, the hedging terminal's way.
+   * Only a settled "none listed" answer (an index with no options at all,
+   * India VIX style) sends the panel to the stock list. A cash stock keeps
+   * the old rule: the ladder opens when the exchange confirms expiries.
+   */
+  const indexUnderlying = FNO_UNDERLYING_EXCHANGES.has(workspace?.exchange ?? '')
   const optionsMode =
-    modeOverride === 'fno' ? true : modeOverride === 'equity' ? false : expiries.length > 0
+    modeOverride === 'fno'
+      ? true
+      : modeOverride === 'equity'
+        ? false
+        : indexUnderlying
+          ? expiryState !== 'empty'
+          : expiryState === 'ok'
+
+  /**
+   * Bumped on every combobox selection. The ATM auto-open runs once per
+   * selection — re-picking the same underlying re-opens its ATM the way
+   * the first pick did, without the effect re-seeding behind the trader
+   * while they work the ladder.
+   */
+  const selectionSeq = useRef(0)
 
   /** The title combobox is the only thing that moves the binding. */
   const bindWorkspace = useCallback((pick: { symbol: string; exchange: string }) => {
+    selectionSeq.current += 1
     setWorkspace(pick)
     setState((previous) => {
       const next: DeployBook = { ...previous, workspace: pick }
@@ -278,15 +339,24 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   /* ── expiries, then the chain ───────────────────────────────────── */
   const loadExpiries = useCallback(async () => {
     if (!underlying) return
+    // Answer for the underlying this call was STARTED with — a switch to
+    // another underlying retires it. Without this gate an in-flight NIFTY
+    // expiry list lands after the trader picked SENSEX and the panel
+    // disagrees with itself about what it is trading.
+    const forUnderlying = underlying
     try {
       const res = await scalpingApi.getExpiry(underlying, optionsExchange, 'options')
+      if (underlyingRef.current !== forUnderlying) return
       const list = res.data ?? []
       setExpiries(list)
+      setExpiryState(list.length > 0 ? 'ok' : 'empty')
       setExpiry((current) => (current && list.includes(current) ? current : (list[0] ?? '')))
       setExpiryFailed(false)
       setExpiryNotice(list.length === 0 ? `${underlying} has no option chain listed` : null)
     } catch {
+      if (underlyingRef.current !== forUnderlying) return
       setExpiries([])
+      setExpiryState('failed')
       setExpiryFailed(true)
       setExpiryNotice(`Could not load expiries for ${underlying}`)
     }
@@ -298,6 +368,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     setExpiry('')
     setExpiryNotice(null)
     setExpiryFailed(false)
+    setExpiryState('loading')
     setUnderlyingLtp(undefined)
     setModeOverride('auto')
     void loadExpiries()
@@ -318,6 +389,13 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
    */
   const loadChain = useCallback(async () => {
     if (!underlying || !expiry) return
+    // Same retirement rule as the expiry ask: the answer may only touch
+    // state while both the underlying and the expiry it was asked for are
+    // still the panel's own. A slow NIFTY snapshot arriving under a SENSEX
+    // binding would otherwise drive the ATM, the round buttons and the row
+    // quotes with the previous underlying's strikes.
+    const forUnderlying = underlying
+    const forExpiry = expiry
     try {
       const res = await optionChainApi.getOptionChain(
         apiKey,
@@ -326,6 +404,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
         expiry,
         50
       )
+      if (underlyingRef.current !== forUnderlying || expiryRef.current !== forExpiry) return
       if (res.status === 'success') setChain(res)
     } catch {
       // the next poll retries; the quote-driven picks keep working meanwhile
@@ -532,6 +611,87 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     ]
   )
   const sizing = useMemo(() => ({ capital: usable, ltpOf }), [usable, ltpOf])
+
+  /* ── auto-open: selecting an index underlying opens its ATM ───────────── */
+  const seededSelection = useRef<number | null>(null)
+  useEffect(() => {
+    if (!optionsMode || !indexUnderlying || !underlying || !expiry) return
+    if (atm == null || !interval) return
+    if (seededSelection.current === selectionSeq.current) return
+    seededSelection.current = selectionSeq.current
+    const book = state.books[key]
+    const existingCe = book?.ce ?? []
+    const existingPe = book?.pe ?? []
+    // The ATM strike the exchange lists, else the OpenAlgo-convention build
+    // the reconcile pass swaps for the listed symbol when the chain lands —
+    // the open never waits for the snapshot.
+    const seedRow = (side: 'CE' | 'PE', existing: DeployRow[]): DeployRow | null => {
+      if (existing.some((row) => row.kind === 'option' && row.strike === atm)) return null
+      const leg = chain?.chain.find((entry) => entry.strike === atm)
+      const listed = side === 'CE' ? leg?.ce : leg?.pe
+      const weight = seededSideWeight(existing, side, 50)
+      if (listed?.symbol) {
+        return {
+          symbol: listed.symbol,
+          exchange: optionsExchange,
+          kind: 'option',
+          strike: atm,
+          optionType: side,
+          lotSize: listed.lotsize || 1,
+          enabled: true,
+          lots: 0,
+          weight,
+          entry: null,
+          target: null,
+          stoploss: null,
+        }
+      }
+      return {
+        symbol: constructedOptionSymbol(underlying, expiry, atm, side),
+        exchange: optionsExchange,
+        kind: 'option',
+        strike: atm,
+        optionType: side,
+        lotSize: defaultLotSize(underlying),
+        enabled: true,
+        lots: 0,
+        weight,
+        entry: null,
+        target: null,
+        stoploss: null,
+        constructed: true,
+      }
+    }
+    const ceSeed = seedRow('CE', existingCe)
+    const peSeed = seedRow('PE', existingPe)
+    if (!ceSeed && !peSeed) return
+    setState((previous) => {
+      const bookNow = previous.books[key] ?? { ce: [], pe: [] }
+      const next: DeployBook = {
+        ...previous,
+        books: {
+          ...previous.books,
+          [key]: {
+            ce: ceSeed ? foldSeededRows('CE', bookNow.ce, [ceSeed]) : bookNow.ce,
+            pe: peSeed ? foldSeededRows('PE', bookNow.pe, [peSeed]) : bookNow.pe,
+          },
+        },
+      }
+      writeDeployState(next)
+      return next
+    })
+  }, [
+    optionsMode,
+    indexUnderlying,
+    underlying,
+    expiry,
+    atm,
+    interval,
+    chain,
+    optionsExchange,
+    key,
+    state.books,
+  ])
 
   /* ── add strips ───────────────────────────────────────────────────────── */
   const addStrikes = useCallback(
@@ -741,11 +901,14 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     if (chain?.underlying_symbol) {
       return {
         symbol: chain.underlying_symbol,
-        exchange: chain.underlying_exchange ?? optionsExchange,
+        exchange: chain.underlying_exchange ?? workspace?.exchange ?? optionsExchange,
       }
     }
     if (!underlying) return null
-    return { symbol: underlying, exchange: workspace?.exchange === 'NSE' ? 'NSE' : 'NSE_INDEX' }
+    // The binding's own exchange — NSE_INDEX for NIFTY, BSE_INDEX for
+    // SENSEX — is where its live quote answers. Guessing NSE_INDEX for
+    // every non-NSE pick put BSE index triggers on the wrong feed.
+    return { symbol: underlying, exchange: workspace?.exchange ?? 'NSE_INDEX' }
   }, [chain, underlying, optionsExchange, workspace?.exchange])
 
   const submitSchedule = useCallback(
@@ -1055,6 +1218,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
           onDir={setDir}
           dirLabel={dirLabel}
           onAddStrikes={addStrikes}
+          symbolReady={Boolean((chain && chain.chain.length > 0) || expiry)}
           className="flex shrink-0 items-center gap-1 border-b bg-muted/30 px-2 py-1"
         />
       ) : (
@@ -1331,6 +1495,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
             onDir={setDir}
             dirLabel={dirLabel}
             onAddStrikes={addStrikes}
+            symbolReady={Boolean((chain && chain.chain.length > 0) || expiry)}
             className="mb-1 flex shrink-0 items-center gap-1 border-b bg-muted/30 pb-1"
           />
         )}
@@ -1412,6 +1577,36 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
               >
                 <Layers className="h-2.5 w-2.5" />
                 Deploy by level
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-5 gap-1 px-1.5 text-[10px]"
+                disabled={!underlying}
+                title="Load every active row into the chart layout — CALLS down the left column, PUTS down the right"
+                onClick={() => {
+                  const toSearch = (row: DeployRow) => ({
+                    symbol: row.symbol,
+                    exchange: row.exchange,
+                    name: row.name,
+                  })
+                  const left = ladder.ce.filter((row) => row.enabled).map(toSearch)
+                  const right = ladder.pe.filter((row) => row.enabled).map(toSearch)
+                  if (left.length === 0 && right.length === 0) {
+                    showToast.warning('Load all: no active rows to load')
+                    return
+                  }
+                  onLoadAll({
+                    left,
+                    right,
+                    filler: workspace
+                      ? { symbol: workspace.symbol, exchange: workspace.exchange }
+                      : null,
+                  })
+                }}
+              >
+                <LayoutGrid className="h-2.5 w-2.5" />
+                Load all
               </Button>
             </>
           )}
@@ -1674,13 +1869,20 @@ function OffsetStrip(props: {
   onDir(dir: 1 | -1): void
   dirLabel: string
   onAddStrikes(strikes: number[]): void
+  /**
+   * Whether a strike click can name a real instrument yet — the chain
+   * snapshot has landed, or the expiry ask has (any built symbol needs the
+   * expiry block). Without either, the picks wait: the ATM itself already
+   * works off the live quote, so this only gates the buttons.
+   */
+  symbolReady: boolean
   className: string
 }) {
   const [nOpen, setNOpen] = useState(false)
   const [nCount, setNCount] = useState(5)
   const [customOpen, setCustomOpen] = useState(false)
   const [custom, setCustom] = useState('')
-  const { atm, interval, dir, side } = props
+  const { atm, interval, dir, side, symbolReady } = props
 
   const addN = () => {
     const wanted = strikesForPick(
@@ -1725,7 +1927,7 @@ function OffsetStrip(props: {
         size="sm"
         variant="outline"
         className="h-5 px-1.5 text-[10px]"
-        disabled={!atm}
+        disabled={!atm || !symbolReady}
         onClick={() => props.onAddStrikes([atm as number])}
         title="Add ATM strike"
       >
@@ -1746,7 +1948,7 @@ function OffsetStrip(props: {
           size="sm"
           variant="outline"
           className="h-5 min-w-5 px-1 text-[10px]"
-          disabled={!atm || !interval}
+          disabled={!atm || !interval || !symbolReady}
           onClick={() => {
             if (atm == null) return
             props.onAddStrikes([atm + offset * interval * dir])
@@ -1762,7 +1964,7 @@ function OffsetStrip(props: {
             size="sm"
             variant="outline"
             className="h-5 px-1.5 text-[10px] font-semibold"
-            disabled={!atm || !interval}
+            disabled={!atm || !interval || !symbolReady}
             title="Add N strikes from ATM"
           >
             ×N

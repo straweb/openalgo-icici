@@ -317,6 +317,43 @@ export function writeDeployState(
 /* ── the weight engine: every side sums to 100, automatically ─────────────── */
 
 /**
+ * The weight a freshly seeded row starts at, the hedging terminal's rule:
+ * half the side's enabled rows' mean weight, so the merge's normalise lands
+ * it at roughly half an existing row's share instead of halving everyone
+ * else. A side with nothing enabled has no mean to halve — the row carries
+ * the fallback (50: the default an opening ATM row starts at) instead.
+ */
+export function seededSideWeight(rows: DeployRow[], side: RowSide, fallback = 50): number {
+  const siblings = rows.filter((row) => row.enabled && sideOfRow(row) === side)
+  if (siblings.length === 0) return fallback
+  const mean = siblings.reduce((sum, row) => sum + Math.max(0, row.weight), 0) / siblings.length
+  return Math.round((mean / 2) * 10) / 10
+}
+
+/**
+ * Fold seeded rows into one side and settle the weights the way the panel
+ * opens an underlying's ladder by default:
+ *
+ * - a side that already carries enabled rows folds the newcomers in at
+ *   their seeded weight (half the existing mean) and rescales the side
+ *   back to 100 — the newcomer is weighted against the existing strikes;
+ * - an empty side keeps the newcomer's own weight untouched — the 50
+ *   percent a default ATM row opens at stays visible on the slider (and
+ *   the side's Σ reads it honestly) until the trader adds another strike
+ *   or moves a slider, both of which re-level the side to 100.
+ */
+export function foldSeededRows(
+  side: RowSide,
+  existing: DeployRow[],
+  seeded: DeployRow[]
+): DeployRow[] {
+  if (seeded.length === 0) return existing
+  const hadEnabled = existing.some((row) => row.enabled && sideOfRow(row) === side)
+  const merged = [...existing, ...seeded]
+  return hadEnabled ? normalizeSideWeights(merged) : merged
+}
+
+/**
  * Rescale each side's enabled weights so CE, PE and the stock list each sum
  * to exactly 100 (one decimal). Runs after every add, remove and toggle, so
  * the trader never has to make the shares add up.
@@ -750,6 +787,22 @@ export interface Sizing {
   capital?: number
   /** LTP lookup for auto sizing — the chain or the quotes feed. */
   ltpOf?(row: DeployRow): number | undefined
+}
+
+/**
+ * What the panel's "Load all" hands the page: the active rows, split by
+ * side, for a two-column chart layout — CALLS down the left, PUTS down the
+ * right, one row of charts per strike pair. A side with fewer rows leaves
+ * its trailing cells to the filler (the underlying's own chart), so the
+ * grid stays rectangular without inventing instruments.
+ */
+export interface DeployChartLoad {
+  /** Left column, top to bottom — the enabled CE rows (or the stock list). */
+  left: Array<{ symbol: string; exchange: string; name?: string }>
+  /** Right column, top to bottom — the enabled PE rows. */
+  right: Array<{ symbol: string; exchange: string; name?: string }>
+  /** The chart a missing row's cell shows — the underlying itself. */
+  filler: { symbol: string; exchange: string; name?: string } | null
 }
 
 /**

@@ -8,13 +8,15 @@
  * on the row and flattens that position; Depth loads the instrument into
  * the dock's depth tab.
  *
- * Line 2 — what it trades: the percent of the session capital this row
- * carries — a slider plus a type-in box, auto-levelled with its side so
- * the shares always sum to 100 — the lots (or shares) that percent buys
- * right now, the rupee amount that quantity needs, and the Edit / Exit /
- * Buy / Sell actions.
+ * Line 2 — what it carries: nothing but the percent slider and its value —
+ * auto-levelled with its side so the shares always sum to 100 — which is
+ * what keeps a strike row narrow enough to read at a glance.
  *
- * Line 3 — the levels, behind the Edit press: entry, target, stop. The row
+ * Line 3 — what it trades: the lots (or shares) that percent buys right
+ * now, the rupee amount that quantity needs, and the Edit / Exit / Buy /
+ * Sell actions, all on one line under the slider.
+ *
+ * Line 4 — the levels, behind the Edit press: entry, target, stop. The row
  * lights when its instrument is the charted one, when a position or a live
  * order exists on it, and its level badges light when LTP crosses them.
  */
@@ -251,11 +253,22 @@ export function DeployRowItem(props: Props) {
         </Button>
       </div>
 
-      {/* Line 2: sizing (slider + percent) + required amount + trade actions */}
+      {/* Line 2: the slider and its value — and nothing else, so the row
+          stays narrow; the sizing it drives reads on the line below. */}
       {!props.collapsed && (
-        <div className="mt-0.5 flex flex-wrap items-center gap-1">
+        <div className="mt-0.5 flex items-center gap-1.5">
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={0.5}
+            value={Math.min(100, Math.max(0, row.weight))}
+            onChange={(e) => props.onWeight(Number(e.target.value))}
+            className="h-1 min-w-0 flex-1 cursor-pointer accent-sky-600"
+            aria-label="Weight percent slider"
+          />
           <span
-            className="flex items-center gap-0.5 rounded bg-muted/60 px-1 py-px"
+            className="flex shrink-0 items-center gap-0.5 rounded bg-muted/60 px-1 py-px"
             title="Percent of the funds this row carries (sides auto-adjust to 100%)"
           >
             <input
@@ -271,18 +284,16 @@ export function DeployRowItem(props: Props) {
             />
             <span className="text-[9px] text-muted-foreground">%</span>
           </span>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            step={0.5}
-            value={Math.min(100, Math.max(0, row.weight))}
-            onChange={(e) => props.onWeight(Number(e.target.value))}
-            className="h-1 w-14 shrink-0 cursor-pointer accent-sky-600"
-            aria-label="Weight percent slider"
-          />
+        </div>
+      )}
+
+      {/* Line 3: what the percent buys right now — the lots (or shares),
+          the rupees that quantity needs — with the trade actions on the
+          right. */}
+      {!props.collapsed && (
+        <div className="mt-0.5 flex items-center gap-1">
           <span
-            className="min-w-[58px] font-mono text-[10px] tabular-nums"
+            className="shrink-0 font-mono text-[10px] tabular-nums"
             title={
               manual
                 ? 'Manual lots (this row overrides the auto size)'
@@ -302,14 +313,14 @@ export function DeployRowItem(props: Props) {
           </span>
           <span
             className={cn(
-              'font-mono text-[10px] tabular-nums',
+              'min-w-[58px] font-mono text-[10px] tabular-nums',
               required <= 0 ? 'text-muted-foreground' : 'text-foreground'
             )}
             title="Amount required to buy this row's quantity at the live price"
           >
             {required > 0 ? `≈ ${fmtINR(required)}` : '≈ ₹0'}
           </span>
-          <div className="ml-auto flex items-center gap-1">
+          <div className="ml-auto flex shrink-0 items-center gap-1">
             <Button
               size="sm"
               variant={editOpen ? 'secondary' : 'ghost'}
@@ -351,7 +362,7 @@ export function DeployRowItem(props: Props) {
         </div>
       )}
 
-      {/* Line 3: the levels, behind the Edit press */}
+      {/* Line 4: the levels, behind the Edit press */}
       {showLevels && (
         <div className="mt-1 flex flex-wrap items-center gap-2 rounded bg-muted/40 px-1.5 py-1">
           <NumField

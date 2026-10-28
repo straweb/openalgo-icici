@@ -81,9 +81,22 @@ export function makeInstrumentId(kind: 'option' | 'stock', symbol: string, excha
 /** The exchanges that carry F&O derivatives (underlyings trade here). */
 export const FNO_EXCHANGES: ReadonlySet<string> = new Set(['NFO', 'BFO', 'MCX', 'CDS'])
 
-/** The home derivative exchange of a cash exchange (NSE→NFO, BSE→BFO). */
+/** The exchanges that carry F&O derivatives, index quotes included. */
+export const FNO_UNDERLYING_EXCHANGES: ReadonlySet<string> = new Set([
+  ...FNO_EXCHANGES,
+  'NSE_INDEX',
+  'BSE_INDEX',
+])
+
+/** The home derivative exchange of a cash or index quote exchange.
+ *
+ * Indices quote on their own feed — NSE_INDEX / BSE_INDEX — while their
+ * derivatives list on the home F&O exchange (SENSEX options are BFO, not
+ * NFO; asking NFO for them is how a SENSEX pick used to come back
+ * "no option chain listed"). */
 export function fnoExchangeFor(exchange: string): string {
-  if (exchange === 'BSE') return 'BFO'
+  if (exchange === 'BSE' || exchange === 'BSE_INDEX') return 'BFO'
+  if (exchange === 'NSE_INDEX') return 'NFO'
   if (exchange === 'NFO' || exchange === 'BFO' || exchange === 'MCX' || exchange === 'CDS')
     return exchange
   return 'NFO'

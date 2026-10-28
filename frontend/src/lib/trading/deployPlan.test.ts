@@ -11,12 +11,14 @@ import {
   equalSplitSide,
   firingRows,
   fnoBaseSymbol,
+  foldSeededRows,
   hydrateDeployState,
   normalizeSideWeights,
   reconcileConstructed,
   rowQty,
   rowRequired,
   rowsFromStrikes,
+  seededSideWeight,
   sideOfRow,
   slideSideWeight,
   stockRowFromSearch,
@@ -252,6 +254,52 @@ describe('the weight engine', () => {
     const backOn = toggleSideRow(off, rows[0].symbol)
     const total = backOn.filter((r) => r.enabled).reduce((sum, r) => sum + r.weight, 0)
     expect(Math.round(total * 10) / 10).toBe(100)
+  })
+
+  it('seededSideWeight halves the siblings mean, falls back to 50 on an empty side', () => {
+    const rows = equalSplitSide(rowsFromStrikes(chain, 'CE', [24400, 24500]).rows, 'CE')
+    // CE siblings sit at 50 each, so a seeded row starts at 25.
+    expect(seededSideWeight(rows, 'CE')).toBe(25)
+    // The PE side of the same list is empty — the default opens at 50.
+    expect(seededSideWeight(rows, 'PE')).toBe(50)
+    expect(seededSideWeight([], 'CE')).toBe(50)
+  })
+
+  it('foldSeededRows keeps an empty side at its seeded default weight', () => {
+    // Selecting an index underlying opens its ATM at 50% of the funds —
+    // visible on the slider, NOT normalised away to 100.
+    const [atm] = rowsFromStrikes(chain, 'CE', [24500]).rows.map((r) => ({
+      ...r,
+      weight: 50,
+    }))
+    const folded = foldSeededRows('CE', [], [atm])
+    expect(folded).toHaveLength(1)
+    expect(folded[0].weight).toBe(50)
+    expect(folded[0].enabled).toBe(true)
+  })
+
+  it('foldSeededRows weights a newcomer against existing rows and re-levels to 100', () => {
+    const existing = equalSplitSide(rowsFromStrikes(chain, 'CE', [24400, 24500]).rows, 'CE')
+    // A third strike joins at the seed weight (25: half the 50/50 mean).
+    const seeded = [
+      {
+        ...rowsFromStrikes(chain, 'CE', [24400]).rows[0],
+        symbol: 'NIFTY28OCT2624600CE',
+        strike: 24600,
+        weight: 25,
+      },
+    ]
+    const folded = foldSeededRows('CE', existing, seeded)
+    const total = folded.filter((r) => r.enabled).reduce((sum, r) => sum + r.weight, 0)
+    expect(Math.round(total * 10) / 10).toBe(100)
+    // 25 of the former 125 — the newcomer lands at a fifth of the side,
+    // half an existing row's share, the hedging terminal's seeding rule.
+    expect(folded.find((r) => r.symbol === seeded[0].symbol)?.weight).toBe(20)
+  })
+
+  it('foldSeededRows with nothing seeded returns the side untouched', () => {
+    const existing = equalSplitSide(rowsFromStrikes(chain, 'CE', [24400]).rows, 'CE')
+    expect(foldSeededRows('CE', existing, [])).toBe(existing)
   })
 })
 

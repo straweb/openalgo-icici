@@ -1,3 +1,5 @@
+import { clampedBase, usableCapital } from '@/lib/hedging/capital'
+import type { CapitalBasis } from '@/types/hedging'
 import type { OptionChainResponse } from '@/types/option-chain'
 
 /**
@@ -56,8 +58,26 @@ export interface DeployRow {
   name?: string
 }
 
-/** Where the panel's session capital comes from — the hedging chip's two modes. */
+/** Where the panel's session capital comes from — the hedging chip's two sources. */
 export type DeployCapitalSource = 'fixed' | 'percent'
+
+/**
+ * The session-capital basis, the hedging chip's four-mode ladder:
+ * initial (allocation alone, losses shrink it), +PnL (allocation plus the
+ * session's P&L), house (after the first deployment only realized profit
+ * works), all (the whole account's cash plus the session P&L, no lock).
+ */
+export type DeployCapitalBasis = CapitalBasis
+
+/** The session P&L inputs the withPnl / house / all bases read. */
+export interface SessionPnl {
+  /** Every position the books report, open or flattened. */
+  dayPnl: number
+  /** Flattened rows only — the profit that is actually booked. */
+  realizedPnl: number
+  /** Whether any deployment has fired this session (the house basis). */
+  deployedOnce: boolean
+}
 
 export interface DeployBook {
   /** Keyed by `${optionsExchange}:${underlying}` so two underlyings keep their ladders. */
@@ -74,6 +94,8 @@ export interface DeployBook {
   capitalSource: DeployCapitalSource
   capitalFixed: number
   capitalPercent: number
+  /** The usable-capital basis the hedging chip's ladder defines. */
+  capitalBasis: DeployCapitalBasis
   /**
    * The instrument the panel is bound to — the workspace binding, not the
    * chart's. Multi-layout grids let the trader focus any pane without the
@@ -101,24 +123,71 @@ export function defaultDeployState(): DeployBook {
     capitalSource: 'percent',
     capitalFixed: 0,
     capitalPercent: 100,
+    // Percent of cash under the initial basis is the no-surprise default:
+    // until the trader touches the chip the panel divides exactly what the
+    // funds snapshot shows, never the session's P&L on top.
+    capitalBasis: 'initial',
   }
 }
 
 /**
- * The rupees the weight shares divide under the chip's choice: a fixed
- * allocation clamped to what the account holds, or a percent of cash.
+ * The rupees the weight shares divide, under the chip's two choices:
+ *
+ * - the source — a fixed rupee allocation (clamped to what the account
+ *   holds) or a percent of cash — sets the allocation, and
+ * - the basis — the hedging chip's four-mode ladder — turns that allocation
+ *   into the usable figure, folding the session's P&L in (or locking it out)
+ *   the way `usableCapital` defines it.
+ *
  * Cash the funds snapshot has not delivered yet reads as 0 — a fixed
  * capital still works (it is the trader's own number), a percent reads 0
- * until funds land, which is the honest answer.
+ * until funds land, which is the honest answer. The funds endpoint answers
+ * with strings, so every cash value is coerced before the arithmetic.
  */
-export function usableSessionCapital(state: DeployBook, cash: number): number {
+export function usableSessionCapital(
+  state: Pick<DeployBook, 'capitalSource' | 'capitalFixed' | 'capitalPercent' | 'capitalBasis'>,
+  cash: number,
+  session?: SessionPnl
+): number {
   const safeCash = Number.isFinite(cash) && cash > 0 ? cash : 0
+  const pnl = session ?? { dayPnl: 0, realizedPnl: 0, deployedOnce: false }
+  const basis = state.capitalBasis ?? 'initial'
   if (state.capitalSource === 'fixed') {
     const fixed = Number.isFinite(state.capitalFixed) ? state.capitalFixed : 0
-    return Math.max(0, safeCash > 0 ? Math.min(fixed, safeCash) : fixed)
+    // The old contract stands: a fixed capital is the trader's own number and
+    // keeps working while the funds snapshot has not landed. `usableCapital`
+    // clamps every allocation to known cash — with none known there is
+    // nothing to clamp against, so the ladder runs against the fixed amount
+    // directly (identical shapes, minus the clamp).
+    if (safeCash <= 0) {
+      switch (basis) {
+        case 'initial':
+          return Math.max(0, fixed + Math.min(0, pnl.realizedPnl))
+        case 'withPnl':
+          return Math.max(0, fixed + pnl.dayPnl)
+        case 'house':
+          return pnl.deployedOnce ? Math.max(0, pnl.realizedPnl) : fixed
+        case 'available':
+          // No cash known: the session P&L alone, never invented money.
+          return Math.max(0, pnl.dayPnl)
+      }
+    }
+    return usableCapital(basis, {
+      base: clampedBase(fixed, safeCash),
+      cash: safeCash,
+      dayPnl: pnl.dayPnl,
+      realizedPnl: pnl.realizedPnl,
+      deployedOnce: pnl.deployedOnce,
+    })
   }
   const pct = Number.isFinite(state.capitalPercent) ? state.capitalPercent : 100
-  return Math.max(0, (safeCash * Math.min(100, Math.max(0, pct))) / 100)
+  return usableCapital(state.capitalBasis ?? 'initial', {
+    base: (safeCash * Math.min(100, Math.max(0, pct))) / 100,
+    cash: safeCash,
+    dayPnl: pnl.dayPnl,
+    realizedPnl: pnl.realizedPnl,
+    deployedOnce: pnl.deployedOnce,
+  })
 }
 
 /** Which side of the book (or the stock list) a row belongs to. */
@@ -158,11 +227,7 @@ function hydrateRow(raw: unknown, defaultKind: RowKind): DeployRow | null {
   return {
     symbol: r.symbol,
     exchange:
-      typeof r.exchange === 'string' && r.exchange
-        ? r.exchange
-        : kind === 'stock'
-          ? 'NSE'
-          : 'NFO',
+      typeof r.exchange === 'string' && r.exchange ? r.exchange : kind === 'stock' ? 'NSE' : 'NFO',
     kind,
     strike,
     optionType,
@@ -199,6 +264,13 @@ export function hydrateDeployState(raw: unknown): DeployBook {
   if (Number.isFinite(fixed) && fixed >= 0) base.capitalFixed = fixed
   const pct = Number(r.capitalPercent)
   if (Number.isFinite(pct) && pct >= 0 && pct <= 100) base.capitalPercent = pct
+  if (
+    r.capitalBasis === 'initial' ||
+    r.capitalBasis === 'withPnl' ||
+    r.capitalBasis === 'house' ||
+    r.capitalBasis === 'available'
+  )
+    base.capitalBasis = r.capitalBasis
   if (typeof r.books === 'object' && r.books !== null) {
     const side = (list: unknown): DeployRow[] =>
       Array.isArray(list)
@@ -418,7 +490,9 @@ export function constructedOptionSymbol(
   strike: number,
   optionType: 'CE' | 'PE'
 ): string {
-  const compact = String(expiry || '').replace(/-/g, '').toUpperCase()
+  const compact = String(expiry || '')
+    .replace(/-/g, '')
+    .toUpperCase()
   return `${base.toUpperCase()}${compact}${Math.round(strike)}${optionType}`
 }
 

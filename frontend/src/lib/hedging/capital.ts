@@ -47,8 +47,13 @@ export interface CapitalInputs {
 
 /** The allocated amount clamped to what the account actually holds. */
 export function clampedBase(base: number, cash: number): number {
-  const safeCash = Number.isFinite(cash) && cash > 0 ? cash : 0
-  return Math.max(0, Math.min(base, safeCash))
+  // The funds endpoint answers with 2-dp STRINGS (`"123456.00"`), so the
+  // number checks below would silently fail and clamp every basis to zero —
+  // the "Usable ₹0 whatever the mode" report. Coerce once, here.
+  const safeCash = Number(cash)
+  const cashNum = Number.isFinite(safeCash) && safeCash > 0 ? safeCash : 0
+  const baseNum = Number.isFinite(base) ? base : 0
+  return Math.max(0, Math.min(baseNum, cashNum))
 }
 
 /**
@@ -59,6 +64,9 @@ export function usableCapital(basis: CapitalBasis, inputs: CapitalInputs): numbe
   const base = clampedBase(inputs.base, inputs.cash)
   const realized = Number.isFinite(inputs.realizedPnl) ? inputs.realizedPnl : 0
   const pnl = Number.isFinite(inputs.dayPnl) ? inputs.dayPnl : 0
+  // Same string answer as clampedBase: the available basis reads the funds
+  // snapshot directly, so it must coerce too or it alone would read ₹0.
+  const cash = Number(inputs.cash)
   switch (basis) {
     case 'initial':
       // Losses shrink the session; profits do not grow it.
@@ -72,6 +80,6 @@ export function usableCapital(basis: CapitalBasis, inputs: CapitalInputs): numbe
     case 'available':
       // The whole account works: available cash plus the session P&L, with
       // no allocated amount locked aside.
-      return Math.max(0, (Number.isFinite(inputs.cash) ? inputs.cash : 0) + pnl)
+      return Math.max(0, (Number.isFinite(cash) ? cash : 0) + pnl)
   }
 }

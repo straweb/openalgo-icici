@@ -31,9 +31,6 @@
  */
 
 import {
-  Badge
-} from '@/components/ui/badge'
-import {
   CalendarClock,
   CirclePlus,
   Layers,
@@ -52,9 +49,11 @@ import { strikeAccent } from '@/components/hedging/InstrumentPanel'
 import { SchedulerDialog, type SchedulerSubmit } from '@/components/hedging/SchedulerDialog'
 import { DeployRowItem } from '@/components/trading/DeployRowItem'
 import { SymbolCombobox, searchInstruments } from '@/components/trading/SymbolCombobox'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from '@/components/ui/resizable'
 import {
   Select,
   SelectContent,
@@ -62,33 +61,33 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from '@/components/ui/resizable'
-import { newScheduleId, scheduleActionLabel } from '@/lib/hedging/scheduler'
 import { strikesForPick } from '@/lib/hedging/indexLevels'
+import { newScheduleId, scheduleActionLabel } from '@/lib/hedging/scheduler'
 import { loadHedgingState, saveHedgingState } from '@/lib/hedging/storage'
 import type { ChartContext } from '@/lib/trading/chartContract'
 import {
   bookKey,
   chainLtp,
   constructedRows,
+  type DeployBook,
+  type DeployCapitalBasis,
+  type DeployCapitalSource,
+  type DeployRow,
   defaultStrikeStep,
-  equalSplitSide,
   ensureSideWeights,
+  equalSplitSide,
   firingRows,
   normalizeSideWeights,
+  type RowSide,
   readDeployState,
   reconcileConstructed,
-  rowsFromStrikes,
   rowQty,
+  rowsFromStrikes,
+  type Sizing,
   slideSideWeight,
   stockRowFromSearch,
   toggleSideRow,
   usableSessionCapital,
-  type DeployBook,
-  type DeployCapitalSource,
-  type DeployRow,
-  type RowSide,
-  type Sizing,
   writeDeployState,
 } from '@/lib/trading/deployPlan'
 import { openDepthTab } from '@/lib/trading/depthBus'
@@ -100,14 +99,14 @@ import {
   resolveLevelPick,
 } from '@/lib/trading/levelDeploy'
 import { armLadderBatch, armPastMiss } from '@/lib/trading/scheduleArm'
-import { planCrosses, swapFireOrders } from '@/lib/trading/tradingFire'
 import type { SearchRow } from '@/lib/trading/terminal'
+import { planCrosses, swapFireOrders } from '@/lib/trading/tradingFire'
+import { cn } from '@/lib/utils'
 import { fnoExchangeFor, type ScheduledOrder } from '@/types/hedging'
 import type { OptionChainResponse } from '@/types/option-chain'
 import type { Position } from '@/types/trading'
-import { cn } from '@/lib/utils'
-import { PANEL_HEADER, PanelShell } from './panelShell'
 import { showToast } from '@/utils/toast'
+import { PANEL_HEADER, PanelShell } from './panelShell'
 
 /** Polling cadences: chain, quotes, funds and the position/order books. */
 const CHAIN_POLL_MS = 5000
@@ -175,13 +174,26 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   const [quotes, setQuotes] = useState<Record<string, number>>({})
   const [funds, setFunds] = useState(0)
   const [positions, setPositions] = useState<Map<string, Position>>(new Map())
+  /**
+   * The session's P&L across every position the books report — the capital
+   * chip's +PnL / House / All bases fold it into the usable figure the way
+   * the hedging terminal does. Flattened rows are the realized half.
+   */
+  const [sessionPnl, setSessionPnl] = useState<{ day: number; realized: number }>({
+    day: 0,
+    realized: 0,
+  })
+  /** Whether any deployment has fired this session — the House basis reads it. */
+  const deployedOnceRef = useRef(false)
   const [orderKeys, setOrderKeys] = useState<Set<string>>(new Set())
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [scheduleOpen, setScheduleOpen] = useState(false)
   const [levelOpen, setLevelOpen] = useState(false)
   const [stockAddOpen, setStockAddOpen] = useState(false)
   const [stockQuery, setStockQuery] = useState('')
-  const [stockHits, setStockHits] = useState<Array<{ symbol: string; exchange: string; name?: string; lotsize?: number }>>([])
+  const [stockHits, setStockHits] = useState<
+    Array<{ symbol: string; exchange: string; name?: string; lotsize?: number }>
+  >([])
   const [stockSearching, setStockSearching] = useState(false)
   const stockRequestId = useRef(0)
 
@@ -249,7 +261,11 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
 
   /* ── session capital: the title chip's popbox ─────────────────────────── */
   const saveCapital = useCallback(
-    (patch: Partial<Pick<DeployBook, 'capitalSource' | 'capitalFixed' | 'capitalPercent'>>) => {
+    (
+      patch: Partial<
+        Pick<DeployBook, 'capitalSource' | 'capitalFixed' | 'capitalPercent' | 'capitalBasis'>
+      >
+    ) => {
       setState((previous) => {
         const next: DeployBook = { ...previous, ...patch }
         writeDeployState(next)
@@ -303,7 +319,13 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   const loadChain = useCallback(async () => {
     if (!underlying || !expiry) return
     try {
-      const res = await optionChainApi.getOptionChain(apiKey, underlying, optionsExchange, expiry, 50)
+      const res = await optionChainApi.getOptionChain(
+        apiKey,
+        underlying,
+        optionsExchange,
+        expiry,
+        50
+      )
       if (res.status === 'success') setChain(res)
     } catch {
       // the next poll retries; the quote-driven picks keep working meanwhile
@@ -439,10 +461,17 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
       ])
       if (!alive) return
       if (posRes.status === 'fulfilled' && posRes.value.status === 'success') {
+        const rows = posRes.value.data ?? []
+        let day = 0
+        let realized = 0
         const map = new Map<string, Position>()
-        for (const position of posRes.value.data ?? []) {
+        for (const position of rows) {
+          const pnl = Number(position.pnl) || 0
+          day += pnl
+          if (Number(position.quantity) === 0) realized += pnl
           if (position.quantity !== 0) map.set(`${position.exchange}:${position.symbol}`, position)
         }
+        setSessionPnl({ day, realized })
         setPositions(map)
       }
       if (ordRes.status === 'fulfilled' && ordRes.value.status === 'success') {
@@ -477,7 +506,9 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
 
   // The ATM lands from the chain when it can and from the live quote when it
   // cannot — the picks work either way, the hedging terminal's way.
-  const atm = chain?.atm_strike || (underlyingLtp && interval ? Math.round(underlyingLtp / interval) * interval : null)
+  const atm =
+    chain?.atm_strike ||
+    (underlyingLtp && interval ? Math.round(underlyingLtp / interval) * interval : null)
 
   const ltpOf = useCallback(
     (row: DeployRow) => quotes[row.symbol] ?? chainLtp(chain, row.symbol),
@@ -485,8 +516,20 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   )
   /** The session capital the weight shares divide — the chip's number. */
   const usable = useMemo(
-    () => usableSessionCapital(state, funds),
-    [state.capitalSource, state.capitalFixed, state.capitalPercent, funds]
+    () =>
+      usableSessionCapital(state, funds, {
+        dayPnl: sessionPnl.day,
+        realizedPnl: sessionPnl.realized,
+        deployedOnce: deployedOnceRef.current,
+      }),
+    [
+      state.capitalSource,
+      state.capitalFixed,
+      state.capitalPercent,
+      state.capitalBasis,
+      funds,
+      sessionPnl,
+    ]
   )
   const sizing = useMemo(() => ({ capital: usable, ltpOf }), [usable, ltpOf])
 
@@ -570,7 +613,9 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
 
   /* ── firing ───────────────────────────────────────────────────────────── */
   const placeOrders = useCallback(
-    async (orders: Array<{ symbol: string; exchange: string; action: 'BUY' | 'SELL'; quantity: number }>) => {
+    async (
+      orders: Array<{ symbol: string; exchange: string; action: 'BUY' | 'SELL'; quantity: number }>
+    ) => {
       let placed = 0
       let failed = 0
       for (const order of orders) {
@@ -585,8 +630,10 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
             pricetype: state.pricetype,
             product: state.product,
           })
-          if (res.status === 'success') placed += 1
-          else failed += 1
+          if (res.status === 'success') {
+            placed += 1
+            deployedOnceRef.current = true
+          } else failed += 1
         } catch {
           failed += 1
         }
@@ -597,7 +644,8 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
   )
 
   const report = (label: string, placed: number, failed: number) => {
-    if (failed === 0) showToast.success(`${label}: ${placed} order${placed === 1 ? '' : 's'} placed`)
+    if (failed === 0)
+      showToast.success(`${label}: ${placed} order${placed === 1 ? '' : 's'} placed`)
     else if (placed === 0) showToast.error(`${label}: every order failed`)
     else showToast.warning(`${label}: ${placed} placed, ${failed} failed`)
   }
@@ -651,7 +699,9 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     async (from: 'CE' | 'PE') => {
       const orders = swapFireOrders(ladder, from, sizing)
       if (orders.length === 0) {
-        showToast.warning(`Swap ${from}→${from === 'CE' ? 'PE' : 'CE'}: no enabled rows on either side`)
+        showToast.warning(
+          `Swap ${from}→${from === 'CE' ? 'PE' : 'CE'}: no enabled rows on either side`
+        )
         return
       }
       const busyKey: BusyKey = from === 'CE' ? 'swapCE' : 'swapPE'
@@ -706,9 +756,13 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
       const hedging = loadHedgingState()
       saveHedgingState({ ...hedging, scheduled: [...hedging.scheduled, row] })
       if (miss === 'missed') {
-        showToast.warning(`${row.trigger.kind === 'time' ? row.trigger.at : 'That level'} has already passed — nothing scheduled.`)
+        showToast.warning(
+          `${row.trigger.kind === 'time' ? row.trigger.at : 'That level'} has already passed — nothing scheduled.`
+        )
       } else if (miss === 'daily') {
-        showToast.info(`${row.trigger.kind === 'time' ? row.trigger.at : 'The level'} runs at the next trading day's pass.`)
+        showToast.info(
+          `${row.trigger.kind === 'time' ? row.trigger.at : 'The level'} runs at the next trading day's pass.`
+        )
       } else {
         showToast.success(
           `${scheduleActionLabel(row.action, row.modeAtCreation, row.target)} scheduled — it fires this panel's ladder for ${underlying}.`
@@ -740,7 +794,11 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
       }
       const deploy = buildDeployPlan({ plan, picked: resolved.picked, spot, optionsExchange })
       if (levelEntryMet(plan, chain.underlying_ltp)) {
-        setBusy((previous) => ({ ...previous, deployCE: plan.side === 'CE', deployPE: plan.side === 'PE' }))
+        setBusy((previous) => ({
+          ...previous,
+          deployCE: plan.side === 'CE',
+          deployPE: plan.side === 'PE',
+        }))
         const { placed, failed } = await placeLevelOrders({
           apiKey,
           picked: resolved.picked,
@@ -788,7 +846,19 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
         `Set: ${plan.optionAction} ${plan.side} ×${deploy.strikes.length} when ${spot.symbol} ${crosses.target === 'above' ? '≥' : '≤'} ${(plan.entry as number).toLocaleString('en-IN')}. It fires this panel's ladder.`
       )
     },
-    [chain, underlying, ladder, interval, optionsExchange, patchRows, spot, apiKey, state.lots, state.product, state.pricetype]
+    [
+      chain,
+      underlying,
+      ladder,
+      interval,
+      optionsExchange,
+      patchRows,
+      spot,
+      apiKey,
+      state.lots,
+      state.product,
+      state.pricetype,
+    ]
   )
 
   /* ── row editing ─────────────────────────────────────────────────────── */
@@ -799,7 +869,10 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
         return
       }
       const rows = ladder[where === 'CE' ? 'ce' : 'pe']
-      patchRows(where, rows.map((row) => (row.symbol === symbol ? patch(row) : row)))
+      patchRows(
+        where,
+        rows.map((row) => (row.symbol === symbol ? patch(row) : row))
+      )
     },
     [state.stocks, ladder, patchRows, patchStocks]
   )
@@ -810,7 +883,10 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
         patchStocks(state.stocks.filter((row) => row.symbol !== symbol))
         return
       }
-      patchRows(where, ladder[where === 'CE' ? 'ce' : 'pe'].filter((row) => row.symbol !== symbol))
+      patchRows(
+        where,
+        ladder[where === 'CE' ? 'ce' : 'pe'].filter((row) => row.symbol !== symbol)
+      )
     },
     [state.stocks, ladder, patchRows, patchStocks]
   )
@@ -841,7 +917,14 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
     [state.stocks, ladder, positions, placeOrders]
   )
 
-  const btn = (busyKey: BusyKey, label: string, tone: 'green' | 'red' | 'amber' | 'sky', onClick: () => void, title?: string, disabled?: boolean) => (
+  const btn = (
+    busyKey: BusyKey,
+    label: string,
+    tone: 'green' | 'red' | 'amber' | 'sky',
+    onClick: () => void,
+    title?: string,
+    disabled?: boolean
+  ) => (
     <Button
       size="sm"
       disabled={busy[busyKey] || disabled}
@@ -914,9 +997,12 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
             source={state.capitalSource}
             fixed={state.capitalFixed}
             percent={state.capitalPercent}
+            basis={state.capitalBasis}
+            pnl={sessionPnl.day}
             onSource={(source) => saveCapital({ capitalSource: source })}
             onFixed={(value) => saveCapital({ capitalFixed: value })}
             onPercent={(value) => saveCapital({ capitalPercent: value })}
+            onBasis={(capitalBasis) => saveCapital({ capitalBasis })}
           />
         </div>
         {optionsMode && (
@@ -1059,10 +1145,14 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                   if (!row) return
                   const qty = rowQtyOf(row, sizing)
                   if (qty <= 0) {
-                    showToast.warning('Nothing to place at the current size — set the percent or manual lots first.')
+                    showToast.warning(
+                      'Nothing to place at the current size — set the percent or manual lots first.'
+                    )
                     return
                   }
-                  void placeOrders([{ symbol: row.symbol, exchange: row.exchange, action, quantity: qty }])
+                  void placeOrders([
+                    { symbol: row.symbol, exchange: row.exchange, action, quantity: qty },
+                  ])
                 }}
                 onExit={(symbol) => {
                   const row = ladder.ce.find((r) => r.symbol === symbol)
@@ -1072,9 +1162,13 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                     showToast.warning('Exit: nothing to sell at the current size')
                     return
                   }
-                  void placeOrders([{ symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty }])
+                  void placeOrders([
+                    { symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty },
+                  ])
                 }}
-                onChart={(row) => onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })}
+                onChart={(row) =>
+                  onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })
+                }
                 onQuit={(symbol) => quitRow('CE', symbol)}
                 onDepth={(symbol) => {
                   const row = ladder.ce.find((r) => r.symbol === symbol)
@@ -1118,10 +1212,14 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                   if (!row) return
                   const qty = rowQtyOf(row, sizing)
                   if (qty <= 0) {
-                    showToast.warning('Nothing to place at the current size — set the percent or manual lots first.')
+                    showToast.warning(
+                      'Nothing to place at the current size — set the percent or manual lots first.'
+                    )
                     return
                   }
-                  void placeOrders([{ symbol: row.symbol, exchange: row.exchange, action, quantity: qty }])
+                  void placeOrders([
+                    { symbol: row.symbol, exchange: row.exchange, action, quantity: qty },
+                  ])
                 }}
                 onExit={(symbol) => {
                   const row = ladder.pe.find((r) => r.symbol === symbol)
@@ -1131,9 +1229,13 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                     showToast.warning('Exit: nothing to sell at the current size')
                     return
                   }
-                  void placeOrders([{ symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty }])
+                  void placeOrders([
+                    { symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty },
+                  ])
                 }}
-                onChart={(row) => onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })}
+                onChart={(row) =>
+                  onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })
+                }
                 onQuit={(symbol) => quitRow('PE', symbol)}
                 onDepth={(symbol) => {
                   const row = ladder.pe.find((r) => r.symbol === symbol)
@@ -1162,8 +1264,14 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                 inChart={charted?.symbol === row.symbol}
                 hasPosition={positions.has(`${row.exchange}:${row.symbol}`)}
                 hasOrder={orderKeys.has(`${row.exchange}:${row.symbol}`)}
-                targetHit={row.target != null && ltpOf(row) != null && (ltpOf(row) as number) >= row.target}
-                stopHit={row.stoploss != null && ltpOf(row) != null && (ltpOf(row) as number) <= row.stoploss}
+                targetHit={
+                  row.target != null && ltpOf(row) != null && (ltpOf(row) as number) >= row.target
+                }
+                stopHit={
+                  row.stoploss != null &&
+                  ltpOf(row) != null &&
+                  (ltpOf(row) as number) <= row.stoploss
+                }
                 collapsed={collapsed.has(row.symbol)}
                 onToggleCollapse={() =>
                   setCollapsed((previous) => {
@@ -1174,9 +1282,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                   })
                 }
                 onToggle={() => patchStocks(toggleSideRow(state.stocks, row.symbol))}
-                onWeight={(value) =>
-                  patchStocks(slideSideWeight(state.stocks, row.symbol, value))
-                }
+                onWeight={(value) => patchStocks(slideSideWeight(state.stocks, row.symbol, value))}
                 onLevels={(levels) => updateRow('EQ', row.symbol, (r) => ({ ...r, ...levels }))}
                 onRemove={() => removeRow('EQ', row.symbol)}
                 onFire={(action) => {
@@ -1199,7 +1305,9 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
                     { symbol: row.symbol, exchange: row.exchange, action: 'SELL', quantity: qty },
                   ])
                 }}
-                onChart={() => onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })}
+                onChart={() =>
+                  onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })
+                }
                 onQuit={() => quitRow('EQ', row.symbol)}
                 onDepth={() => openDepthTab({ symbol: row.symbol, exchange: row.exchange })}
               />
@@ -1228,18 +1336,55 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
         )}
         {optionsMode ? (
           <div className="flex items-center gap-1">
-            {btn('deployCE', 'Deploy CE', 'green', () => void fire('BUY', 'CE', 'deployCE', 'Deploy CE'))}
-            {btn('deployPE', 'Deploy PE', 'green', () => void fire('BUY', 'PE', 'deployPE', 'Deploy PE'))}
-            {btn('closeCE', 'Close CE', 'red', () => void fire('SELL', 'CE', 'closeCE', 'Close CE'))}
-            {btn('closePE', 'Close PE', 'red', () => void fire('SELL', 'PE', 'closePE', 'Close PE'))}
-            {btn('swapCE', 'CE→PE', 'sky', () => void runSwap('CE'), 'Swap: close the CE rows, buy the PE rows')}
-            {btn('swapPE', 'PE→CE', 'sky', () => void runSwap('PE'), 'Swap: close the PE rows, buy the CE rows')}
+            {btn(
+              'deployCE',
+              'Deploy CE',
+              'green',
+              () => void fire('BUY', 'CE', 'deployCE', 'Deploy CE')
+            )}
+            {btn(
+              'deployPE',
+              'Deploy PE',
+              'green',
+              () => void fire('BUY', 'PE', 'deployPE', 'Deploy PE')
+            )}
+            {btn(
+              'closeCE',
+              'Close CE',
+              'red',
+              () => void fire('SELL', 'CE', 'closeCE', 'Close CE')
+            )}
+            {btn(
+              'closePE',
+              'Close PE',
+              'red',
+              () => void fire('SELL', 'PE', 'closePE', 'Close PE')
+            )}
+            {btn(
+              'swapCE',
+              'CE→PE',
+              'sky',
+              () => void runSwap('CE'),
+              'Swap: close the CE rows, buy the PE rows'
+            )}
+            {btn(
+              'swapPE',
+              'PE→CE',
+              'sky',
+              () => void runSwap('PE'),
+              'Swap: close the PE rows, buy the CE rows'
+            )}
             {btn('exitAll', 'Exit All', 'amber', () => void exitAll())}
           </div>
         ) : (
           <div className="flex items-center gap-1">
             {btn('buyAll', 'Buy All', 'green', () => void fireStocks('BUY', 'buyAll', 'Buy All'))}
-            {btn('sellAll', 'Sell All', 'red', () => void fireStocks('SELL', 'sellAll', 'Sell All'))}
+            {btn(
+              'sellAll',
+              'Sell All',
+              'red',
+              () => void fireStocks('SELL', 'sellAll', 'Sell All')
+            )}
             {btn('exitAll', 'Exit All', 'amber', () => void exitAll())}
           </div>
         )}
@@ -1274,11 +1419,14 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
             className="ml-auto flex items-baseline gap-1 font-mono text-[10px] tabular-nums text-muted-foreground"
             title="Available capital the percent shares divide"
           >
-            <span className="text-[9px] font-semibold uppercase">Avail</span>
-            ₹{funds.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+            <span className="text-[9px] font-semibold uppercase">Avail</span>₹
+            {funds.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
           </span>
           {optionsMode && (
-            <span className="flex items-center gap-0.5" title="Lots per row when a row has no manual lots">
+            <span
+              className="flex items-center gap-0.5"
+              title="Lots per row when a row has no manual lots"
+            >
               <Input
                 type="number"
                 min={1}
@@ -1294,7 +1442,9 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
           )}
           <Select
             value={state.product}
-            onValueChange={(product) => save({ ...state, product: product as DeployBook['product'] })}
+            onValueChange={(product) =>
+              save({ ...state, product: product as DeployBook['product'] })
+            }
           >
             <SelectTrigger className="h-5 w-[58px] px-1 text-[10px]">
               <SelectValue />
@@ -1338,9 +1488,7 @@ export function DeployPanel({ apiKey, getChartContext, chartRevision, onPick }: 
         defaultSymbol={spot ?? undefined}
         spotSymbol={spot}
         actsOn={
-          underlying
-            ? { options: `${underlying} deploy ladder`, stock: underlying }
-            : undefined
+          underlying ? { options: `${underlying} deploy ladder`, stock: underlying } : undefined
         }
         allowStockTarget={false}
         onOpenChange={setScheduleOpen}
@@ -1389,11 +1537,7 @@ function rowPnl(
  * is ITM (and the at-the-money strike itself reads OTM). Steps carry their
  * distance — "OTM 3" is three strikes past the money on that side.
  */
-function sideOffsetLabel(
-  row: DeployRow,
-  atm: number | null,
-  interval: number
-): string | null {
+function sideOffsetLabel(row: DeployRow, atm: number | null, interval: number): string | null {
   if (row.kind !== 'option' || atm == null || !interval) return null
   const off = Math.round((row.strike - atm) / interval)
   if (row.optionType === 'CE') {
@@ -1448,7 +1592,9 @@ function SidePane(props: {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 items-center gap-1 border-b bg-muted/20 px-1.5 py-0.5 text-[9px] text-muted-foreground">
-        <span className={cn('font-semibold', props.side === 'CE' ? 'text-emerald-600' : 'text-red-600')}>
+        <span
+          className={cn('font-semibold', props.side === 'CE' ? 'text-emerald-600' : 'text-red-600')}
+        >
           {props.side === 'CE' ? 'CALLS' : 'PUTS'}
         </span>
         {props.atm != null && <span className="font-mono">ATM {props.atm}</span>}
@@ -1456,7 +1602,10 @@ function SidePane(props: {
           Σ {Math.round(weightSum * 10) / 10}%
         </span>
         {constructed > 0 && (
-          <span className="ml-auto truncate" title="Rows still on the OpenAlgo symbol convention — the chain snapshot swaps in the exact listed symbols when it lands">
+          <span
+            className="ml-auto truncate"
+            title="Rows still on the OpenAlgo symbol convention — the chain snapshot swaps in the exact listed symbols when it lands"
+          >
             {constructed} resolving…
           </span>
         )}
@@ -1472,7 +1621,10 @@ function SidePane(props: {
             key={row.symbol}
             row={row}
             ltp={ltpOfRow(row)}
-            accent={strikeAccent(props.side, props.atm != null && props.interval ? (row.strike - props.atm) / props.interval : null)}
+            accent={strikeAccent(
+              props.side,
+              props.atm != null && props.interval ? (row.strike - props.atm) / props.interval : null
+            )}
             offsetLabel={sideOffsetLabel(row, props.atm, props.interval)}
             capital={props.capital}
             pnl={rowPnl(row, props.positions, sizing)}
@@ -1480,7 +1632,9 @@ function SidePane(props: {
             hasPosition={props.positions.has(`${row.exchange}:${row.symbol}`)}
             hasOrder={props.orderKeys.has(`${row.exchange}:${row.symbol}`)}
             targetHit={row.target != null && ltpOfRow(row) != null && ltpOfRow(row)! >= row.target}
-            stopHit={row.stoploss != null && ltpOfRow(row) != null && ltpOfRow(row)! <= row.stoploss}
+            stopHit={
+              row.stoploss != null && ltpOfRow(row) != null && ltpOfRow(row)! <= row.stoploss
+            }
             collapsed={props.collapsed.has(row.symbol)}
             onToggleCollapse={() => props.onToggleCollapse(row.symbol)}
             onToggle={() => props.onToggle(row.symbol)}
@@ -1667,11 +1821,26 @@ const fmtChipMoney = (value: number): string =>
 
 /**
  * The hedging page's Session capital chip, sized for the panel's title:
- * the usable figure on the button, and inside the popbox the two sources —
- * a fixed rupee amount clamped to cash, or a percent of cash on a slider.
- * The choice persists in the deploy book, so a reload keeps the trader's
- * capital exactly as they left it.
+ * the usable figure on the button, and inside the popbox the same two
+ * controls the hedging chip carries — the four-mode basis ladder (Initial /
+ * +PnL / House / All) over the source (a fixed rupee amount clamped to cash,
+ * or a percent of cash). The choice persists in the deploy book, so a
+ * reload keeps the trader's capital exactly as they left it.
  */
+const BASIS_LABEL: Record<DeployCapitalBasis, string> = {
+  initial: 'Initial',
+  withPnl: '+PnL',
+  house: 'House',
+  available: 'All',
+}
+
+const BASIS_HINT: Record<DeployCapitalBasis, string> = {
+  initial: 'The allocation alone — losses shrink it, profit never adds back.',
+  withPnl: 'The allocation plus the session P&L — a winning session compounds.',
+  house: 'After the first deployment only realized profit works — house money.',
+  available: 'No lock: all available cash plus the session P&L works.',
+}
+
 function CapitalChip(props: {
   /** Available cash from the funds snapshot. */
   cash: number
@@ -1680,9 +1849,14 @@ function CapitalChip(props: {
   source: DeployCapitalSource
   fixed: number
   percent: number
+  /** The usable-capital basis (the hedging chip's four-mode ladder). */
+  basis: DeployCapitalBasis
+  /** The session's day P&L, shown beside the ladder. */
+  pnl: number
   onSource(source: DeployCapitalSource): void
   onFixed(value: number): void
   onPercent(value: number): void
+  onBasis(basis: DeployCapitalBasis): void
 }) {
   const overCash = props.source === 'fixed' && props.cash > 0 && props.fixed > props.cash
   return (
@@ -1695,6 +1869,9 @@ function CapitalChip(props: {
         >
           <Wallet className="h-3 w-3" />
           Cap <span className="font-mono tabular-nums">₹{fmtChipMoney(props.usable)}</span>
+          <Badge variant="secondary" className="px-1 py-0 text-[8px]">
+            {BASIS_LABEL[props.basis]}
+          </Badge>
           {props.source === 'percent' && (
             <Badge variant="secondary" className="px-1 py-0 text-[8px]">
               {props.percent}%
@@ -1704,6 +1881,30 @@ function CapitalChip(props: {
       </PopoverTrigger>
       <PopoverContent className="w-64 p-3" align="end">
         <p className="mb-2 text-[11px] font-semibold">Session capital</p>
+        {/* Basis: the hedging chip's four-mode ladder */}
+        <div className="mb-1 flex gap-1">
+          {(Object.keys(BASIS_LABEL) as DeployCapitalBasis[]).map((basis) => (
+            <Button
+              key={basis}
+              size="sm"
+              variant={props.basis === basis ? 'default' : 'outline'}
+              className="h-6 flex-1 px-1 text-[9px]"
+              onClick={() => props.onBasis(basis)}
+            >
+              {BASIS_LABEL[basis]}
+            </Button>
+          ))}
+        </div>
+        <p className="mb-2 text-[10px] leading-4 text-muted-foreground">
+          {BASIS_HINT[props.basis]}
+          {props.pnl !== 0 && (
+            <span
+              className={cn('ml-1 font-mono', props.pnl > 0 ? 'text-emerald-600' : 'text-red-600')}
+            >
+              ({props.pnl >= 0 ? '+' : '−'}₹{fmtChipMoney(Math.abs(props.pnl))} P&L)
+            </span>
+          )}
+        </p>
         <div className="mb-2 flex gap-1">
           <Button
             size="sm"
@@ -1762,8 +1963,7 @@ function CapitalChip(props: {
           </label>
         )}
         <p className="mt-2 border-t pt-2 text-[11px]">
-          Usable{' '}
-          <span className="font-mono font-semibold">₹{fmtChipMoney(props.usable)}</span>
+          Usable <span className="font-mono font-semibold">₹{fmtChipMoney(props.usable)}</span>
         </p>
         <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
           Each side's enabled rows split the usable capital by their % weights — the sliders keep

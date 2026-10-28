@@ -18,6 +18,13 @@ describe('clampedBase', () => {
   it('floors negative allocations at zero', () => {
     expect(clampedBase(-5_000, 100_000)).toBe(0)
   })
+
+  it("coerces the funds endpoint's string cash — a string used to clamp every basis to zero", () => {
+    // The broker layer answers "availablecash": "123456.00" (2-dp strings);
+    // Number.isFinite on a string is false, which read as no cash at all.
+    expect(clampedBase(75_000, '123456.00' as unknown as number)).toBe(75_000)
+    expect(clampedBase(200_000, '123456.00' as unknown as number)).toBe(123_456)
+  })
 })
 
 describe('usableCapital — initial basis', () => {
@@ -111,12 +118,20 @@ describe('the available basis — the whole account, no allocation lock', () => 
 
   it('ignores the allocated amount entirely — nothing is locked', () => {
     expect(
-      usableCapital('available', { base: 10_000, cash: 100_000, dayPnl: 0, realizedPnl: 0, deployedOnce: false })
+      usableCapital('available', {
+        base: 10_000,
+        cash: 100_000,
+        dayPnl: 0,
+        realizedPnl: 0,
+        deployedOnce: false,
+      })
     ).toBe(100_000)
   })
 
   it('a losing session shrinks what can deploy, never below zero', () => {
-    expect(usableCapital('available', { ...base, dayPnl: -40_000, realizedPnl: -40_000 })).toBe(60_000)
+    expect(usableCapital('available', { ...base, dayPnl: -40_000, realizedPnl: -40_000 })).toBe(
+      60_000
+    )
     expect(usableCapital('available', { ...base, dayPnl: -150_000, realizedPnl: -150_000 })).toBe(0)
   })
 
@@ -124,5 +139,26 @@ describe('the available basis — the whole account, no allocation lock', () => 
     expect(
       usableCapital('available', { ...base, cash: Number.NaN, dayPnl: 5_000, realizedPnl: 5_000 })
     ).toBe(5_000)
+  })
+
+  it('string cash from the funds endpoint works the same as a number', () => {
+    expect(
+      usableCapital('available', {
+        ...base,
+        cash: '100000.00' as unknown as number,
+        dayPnl: 9_000,
+        realizedPnl: 6_500,
+      })
+    ).toBe(109_000)
+    // And the allocation bases clamp against it instead of zeroing out —
+    // the "Usable ₹0 whatever the mode" report.
+    expect(
+      usableCapital('initial', {
+        ...base,
+        cash: '100000.00' as unknown as number,
+        dayPnl: 0,
+        realizedPnl: 0,
+      })
+    ).toBe(75_000)
   })
 })

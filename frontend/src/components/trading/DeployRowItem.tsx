@@ -32,7 +32,7 @@ import {
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { autoLots, rowRequired, type DeployRow } from '@/lib/trading/deployPlan'
+import { autoLots, type DeployRow, rowRequired } from '@/lib/trading/deployPlan'
 import { cn } from '@/lib/utils'
 
 const fmtINR = (value: number): string => {
@@ -135,7 +135,9 @@ export function DeployRowItem(props: Props) {
       }
       data-symbol={row.symbol}
     >
-      {/* Line 1: identity + price + pnl + row actions */}
+      {/* Line 1: identity + price + pnl + row actions. One compact token per
+          row: `22800 CE OTM1 0.05/₹3` — strike, side, moneyness, the live
+          price over the rupees one lot (or one share) carries. */}
       <div className="flex items-center gap-1">
         <input
           type="checkbox"
@@ -145,49 +147,43 @@ export function DeployRowItem(props: Props) {
           aria-label={`Enable ${row.symbol}`}
         />
         <span
-          className="flex min-w-0 shrink-0 items-baseline gap-0.5 font-mono text-[11px] font-semibold tabular-nums"
-          title={row.symbol}
+          className="flex min-w-0 flex-1 items-baseline gap-1 overflow-hidden whitespace-nowrap font-mono text-[11px] font-semibold tabular-nums"
+          title={
+            ltp != null
+              ? `${row.symbol} — one ${row.lotSize > 1 ? `lot (${row.lotSize})` : 'share'} ≈ ₹${Math.round(
+                  ltp * row.lotSize
+                ).toLocaleString('en-IN')}`
+              : row.symbol
+          }
         >
           {row.kind === 'option' ? (
             <>
-              {row.strike}
-              <span className={row.optionType === 'CE' ? 'text-emerald-600' : 'text-red-600'}>
+              <span className="shrink-0">{row.strike}</span>
+              <span
+                className={cn(
+                  'shrink-0',
+                  row.optionType === 'CE' ? 'text-emerald-600' : 'text-red-600'
+                )}
+              >
                 {row.optionType}
               </span>
+              {props.offsetLabel && (
+                <span className="shrink-0 text-[9px] font-semibold text-muted-foreground">
+                  {props.offsetLabel.replace(' ', '')}
+                </span>
+              )}
             </>
           ) : (
-            <span className="max-w-[86px] truncate">{row.name || row.symbol}</span>
+            <span className="max-w-[86px] shrink-0 truncate">{row.name || row.symbol}</span>
           )}
-        </span>
-        {props.offsetLabel && (
-          <span
-            className="shrink-0 rounded bg-muted px-1 text-[8px] font-semibold text-muted-foreground"
-            title="Moneyness — ITM: in the money, OTM: out of the money. The at-the-money strike reads ITM on calls, OTM on puts."
-          >
-            {props.offsetLabel}
-          </span>
-        )}
-        <span
-          className={cn(
-            'w-[52px] shrink-0 text-right font-mono text-[11px] tabular-nums',
-            ltp == null && 'text-muted-foreground'
+          {ltp != null && (
+            <span className="shrink-0">
+              {ltp.toFixed(2)}
+              <span className="font-normal text-muted-foreground">
+                /₹{Math.round(ltp * row.lotSize).toLocaleString('en-IN')}
+              </span>
+            </span>
           )}
-        >
-          {ltp != null ? ltp.toFixed(2) : '—'}
-        </span>
-        <span
-          className="w-[62px] shrink-0 text-right font-mono text-[9px] tabular-nums text-muted-foreground"
-          title={
-            ltp != null
-              ? `One ${row.lotSize > 1 ? `lot (${row.lotSize})` : 'share'} at this price`
-              : 'One lot / one share at the live price'
-          }
-        >
-          {ltp != null
-            ? `1 ${row.lotSize > 1 ? 'lot' : 'sh'} ₹${Math.round(ltp * row.lotSize).toLocaleString(
-                'en-IN'
-              )}`
-            : '—'}
         </span>
         <span
           className={cn(
@@ -295,7 +291,9 @@ export function DeployRowItem(props: Props) {
           >
             {qty > 0 ? (
               <>
-                {row.lotSize > 1 ? `${qty / row.lotSize} lot${qty / row.lotSize === 1 ? '' : 's'}` : `${qty} sh`}
+                {row.lotSize > 1
+                  ? `${qty / row.lotSize} lot${qty / row.lotSize === 1 ? '' : 's'}`
+                  : `${qty} sh`}
                 <span className="ml-1 text-[9px] text-muted-foreground">({qty})</span>
               </>
             ) : (
@@ -359,19 +357,25 @@ export function DeployRowItem(props: Props) {
           <NumField
             label="Entry"
             value={row.entry}
-            onCommit={(entry) => props.onLevels({ entry, target: row.target, stoploss: row.stoploss })}
+            onCommit={(entry) =>
+              props.onLevels({ entry, target: row.target, stoploss: row.stoploss })
+            }
           />
           <NumField
             label="Target"
             value={row.target}
             hit={props.targetHit}
-            onCommit={(target) => props.onLevels({ entry: row.entry, target, stoploss: row.stoploss })}
+            onCommit={(target) =>
+              props.onLevels({ entry: row.entry, target, stoploss: row.stoploss })
+            }
           />
           <NumField
             label="SL"
             value={row.stoploss}
             hit={props.stopHit}
-            onCommit={(stoploss) => props.onLevels({ entry: row.entry, target: row.target, stoploss })}
+            onCommit={(stoploss) =>
+              props.onLevels({ entry: row.entry, target: row.target, stoploss })
+            }
           />
           <Button
             size="sm"

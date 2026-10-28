@@ -1,28 +1,28 @@
 import { describe, expect, it } from 'vitest'
+import type { OptionChainResponse } from '@/types/option-chain'
 import {
+  autoLots,
   bookKey,
   chainLtp,
   constructedOptionSymbol,
   constructedRows,
   defaultDeployState,
-  equalSplitSide,
   ensureSideWeights,
+  equalSplitSide,
   firingRows,
   fnoBaseSymbol,
   hydrateDeployState,
   normalizeSideWeights,
   reconcileConstructed,
-  rowsFromStrikes,
   rowQty,
   rowRequired,
+  rowsFromStrikes,
   sideOfRow,
   slideSideWeight,
   stockRowFromSearch,
-  autoLots,
   toggleSideRow,
   usableSessionCapital,
 } from './deployPlan'
-import type { OptionChainResponse } from '@/types/option-chain'
 
 const chain = {
   atm_strike: 24500,
@@ -240,9 +240,7 @@ describe('the weight engine', () => {
     expect(enabled.find((r) => r.symbol === fresh.symbol)?.weight).toBeGreaterThan(0)
     // The rows that carried the side shrank but stay positive.
     expect(
-      enabled
-        .filter((r) => r.symbol !== fresh.symbol)
-        .every((r) => r.weight > 0 && r.weight < 50)
+      enabled.filter((r) => r.symbol !== fresh.symbol).every((r) => r.weight > 0 && r.weight < 50)
     ).toBe(true)
   })
 
@@ -288,6 +286,65 @@ describe('session capital', () => {
     expect(legacy.capitalSource).toBe('percent')
     expect(legacy.capitalPercent).toBe(100)
   })
+
+  it('the capital basis defaults to initial and round-trips', () => {
+    expect(defaultDeployState().capitalBasis).toBe('initial')
+    const state = defaultDeployState()
+    state.capitalBasis = 'available'
+    const back = hydrateDeployState(JSON.parse(JSON.stringify(state)))
+    expect(back.capitalBasis).toBe('available')
+    // A snapshot from before the ladder existed keeps the default.
+    expect(hydrateDeployState({ books: {}, stocks: [] }).capitalBasis).toBe('initial')
+  })
+
+  it('the +PnL basis folds the session P&L into the usable figure', () => {
+    const state = defaultDeployState()
+    state.capitalPercent = 50
+    state.capitalBasis = 'withPnl'
+    // Allocation alone: half of 200k cash.
+    expect(usableSessionCapital(state, 200000)).toBe(100000)
+    // +PnL: the session's 25k profit recycles in.
+    expect(
+      usableSessionCapital(state, 200000, { dayPnl: 25000, realizedPnl: 0, deployedOnce: false })
+    ).toBe(125000)
+    // A losing session shrinks it, never below zero.
+    expect(
+      usableSessionCapital(state, 200000, {
+        dayPnl: -150000,
+        realizedPnl: -150000,
+        deployedOnce: false,
+      })
+    ).toBe(0)
+  })
+
+  it('the house basis spends the allocation once, then only realized profit', () => {
+    const state = defaultDeployState()
+    state.capitalSource = 'fixed'
+    state.capitalFixed = 100000
+    state.capitalBasis = 'house'
+    expect(
+      usableSessionCapital(state, 200000, { dayPnl: 0, realizedPnl: 0, deployedOnce: false })
+    ).toBe(100000)
+    // After the first deployment only realized profit works.
+    expect(
+      usableSessionCapital(state, 200000, { dayPnl: 30000, realizedPnl: 30000, deployedOnce: true })
+    ).toBe(30000)
+    // A losing start means no further deployments.
+    expect(
+      usableSessionCapital(state, 200000, { dayPnl: -5000, realizedPnl: -5000, deployedOnce: true })
+    ).toBe(0)
+  })
+
+  it('the all basis reads the whole cash plus the session P&L, allocation aside', () => {
+    const state = defaultDeployState()
+    state.capitalSource = 'fixed'
+    state.capitalFixed = 50000
+    state.capitalBasis = 'available'
+    // The fixed allocation is no lock: the account's cash works, P&L on top.
+    expect(
+      usableSessionCapital(state, 250000, { dayPnl: 10000, realizedPnl: 4000, deployedOnce: true })
+    ).toBe(260000)
+  })
 })
 
 describe('fnoBaseSymbol', () => {
@@ -314,11 +371,16 @@ describe('constructed symbols', () => {
 
   it('constructedRows flags every row and keeps existing strikes', () => {
     const existing = rowsFromStrikes(chain, 'CE', [24500]).rows
-    const rows = constructedRows('CE', [24500, 24550], {
-      base: 'NIFTY',
-      expiry: '28OCT26',
-      exchange: 'NFO',
-    }, existing)
+    const rows = constructedRows(
+      'CE',
+      [24500, 24550],
+      {
+        base: 'NIFTY',
+        expiry: '28OCT26',
+        exchange: 'NFO',
+      },
+      existing
+    )
     expect(rows.map((r) => r.strike)).toEqual([24500, 24550])
     expect(rows[0].constructed).toBeFalsy()
     expect(rows[1].constructed).toBe(true)
@@ -326,7 +388,7 @@ describe('constructed symbols', () => {
     expect(rows[1].lotSize).toBe(75)
   })
 
-  it('reconcileConstructed promotes rows to the chain\'s exact listed symbols', () => {
+  it("reconcileConstructed promotes rows to the chain's exact listed symbols", () => {
     const existing = constructedRows('CE', [24400, 24700], {
       base: 'NIFTY',
       expiry: '28OCT26',
@@ -345,7 +407,12 @@ describe('constructed symbols', () => {
 
 describe('stock rows', () => {
   it('stockRowFromSearch carries the lot size and name', () => {
-    const row = stockRowFromSearch({ symbol: 'TCS', exchange: 'NSE', lotsize: 350, name: 'Tata Consultancy' })
+    const row = stockRowFromSearch({
+      symbol: 'TCS',
+      exchange: 'NSE',
+      lotsize: 350,
+      name: 'Tata Consultancy',
+    })
     expect(row.kind).toBe('stock')
     expect(row.lotSize).toBe(350)
     expect(row.name).toBe('Tata Consultancy')
@@ -368,7 +435,21 @@ describe('stock rows', () => {
 describe('v2 books hydrate forward', () => {
   it('rows saved before the rework gain the option kind and zero weights', () => {
     const back = hydrateDeployState({
-      books: { 'NFO:NIFTY': { ce: [{ symbol: 'NIFTY28OCT2624500CE', strike: 24500, optionType: 'CE', lotSize: 75, enabled: true, lots: 0 }], pe: [] } },
+      books: {
+        'NFO:NIFTY': {
+          ce: [
+            {
+              symbol: 'NIFTY28OCT2624500CE',
+              strike: 24500,
+              optionType: 'CE',
+              lotSize: 75,
+              enabled: true,
+              lots: 0,
+            },
+          ],
+          pe: [],
+        },
+      },
     })
     const row = back.books['NFO:NIFTY']?.ce[0]
     expect(row?.kind).toBe('option')
@@ -403,7 +484,9 @@ describe('the workspace binding', () => {
 })
 
 describe('rowRequired — the amount a row needs', () => {
-  const row = (over: Partial<Parameters<typeof rowRequired>[0]> = {}): Parameters<typeof rowRequired>[0] => ({
+  const row = (
+    over: Partial<Parameters<typeof rowRequired>[0]> = {}
+  ): Parameters<typeof rowRequired>[0] => ({
     symbol: 'NIFTY28OCT2624500CE',
     exchange: 'NFO',
     kind: 'option',

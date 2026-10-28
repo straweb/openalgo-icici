@@ -397,12 +397,14 @@ export function HedgingTopBar(props: Props) {
         <div className="hidden items-center gap-3 text-[11px] text-muted-foreground md:flex">
           <span title="Available cash">
             Cash{' '}
-            <span className="font-mono text-foreground">{fmtMoney(props.funds.availablecash)}</span>
+            <span className="font-mono text-foreground">
+              {fmtMoney(Number(props.funds.availablecash) || 0)}
+            </span>
           </span>
           <span title="Utilised">
             Used{' '}
             <span className="font-mono text-foreground">
-              {fmtMoney(props.funds.utiliseddebits)}
+              {fmtMoney(Number(props.funds.utiliseddebits) || 0)}
             </span>
           </span>
         </div>
@@ -413,7 +415,7 @@ export function HedgingTopBar(props: Props) {
         capitalPercent={props.capitalPercent}
         capitalBasis={props.capitalBasis}
         usable={props.usable}
-        cash={props.funds?.availablecash ?? 0}
+        cash={Number(props.funds?.availablecash) || 0}
         onCapitalChange={props.onCapitalChange}
         onCapitalSourceChange={props.onCapitalSourceChange}
         onCapitalPercentChange={props.onCapitalPercentChange}

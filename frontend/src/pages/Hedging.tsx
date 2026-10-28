@@ -35,6 +35,7 @@ import {
   sideOf,
 } from '@/lib/hedging/allocation'
 import { clampedBase, usableCapital } from '@/lib/hedging/capital'
+import { claimEngineLock, releaseEngineLock } from '@/lib/hedging/engineLock'
 import { levelCrosses, strikeMarkerLines, strikesForPick } from '@/lib/hedging/indexLevels'
 import {
   istSeconds,
@@ -44,7 +45,6 @@ import {
   isDue as scheduleIsDue,
   scheduleTriggerLabel,
 } from '@/lib/hedging/scheduler'
-import { claimEngineLock, releaseEngineLock } from '@/lib/hedging/engineLock'
 import {
   loadHedgingState,
   makeOptionRow,
@@ -443,8 +443,10 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
 
   // ── Derived capital + summaries ─────────────────────────────────────────
   // The allocation: a fixed amount (clamped to cash — an allocation larger
-  // than the account cannot exist) or a share of it.
-  const cash = funds?.availablecash ?? 0
+  // than the account cannot exist) or a share of it. The funds snapshot
+  // answers with strings ("123456.00"), so coerce before any arithmetic —
+  // a string here made every capital basis clamp to zero (Usable ₹0).
+  const cash = Number(funds?.availablecash ?? 0) || 0
   const baseCapital =
     state.capitalSource === 'percent'
       ? (cash * state.capitalPercent) / 100

@@ -1221,7 +1221,35 @@ export class TradingTerminal {
   private qtySlider: HTMLDivElement | null = null
   private qtyHoverOff: (() => void) | null = null
   private qtyHideTimer: number | null = null
+  /** True between pointerdown and pointerup on the range — a drag never hides it. */
+  private qtySliderDrag = false
   private capitalTimer: number | null = null
+  /**
+   * The one-click instant panel — the DOM twin of the canvas SELL·qty·BUY
+   * that fires a market order the moment it is pressed (NRML on the
+   * derivative segments, MIS on cash equity). Visible only while One-Click
+   * is armed and the toolbar toggle keeps it on.
+   */
+  private instantPanel: HTMLDivElement | null = null
+  private instantPanelOn = true
+  /** The classic canvas Buy/Sell panel's toggle (the toolbar hides either). */
+  private tradePanelOn = true
+  /**
+   * The open position's box, docked top-right: side, size, average, live
+   * P&L, an instant CLOSE, and the SL/TP levels the drag handles set.
+   */
+  private posBox: HTMLDivElement | null = null
+  /** This symbol's stop/target levels the drag handles move (persisted). */
+  private posLevels: { stop: number | null; target: number | null } = { stop: null, target: null }
+  /** The working orders those levels sent, so a re-drag modifies in place. */
+  private posLevelOrders: { stop: string | null; target: string | null } = {
+    stop: null,
+    target: null,
+  }
+  private posStopLine: PriceLine | null = null
+  private posTargetLine: PriceLine | null = null
+  /** Re-entrancy guard for the instant close. */
+  private closingPosition = false
   /** Available cash for the qty slider's lots estimate; 0 until funds land. */
   private capital = 0
   /** This chart's share of capital — per pane, default 25%. */
@@ -2235,6 +2263,9 @@ export class TradingTerminal {
       : null
     if (!this.position || !this.chart || this.position.net === 0) {
       this.position = this.position && this.position.net !== 0 ? this.position : null
+      // No open position: the drag handles go with it, the box hides itself.
+      this.renderPosLevelLines()
+      this.renderPosBox()
       return
     }
     this.posLine = this.chart.addPriceLine(
@@ -2252,6 +2283,8 @@ export class TradingTerminal {
       },
       0
     )
+    this.renderPosLevelLines()
+    this.renderPosBox()
   }
 
   private async pollBook() {
@@ -2279,6 +2312,14 @@ export class TradingTerminal {
           this.chart.removePrimitive(rec.line)
           this.orderLines.delete(id)
         }
+      // The SL/TP orders the drag handles sent: when one leaves the working
+      // book (filled, cancelled, rejected) its stored id goes with it, so the
+      // next drag of that handle places a fresh order instead of modifying
+      // one that no longer exists.
+      for (const role of ['stop', 'target'] as const) {
+        const oid = this.posLevelOrders[role]
+        if (oid && !seen.has(oid)) this.posLevelOrders[role] = null
+      }
     } catch {
       /* transient */
     }
@@ -2326,12 +2367,12 @@ export class TradingTerminal {
   }
 
   /**
-   * Lots (or shares) this chart's percent of the available capital buys at
-   * the live price — the same math the deploy panel's weight rows run,
-   * pointed at one chart and its own percent. Never below one lot: the
-   * slider's floor is "trade something", not zero.
+   * Lots (or shares) the given percent of the available capital buys at the
+   * live price — the same math the deploy panel's weight rows run, pointed
+   * at one chart and its own percent. The raw floor: the slider's readout
+   * shows what the percent really buys, even when that is nothing yet.
    */
-  private capitalLots(): number {
+  private capitalLotsAt(pct: number): number {
     const ltp =
       this.lastLtp != null
         ? this.lastLtp
@@ -2342,9 +2383,18 @@ export class TradingTerminal {
     const lotsize = this.sym?.lotsize && this.sym.lotsize > 0 ? this.sym.lotsize : 1
     const unit = this.sym?.lots ? ltp * lotsize : ltp
     if (unit <= 0) return 0
-    const budget = (this.capital * this.capitalPct) / 100
+    const budget = (this.capital * pct) / 100
     if (budget <= 0) return 0
-    return Math.max(1, Math.floor(budget / unit))
+    return Math.floor(budget / unit)
+  }
+
+  /**
+   * The quantity the slider sends: at least one lot — the floor is "trade
+   * something", not zero. The estimate the readout prints stays the raw
+   * floor above, so a percent too small for a lot reads honestly.
+   */
+  private capitalLots(): number {
+    return Math.max(1, this.capitalLotsAt(this.capitalPct))
   }
 
   /** Fetch the funds snapshot the lots estimate divides. */
@@ -2360,7 +2410,7 @@ export class TradingTerminal {
     this.refreshQtySliderText()
   }
 
-  /** The slider's two readouts: the percent and what it buys right now. */
+  /** The slider's readouts: the percent, what it buys now, and the 100% total. */
   private refreshQtySliderText(): void {
     const slider = this.qtySlider
     if (!slider) return
@@ -2368,16 +2418,20 @@ export class TradingTerminal {
     const lots = slider.querySelector('[data-lots]')
     if (pct) pct.textContent = `${this.capitalPct}%`
     if (lots) {
-      const n = this.capitalLots()
+      const n = this.capitalLotsAt(this.capitalPct)
+      const total = this.capitalLotsAt(100)
       const isLots = this.sym?.lots ?? false
-      lots.textContent =
-        n <= 0
-          ? this.capital > 0
-            ? '—'
-            : 'capital…'
-          : isLots
-            ? `≈ ${n} lot${n === 1 ? '' : 's'}`
-            : `≈ ${n} sh`
+      const unit = isLots ? 'lot' : 'sh'
+      if (this.capital <= 0) {
+        lots.textContent = 'capital…'
+      } else if (total <= 0) {
+        lots.textContent = '—'
+      } else {
+        // Both numbers, absolute: what this percent buys, and what the whole
+        // capital would. "≈ 1 lot · 12 @ 100%" — never a bare fraction.
+        const shown = Math.max(1, n)
+        lots.textContent = `≈ ${shown} ${unit}${shown === 1 ? '' : 's'} · ${total} @ 100%`
+      }
     }
   }
 
@@ -2386,6 +2440,11 @@ export class TradingTerminal {
    * qty chip. Hover is a hit-test on the container's pointer moves — the
    * chip is canvas-drawn by the engine and ships no DOM to listen to — and
    * the slider itself sits just below the panel, never over the plot.
+   *
+   * The hover zone is the chip OR the slider itself, and a drag on the range
+   * never hides it: the pointer travelling the gap between the two, or
+   * sliding the thumb, used to drop the slider mid-drag — the plot under
+   * the gap picked the gesture up instead.
    */
   private mountQtySlider(): void {
     if (!this.qtySlider) {
@@ -2394,7 +2453,7 @@ export class TradingTerminal {
       slider.style.cssText = [
         'position:absolute',
         `left:${TRADE_PANEL.x}px`,
-        `top:${Math.round(TRADE_PANEL.y + TRADE_PANEL.h * TRADE_PANEL.scale + 8)}px`,
+        `top:${this.qtySliderTop()}px`,
         'display:none',
         'z-index:40',
         'pointer-events:auto',
@@ -2428,6 +2487,27 @@ export class TradingTerminal {
         }
         this.refreshQtySliderText()
       })
+      // A press on the range claims the gesture: the slider stays up — and
+      // the plot never sees the drag — until the button comes back up.
+      range?.addEventListener('pointerdown', () => {
+        this.qtySliderDrag = true
+        if (this.qtyHideTimer != null) {
+          window.clearTimeout(this.qtyHideTimer)
+          this.qtyHideTimer = null
+        }
+      })
+      const releaseDrag = () => {
+        this.qtySliderDrag = false
+      }
+      range?.addEventListener('pointerup', releaseDrag)
+      range?.addEventListener('pointercancel', releaseDrag)
+      slider.addEventListener('pointerenter', () => {
+        if (this.qtyHideTimer != null) {
+          window.clearTimeout(this.qtyHideTimer)
+          this.qtyHideTimer = null
+        }
+      })
+      slider.addEventListener('pointerleave', () => this.scheduleQtySliderHide())
       this.qtySlider = slider
       // Hover hit-test over the chip; the hide is delayed so the pointer can
       // travel the few pixels down onto the slider without losing it.
@@ -2437,9 +2517,10 @@ export class TradingTerminal {
         const x = (e as PointerEvent).clientX - rect.left
         const y = (e as PointerEvent).clientY - rect.top
         const chip = this.qtyChipRect()
-        const over =
-          x >= chip.x && x <= chip.x + chip.w && y >= chip.y && y <= chip.y + chip.h
-        if (over) {
+        const overChip = x >= chip.x && x <= chip.x + chip.w && y >= chip.y && y <= chip.y + chip.h
+        const overSlider =
+          this.qtySlider.style.display !== 'none' && this.pointInElement(x, y, this.qtySlider)
+        if (overChip || overSlider) {
           if (this.qtyHideTimer != null) {
             window.clearTimeout(this.qtyHideTimer)
             this.qtyHideTimer = null
@@ -2453,14 +2534,7 @@ export class TradingTerminal {
           }
           this.refreshQtySliderText()
         } else if (this.qtySlider.style.display !== 'none' && this.qtyHideTimer == null) {
-          this.qtyHideTimer = window.setTimeout(() => {
-            if (this.qtySlider) this.qtySlider.style.display = 'none'
-            if (this.capitalTimer != null) {
-              window.clearInterval(this.capitalTimer)
-              this.capitalTimer = null
-            }
-            this.qtyHideTimer = null
-          }, 300)
+          this.scheduleQtySliderHide()
         }
       }
       this.container.addEventListener('pointermove', onMove)
@@ -2469,6 +2543,40 @@ export class TradingTerminal {
     const range = this.qtySlider.querySelector<HTMLInputElement>('[data-range]')
     if (range) range.value = String(this.capitalPct)
     this.refreshQtySliderText()
+  }
+
+  /** Where the slider parks: under the instant panel when it shows, else the panel. */
+  private qtySliderTop(): number {
+    const panelBottom = TRADE_PANEL.y + TRADE_PANEL.h * TRADE_PANEL.scale
+    if (this.instantPanel != null && this.instantPanel.style.display !== 'none') {
+      return Math.round(panelBottom + 38 + 8)
+    }
+    return Math.round(panelBottom + 8)
+  }
+
+  private pointInElement(x: number, y: number, el: HTMLElement): boolean {
+    const rect = el.getBoundingClientRect()
+    const base = this.container.getBoundingClientRect()
+    return (
+      x >= rect.left - base.left &&
+      x <= rect.right - base.left &&
+      y >= rect.top - base.top &&
+      y <= rect.bottom - base.top
+    )
+  }
+
+  /** The delayed hide the pointer's departure arms — a drag disarms it. */
+  private scheduleQtySliderHide(): void {
+    if (this.qtySliderDrag) return
+    if (this.qtyHideTimer != null) return
+    this.qtyHideTimer = window.setTimeout(() => {
+      if (this.qtySlider) this.qtySlider.style.display = 'none'
+      if (this.capitalTimer != null) {
+        window.clearInterval(this.capitalTimer)
+        this.capitalTimer = null
+      }
+      this.qtyHideTimer = null
+    }, 300)
   }
 
   private destroyQtySlider(): void {
@@ -2480,6 +2588,552 @@ export class TradingTerminal {
     this.capitalTimer = null
     this.qtySlider?.remove()
     this.qtySlider = null
+  }
+
+  /* ── the one-click instant panel + the open-position box ──────────────── */
+
+  /**
+   * The instant panel's product: the segment's carry default, not the
+   * toolbar's pick — the requirement is options carry (NRML) and equity
+   * intraday (MIS) with no trip through the product cycle first.
+   */
+  private instantProduct(): 'CNC' | 'NRML' | 'MIS' {
+    return DERIVATIVE_EXCHANGES.has(this.sym?.exchange ?? '') ? 'NRML' : 'MIS'
+  }
+
+  /**
+   * The DOM twin of the canvas SELL·qty·BUY panel, docked just below it:
+   * SELL at the bid, the shared quantity chip, BUY at the ask. A press fires
+   * a market order at once — the one-click requirement — with NRML riding
+   * the derivative segments and MIS the cash ones. It only exists while
+   * One-Click is armed and the toolbar toggle keeps it shown.
+   */
+  private mountInstantPanel(): void {
+    if (this.instantPanel) return
+    const panel = document.createElement('div')
+    panel.setAttribute('data-instant-panel', '1')
+    panel.style.cssText = [
+      'position:absolute',
+      `left:${TRADE_PANEL.x}px`,
+      `top:${Math.round(TRADE_PANEL.y + TRADE_PANEL.h * TRADE_PANEL.scale + 8)}px`,
+      'display:none',
+      'z-index:39',
+      'pointer-events:auto',
+      'background:var(--popover, #18181b)',
+      'color:var(--popover-foreground, #e4e4e7)',
+      'border:1px solid var(--border, #2e2e33)',
+      'border-radius:8px',
+      'padding:4px',
+      'box-shadow:0 6px 16px rgba(0,0,0,0.35)',
+      'white-space:nowrap',
+      'align-items:center',
+      'gap:3px',
+      'font:600 11px/1.2 ui-sans-serif, system-ui, sans-serif',
+    ].join(';')
+    panel.innerHTML =
+      '<button data-i-sell title="Instant SELL — market order, MIS on equity / NRML on options" ' +
+      'style="border:0;border-radius:6px;cursor:pointer;padding:5px 10px 3px;color:#fff;background:#ef5350;' +
+      'display:flex;flex-direction:column;align-items:center;line-height:1.1">SELL' +
+      '<span data-i-sellpx style="font-weight:400;font-size:9px;opacity:0.9"></span></button>' +
+      '<span data-i-qty title="Quantity — hover for the capital-percent slider" ' +
+      'style="min-width:34px;text-align:center;border-radius:6px;background:var(--muted,#27272a);' +
+      'padding:6px 4px;cursor:default;font-variant-numeric:tabular-nums"></span>' +
+      '<button data-i-buy title="Instant BUY — market order, MIS on equity / NRML on options" ' +
+      'style="border:0;border-radius:6px;cursor:pointer;padding:5px 10px 3px;color:#fff;background:#26a69a;' +
+      'display:flex;flex-direction:column;align-items:center;line-height:1.1">BUY' +
+      '<span data-i-buypx style="font-weight:400;font-size:9px;opacity:0.9"></span></button>' +
+      '<span data-i-tag title="One-Click instant order" ' +
+      'style="margin-left:2px;font-size:9px;color:var(--muted-foreground,#a1a1aa)">1-CLICK</span>'
+    const sellBtn = panel.querySelector<HTMLButtonElement>('[data-i-sell]')
+    const buyBtn = panel.querySelector<HTMLButtonElement>('[data-i-buy]')
+    sellBtn?.addEventListener('click', (e) => {
+      e.preventDefault()
+      void this.instantFire('SELL')
+    })
+    buyBtn?.addEventListener('click', (e) => {
+      e.preventDefault()
+      void this.instantFire('BUY')
+    })
+    // The instant chip shares the quantity: hovering it opens the same
+    // capital-percent slider, anchored under THIS panel.
+    const chip = panel.querySelector<HTMLElement>('[data-i-qty]')
+    chip?.addEventListener('pointerenter', () => {
+      if (!this.qtySlider || !this.sym) return
+      if (this.qtyHideTimer != null) {
+        window.clearTimeout(this.qtyHideTimer)
+        this.qtyHideTimer = null
+      }
+      this.qtySlider.style.top = `${this.qtySliderTop()}px`
+      this.qtySlider.style.display = 'flex'
+      void this.pollCapital()
+      if (this.capitalTimer == null)
+        this.capitalTimer = window.setInterval(() => void this.pollCapital(), 30000)
+      this.refreshQtySliderText()
+    })
+    chip?.addEventListener('pointerleave', () => this.scheduleQtySliderHide())
+    this.container.appendChild(panel)
+    this.instantPanel = panel
+    this.syncInstantPanel()
+  }
+
+  private destroyInstantPanel(): void {
+    this.instantPanel?.remove()
+    this.instantPanel = null
+  }
+
+  /** The instant panel exists only while its toggle is on and One-Click is armed. */
+  private syncInstantPanel(): void {
+    if (!this.instantPanel) return
+    const show = this.instantPanelOn && this.armed && !this.workspaceReplayLocked
+    this.instantPanel.style.display = show ? 'flex' : 'none'
+    if (show && this.qtySlider) this.qtySlider.style.top = `${this.qtySliderTop()}px`
+  }
+
+  /** Keep the instant panel's prices and quantity in step with the canvas panel. */
+  private instantPrices(bid: number | undefined, ask: number | undefined): void {
+    if (!this.instantPanel) return
+    const sellPx = this.instantPanel.querySelector('[data-i-sellpx]')
+    const buyPx = this.instantPanel.querySelector('[data-i-buypx]')
+    if (sellPx) sellPx.textContent = bid != null && bid > 0 ? this.fmt(bid) : ''
+    if (buyPx) buyPx.textContent = ask != null && ask > 0 ? this.fmt(ask) : ''
+  }
+
+  private syncInstantQty(): void {
+    if (!this.instantPanel) return
+    const chip = this.instantPanel.querySelector('[data-i-qty]')
+    if (chip) chip.textContent = this.qtyChip()
+  }
+
+  /**
+   * The instant panel's fire: the armed path's guards at toolbar-product
+   * independence — a market order right now, NRML on the derivative
+   * segments, MIS on cash equity.
+   */
+  private async instantFire(side: OrderSide): Promise<void> {
+    if (this.refuseWhileReplaying()) return
+    if (!this.sym || !this.trade) {
+      this.toast('search a symbol first')
+      return
+    }
+    if (this.sym.synthetic) {
+      this.toast(
+        `${this.sym.symbol} is a computed chart, not an instrument — there is nothing to trade`,
+        'err'
+      )
+      return
+    }
+    if (this.sym.quoteOnly) {
+      this.toast(`${this.sym.exchange} is quote-only — trading is not supported`, 'err')
+      return
+    }
+    if (!this.armed) {
+      this.toast('One-Click is off — turn it on in the toolbar to fire instantly', 'err')
+      return
+    }
+    const qty = this.orderQty()
+    if (this.sym.freezeQty > 1 && qty > this.sym.freezeQty) {
+      this.toast(`qty ${qty} exceeds the freeze limit ${this.sym.freezeQty} — reduce lots`, 'err')
+      return
+    }
+    const now = Date.now()
+    if (now - this.lastFireAt < ORDER_COOLDOWN_MS) return
+    this.lastFireAt = now
+    const product = this.instantProduct()
+    const lotTxt = this.sym.lots ? `${qty / this.sym.lotsize}L (${qty})` : qty
+    const summary = `BUY/SELL ${lotTxt} ${this.sym.symbol} · ${product}`.replace('BUY/SELL', side)
+    try {
+      const r = await this.trade.place({
+        symbol: this.sym.symbol,
+        exchange: this.sym.exchange,
+        side,
+        type: 'MARKET',
+        qty,
+        product,
+        mode: this.tradeMode(),
+      })
+      this.toast(`instant ${summary} (id ${r.orderId})`, 'ok')
+      this.pollBook()
+    } catch (e) {
+      this.toast(this.cleanError(e), 'err')
+    }
+  }
+
+  /* ── the open-position box (top-right) ─────────────────────────────────── */
+
+  private posLevelsKey(): string {
+    return this.sym ? `${this.sym.exchange}:${this.sym.symbol}` : ''
+  }
+
+  private loadPosLevels(): void {
+    this.posLevels = { stop: null, target: null }
+    this.posLevelOrders = { stop: null, target: null }
+    try {
+      const raw = globalThis.localStorage.getItem('oa-trading-poslevels')
+      if (!raw) return
+      const all = JSON.parse(raw) as Record<string, { stop?: unknown; target?: unknown }>
+      const mine = all[this.posLevelsKey()]
+      if (!mine || typeof mine !== 'object') return
+      const stop = Number(mine.stop)
+      const target = Number(mine.target)
+      this.posLevels = {
+        stop: Number.isFinite(stop) && stop > 0 ? stop : null,
+        target: Number.isFinite(target) && target > 0 ? target : null,
+      }
+    } catch {
+      /* a broken save is no save */
+    }
+  }
+
+  private savePosLevels(): void {
+    try {
+      const raw = globalThis.localStorage.getItem('oa-trading-poslevels')
+      let all: Record<string, { stop: number | null; target: number | null }> = {}
+      if (raw) all = JSON.parse(raw)
+      if (this.posLevels.stop == null && this.posLevels.target == null)
+        delete all[this.posLevelsKey()]
+      else all[this.posLevelsKey()] = { ...this.posLevels }
+      globalThis.localStorage.setItem('oa-trading-poslevels', JSON.stringify(all))
+    } catch {
+      /* storage refused: the levels live on for this session */
+    }
+  }
+
+  /** Build (once) and refresh the open-position box docked top-right. */
+  private renderPosBox(): void {
+    if (!this.sym || this.sym.quoteOnly) {
+      this.posBox?.remove()
+      this.posBox = null
+      return
+    }
+    if (!this.posBox) {
+      const box = document.createElement('div')
+      box.setAttribute('data-pos-box', '1')
+      box.style.cssText = [
+        'position:absolute',
+        'right:14px',
+        `top:${TRADE_PANEL.y}px`,
+        'display:none',
+        'z-index:38',
+        'pointer-events:auto',
+        'background:var(--popover, #18181b)',
+        'color:var(--popover-foreground, #e4e4e7)',
+        'border:1px solid var(--border, #2e2e33)',
+        'border-radius:8px',
+        'padding:6px 8px',
+        'box-shadow:0 6px 16px rgba(0,0,0,0.35)',
+        'font:500 11px/1.5 ui-sans-serif, system-ui, sans-serif',
+        'min-width:158px',
+      ].join(';')
+      box.innerHTML =
+        '<div data-p-head style="display:flex;align-items:center;gap:5px;font-weight:600">' +
+        '<span data-p-badge style="border-radius:4px;padding:1px 5px;font-size:9px;color:#fff"></span>' +
+        '<span data-p-qty style="font-variant-numeric:tabular-nums"></span>' +
+        '<span data-p-avg style="font-variant-numeric:tabular-nums;font-weight:400;opacity:0.8"></span>' +
+        '</div>' +
+        '<div data-p-pnl style="font-variant-numeric:tabular-nums;font-weight:600"></div>' +
+        '<div data-p-levels style="display:none;gap:3px;margin-top:3px;flex-wrap:wrap"></div>' +
+        '<button data-p-close title="Close this position now — market order, opposite side" ' +
+        'style="margin-top:4px;width:100%;border:0;border-radius:6px;cursor:pointer;' +
+        'padding:4px 0;color:#fff;background:#ef5350;font:600 10px/1.2 inherit">CLOSE</button>'
+      box.querySelector('[data-p-close]')?.addEventListener('click', (e) => {
+        e.preventDefault()
+        void this.closePositionNow()
+      })
+      this.container.appendChild(box)
+      this.posBox = box
+    }
+    const box = this.posBox
+    if (!this.position || this.position.net === 0) {
+      box.style.display = 'none'
+      return
+    }
+    const long = this.position.net > 0
+    const badge = box.querySelector('[data-p-badge]')
+    if (badge) {
+      badge.textContent = long ? 'LONG' : 'SHORT'
+      ;(badge as HTMLElement).style.background = long ? '#2e7d6b' : '#a14a52'
+    }
+    const qty = box.querySelector('[data-p-qty]')
+    if (qty) qty.textContent = `${Math.abs(this.position.net)}`
+    const avg = box.querySelector('[data-p-avg]')
+    if (avg) avg.textContent = `@ ${this.fmt(this.position.avg)}`
+    this.renderPosBoxPnl()
+    // The SL/TP levels the drag handles set — one chip each, with its own ✕.
+    const levels = box.querySelector('[data-p-levels]') as HTMLElement | null
+    if (levels) {
+      levels.innerHTML = ''
+      const rows: Array<{
+        role: 'stop' | 'target'
+        label: string
+        price: number | null
+        color: string
+      }> = [
+        { role: 'stop', label: 'SL', price: this.posLevels.stop, color: '#ef5350' },
+        { role: 'target', label: 'TP', price: this.posLevels.target, color: '#26a69a' },
+      ]
+      let any = false
+      for (const row of rows) {
+        if (row.price == null) continue
+        any = true
+        const chip = document.createElement('span')
+        chip.style.cssText = [
+          'display:inline-flex;align-items:center;gap:3px;border-radius:4px;padding:1px 4px',
+          `background:${row.color}22;color:${row.color};font-size:9px;font-weight:600`,
+          'font-variant-numeric:tabular-nums',
+        ].join(';')
+        chip.title = `${row.label} set by dragging its ${row.label} line on the chart`
+        chip.textContent = `${row.label} ${this.fmt(row.price)}`
+        const clear = document.createElement('button')
+        clear.textContent = '✕'
+        clear.style.cssText =
+          'border:0;background:transparent;color:inherit;cursor:pointer;font-size:9px;padding:0'
+        clear.title = `Clear the ${row.label}`
+        clear.addEventListener('click', (e) => {
+          e.preventDefault()
+          void this.clearPosLevel(row.role)
+        })
+        chip.appendChild(clear)
+        levels.appendChild(chip)
+      }
+      levels.style.display = any ? 'flex' : 'none'
+    }
+    box.style.display = 'block'
+  }
+
+  private renderPosBoxPnl(): void {
+    if (!this.posBox || !this.position) return
+    const pnlEl = this.posBox.querySelector('[data-p-pnl]')
+    if (!pnlEl) return
+    const mark = this.lastLtp != null ? this.lastLtp : this.position.avg
+    const pnl = (mark - this.position.avg) * this.position.net
+    pnlEl.textContent = `${pnl >= 0 ? '+' : '−'}₹${money(Math.abs(pnl))}`
+    ;(pnlEl as HTMLElement).style.color = pnl >= 0 ? '#34d399' : '#f87171'
+  }
+
+  private destroyPosBox(): void {
+    this.posBox?.remove()
+    this.posBox = null
+  }
+
+  /**
+   * The SL/TP drag handles: two price lines riding beside the entry line,
+   * draggable like the order lines. The box at top-right carries the same
+   * numbers, an instant CLOSE, and the level ✕s.
+   */
+  private renderPosLevelLines(): void {
+    if (!this.chart) return
+    for (const [line, id] of [
+      [this.posStopLine, 'position:stop'],
+      [this.posTargetLine, 'position:target'],
+    ] as const) {
+      if (line) {
+        this.chart.removePrimitive(line)
+        if (id === 'position:stop') this.posStopLine = null
+        else this.posTargetLine = null
+      }
+    }
+    if (!this.position || this.position.net === 0) return
+    if (this.posLevels.stop != null) {
+      this.posStopLine = this.chart.addPriceLine(
+        {
+          price: this.posLevels.stop,
+          color: '#ef5350',
+          lineWidth: 1,
+          dashed: true,
+          id: 'position:stop',
+          cursor: 'ns-resize',
+          extentFromRight: 0.3,
+          closeButton: true,
+          badge: 'SL',
+        },
+        0
+      )
+    }
+    if (this.posLevels.target != null) {
+      this.posTargetLine = this.chart.addPriceLine(
+        {
+          price: this.posLevels.target,
+          color: '#26a69a',
+          lineWidth: 1,
+          dashed: true,
+          id: 'position:target',
+          cursor: 'ns-resize',
+          extentFromRight: 0.3,
+          closeButton: true,
+          badge: 'TP',
+        },
+        0
+      )
+    }
+  }
+
+  /** Drop a level: cancel the order it sent, clear the line, update the box. */
+  private async clearPosLevel(role: 'stop' | 'target'): Promise<void> {
+    const orderId = this.posLevelOrders[role]
+    this.posLevels[role] = null
+    this.posLevelOrders[role] = null
+    this.savePosLevels()
+    this.renderPosLevelLines()
+    this.renderPosBox()
+    if (orderId && this.trade) {
+      try {
+        await this.trade.cancel(orderId)
+        this.toast(`${role === 'stop' ? 'SL' : 'TP'} level cleared, order cancelled`, 'ok')
+      } catch (e) {
+        this.toast(this.cleanError(e), 'err')
+      }
+      this.pollBook()
+    }
+  }
+
+  /**
+   * Commit a dragged level: save it, and — One-Click armed — send or move
+   * the order it stands for (SL-M for the stop, LIMIT for the target, the
+   * position's own side and product). Disarmed, the level is a drawing:
+   * nothing is sent the trader did not ask for.
+   */
+  private async commitPosLevel(role: 'stop' | 'target', price: number): Promise<void> {
+    if (!this.position || !this.sym || !this.trade) return
+    const mark = this.marketPrice()
+    const long = this.position.net > 0
+    const exitSide: OrderSide = long ? 'SELL' : 'BUY'
+    // Guard the side: a long's stop lives below the mark and its target above
+    // it; a short's the other way round. A drag to the wrong side reverts.
+    if (mark != null) {
+      const wrong =
+        role === 'stop'
+          ? long
+            ? price >= mark
+            : price <= mark
+          : long
+            ? price <= mark
+            : price >= mark
+      if (wrong) {
+        this.toast(
+          `${role === 'stop' ? 'SL' : 'TP'} must be ${role === 'stop' ? 'below' : 'above'} LTP ${this.fmt(mark)} for a ${long ? 'LONG' : 'SHORT'}`,
+          'err'
+        )
+        this.renderPosLevelLines()
+        return
+      }
+    }
+    this.posLevels[role] = price
+    this.savePosLevels()
+    this.renderPosLevelLines()
+    this.renderPosBox()
+    if (!this.armed) {
+      this.toast(
+        `${role === 'stop' ? 'SL' : 'TP'} set at ${this.fmt(price)} — One-Click is off, turn it on to send the order`,
+        'ok'
+      )
+      return
+    }
+    const product = (this.position.product || this.product) as 'CNC' | 'NRML' | 'MIS'
+    const existing = this.posLevelOrders[role]
+    try {
+      if (role === 'stop') {
+        if (existing) {
+          await this.trade.modify(existing, { triggerPrice: price })
+          this.toast(`SL moved to ${this.fmt(price)}`, 'ok')
+        } else {
+          const r = await this.trade.place({
+            symbol: this.sym.symbol,
+            exchange: this.sym.exchange,
+            side: exitSide,
+            type: 'SL-M',
+            qty: Math.abs(this.position.net),
+            product,
+            triggerPrice: price,
+            mode: this.tradeMode(),
+          })
+          this.posLevelOrders.stop = r.orderId
+          this.toast(
+            `SL-M ${exitSide} ${Math.abs(this.position.net)} @ ${this.fmt(price)} (id ${r.orderId})`,
+            'ok'
+          )
+        }
+      } else {
+        if (existing) {
+          await this.trade.modify(existing, { price })
+          this.toast(`TP moved to ${this.fmt(price)}`, 'ok')
+        } else {
+          const r = await this.trade.place({
+            symbol: this.sym.symbol,
+            exchange: this.sym.exchange,
+            side: exitSide,
+            type: 'LIMIT',
+            qty: Math.abs(this.position.net),
+            product,
+            price,
+            mode: this.tradeMode(),
+          })
+          this.posLevelOrders.target = r.orderId
+          this.toast(
+            `LIMIT ${exitSide} ${Math.abs(this.position.net)} @ ${this.fmt(price)} (id ${r.orderId})`,
+            'ok'
+          )
+        }
+      }
+      this.pollBook()
+    } catch (e) {
+      this.toast(this.cleanError(e), 'err')
+    }
+  }
+
+  /**
+   * The instant close: a market order on the opposite side of the open
+   * position, the position's own product first — and one retry with the
+   * terminal's product when the book row's product is refused — because a
+   * close button that needs a second explanation is not a close button.
+   * The pill's ✕ and the box's CLOSE both land here.
+   */
+  async closePositionNow(): Promise<void> {
+    if (this.closingPosition) return
+    if (!this.trade || !this.position || !this.sym) {
+      this.toast('no open position on this chart')
+      return
+    }
+    if (this.refuseWhileReplaying()) return
+    this.closingPosition = true
+    const qty = Math.abs(this.position.net)
+    const side: OrderSide = this.position.net > 0 ? 'SELL' : 'BUY'
+    const product = (this.position.product || this.product) as 'CNC' | 'NRML' | 'MIS'
+    try {
+      await this.trade.place({
+        symbol: this.sym.symbol,
+        exchange: this.sym.exchange,
+        side,
+        type: 'MARKET',
+        qty,
+        product,
+        mode: this.tradeMode(),
+      })
+      this.toast(`closed ${qty} ${this.sym.symbol} at market — position flat`, 'ok')
+      this.pollBook()
+    } catch (e) {
+      const alt = product !== this.product ? (this.product as 'CNC' | 'NRML' | 'MIS') : null
+      if (alt) {
+        try {
+          await this.trade.place({
+            symbol: this.sym.symbol,
+            exchange: this.sym.exchange,
+            side,
+            type: 'MARKET',
+            qty,
+            product: alt,
+            mode: this.tradeMode(),
+          })
+          this.toast(`closed ${qty} ${this.sym.symbol} (${alt}) — position flat`, 'ok')
+          this.pollBook()
+        } catch (e2) {
+          this.toast(this.cleanError(e2), 'err')
+        }
+      } else {
+        this.toast(this.cleanError(e), 'err')
+      }
+    } finally {
+      this.closingPosition = false
+    }
   }
 
   private marketPrice(): number | null {
@@ -2602,27 +3256,10 @@ export class TradingTerminal {
   }
 
   async exitPosition() {
+    // The pill's ✕ and the box's CLOSE share one path: the instant market
+    // close with the product fallback (see closePositionNow).
     if (this.refuseWhileReplaying()) return
-    if (!this.trade || !this.position || !this.sym) return
-    const qty = Math.abs(this.position.net)
-    const side: OrderSide = this.position.net > 0 ? 'SELL' : 'BUY'
-    try {
-      // Square off with a plain market placeorder (opposite side, position qty) —
-      // never placesmartorder.
-      await this.trade.place({
-        symbol: this.sym.symbol,
-        exchange: this.sym.exchange,
-        side,
-        type: 'MARKET',
-        qty,
-        product: (this.position.product || this.product) as 'CNC' | 'NRML' | 'MIS',
-        mode: this.tradeMode(),
-      })
-      this.toast('position closed', 'ok')
-      this.pollBook()
-    } catch (e) {
-      this.toast(this.cleanError(e), 'err')
-    }
+    await this.closePositionNow()
   }
 
   /* ── chart build + interaction wiring ─────────────────────────────────── */
@@ -2754,6 +3391,12 @@ export class TradingTerminal {
     this.followDrawingScope()
     this.offBranding?.()
     this.offBranding = null
+    // The rebuild wipes the container's DOM: drop the overlay elements first
+    // so the mount guards below rebuild them instead of finding detached
+    // ghosts — the slider going dead after a theme change was exactly that.
+    this.destroyQtySlider()
+    this.destroyInstantPanel()
+    this.destroyPosBox()
     if (this.chart) this.chart.destroy()
     this.priceAxis.detach()
     // The primitives registered here belonged to the chart just destroyed.
@@ -2964,6 +3607,9 @@ export class TradingTerminal {
 
     // inline SELL · qty · BUY panel, docked top-left below the OHLC legend.
     if (!this.sym!.quoteOnly) {
+      // The toolbar's panel toggles, persisted per pane (both default on).
+      this.tradePanelOn = this.lsGet('tradebtns') !== '0'
+      this.instantPanelOn = this.lsGet('instantpanel') !== '0'
       this.tradeBtns = new BuySellButtons({
         id: 'trade',
         position: 'top-left',
@@ -2976,12 +3622,18 @@ export class TradingTerminal {
       // Order entry is an affordance, not chart content: it is left out of a
       // saved image (see `screenshotExcluded`).
       this.addExcludedPrimitive(this.tradeBtns, 0)
+      this.showTradeButtons(true)
       // The qty chip's capital slider rides the same dock: hover the chip,
       // drag the percent of capital, the lot size re-sizes itself.
       this.mountQtySlider()
+      // The one-click instant panel docks right below the canvas one and
+      // only shows itself once One-Click is armed.
+      this.mountInstantPanel()
     } else {
       this.tradeBtns = null
       this.destroyQtySlider()
+      this.destroyInstantPanel()
+      this.destroyPosBox()
     }
 
     this.chart.subscribeCrosshairMove((e) => {
@@ -3015,9 +3667,22 @@ export class TradingTerminal {
       this.container.removeEventListener('pointerup', pointerup)
     }
 
-    // drag-to-modify with a drag ghost; commit on release (tick-snapped)
+    // drag-to-modify with a drag ghost; commit on release (tick-snapped).
+    // The position's own SL/TP handles drag the same way: the first callback
+    // moves the line (with its ghost), the second commits the level — and,
+    // One-Click armed, sends or moves the order it stands for.
+    const posLevelOf = (id: string): 'stop' | 'target' | null =>
+      id === 'position:stop' ? 'stop' : id === 'position:target' ? 'target' : null
     this.chart.subscribeDrag(
       (id, p) => {
+        const role = posLevelOf(id)
+        if (role) {
+          if (this.tradingLocked()) return
+          const line = role === 'stop' ? this.posStopLine : this.posTargetLine
+          if (!line) return
+          line.setPrice(this.snap(p))
+          return
+        }
         if (!id.startsWith('order:') || id.endsWith('::close')) return
         // Silent: a refusal toast on every pointer sample would be a wall of them.
         if (this.tradingLocked()) return
@@ -3030,6 +3695,14 @@ export class TradingTerminal {
         rec.line.setPrice(this.snap(p))
       },
       (id, p) => {
+        const role = posLevelOf(id)
+        if (role) {
+          if (this.refuseWhileReplaying()) return
+          const line = role === 'stop' ? this.posStopLine : this.posTargetLine
+          if (line) line.setDragGhost(null)
+          void this.commitPosLevel(role, this.snap(p))
+          return
+        }
         if (!id.startsWith('order:') || id.endsWith('::close')) return
         // The release is the modify, so this is the one that must refuse.
         if (this.refuseWhileReplaying()) return
@@ -3052,6 +3725,9 @@ export class TradingTerminal {
       if (id === 'trade:buy') return void this.placeFromMenu('BUY', 'MARKET')
       if (id === 'trade:sell') return void this.placeFromMenu('SELL', 'MARKET')
       if (id === 'position::close') return void this.exitPosition()
+      // The SL/TP handles' ✕: clear the level, cancel the order it sent.
+      if (id === 'position:stop::close') return void this.clearPosLevel('stop')
+      if (id === 'position:target::close') return void this.clearPosLevel('target')
       if (id.startsWith('order:') && id.endsWith('::close')) {
         if (this.refuseWhileReplaying()) return
         const oid = id.slice(6, -7)
@@ -6089,6 +6765,7 @@ export class TradingTerminal {
     this.showTradeButtons(
       !locked && !this.replayOwnsDisplay() && !this.replayPicking && !this.replayLoading
     )
+    this.syncInstantPanel()
     if (!locked) {
       this.workspaceReplayMember?.detachAbort()
       this.workspaceReplayMember = null
@@ -6698,8 +7375,37 @@ export class TradingTerminal {
   private showTradeButtons(on: boolean): void {
     if (!this.chart || !this.tradeBtns) return
     if (this.workspaceReplayLocked) on = false
+    // The trader's toolbar toggle rides here too: replay forces the panel
+    // off, and a replay exit only brings it back if the toggle keeps it.
+    on = on && this.tradePanelOn
     if (on) this.chart.addPrimitive(this.tradeBtns, 0)
     else this.chart.removePrimitive(this.tradeBtns)
+  }
+
+  /**
+   * The toolbar's panel toggles. The classic canvas Buy/Sell and the
+   * one-click instant panel are separate affordances for separate habits:
+   * the ticket keeps the details in front of the trader, the instant panel
+   * is the scalper's fire button — each hides the other's way.
+   */
+  setTradePanelVisible(on: boolean): void {
+    this.tradePanelOn = on
+    this.lsSet('tradebtns', on ? '1' : '0')
+    this.showTradeButtons(true)
+  }
+
+  tradePanelVisible(): boolean {
+    return this.tradePanelOn
+  }
+
+  setInstantPanelVisible(on: boolean): void {
+    this.instantPanelOn = on
+    this.lsSet('instantpanel', on ? '1' : '0')
+    this.syncInstantPanel()
+  }
+
+  instantPanelVisible(): boolean {
+    return this.instantPanelOn
   }
 
   private showReplayMark(on: boolean): void {
@@ -6821,6 +7527,7 @@ export class TradingTerminal {
         ) {
           this.depthActive = true
           this.tradeBtns.setPrices(q.bid, q.ask)
+          this.instantPrices(q.bid, q.ask)
         }
         this.cb.onWsState('fallback')
       } catch {
@@ -6843,6 +7550,8 @@ export class TradingTerminal {
     // Recolour with the price: the line belongs to the forming candle, so it
     // follows that candle's direction rather than sitting amber forever.
     if (this.position && this.posLine) this.posLine.setLeftLabel(this.posLabel())
+    // The top-right box's P&L row follows the tick too.
+    this.renderPosBoxPnl()
     if (this.tradeBtns && !this.depthActive) this.tradeBtns.setMark(e.ltp)
     if (this.builder) {
       let u
@@ -6952,6 +7661,7 @@ export class TradingTerminal {
       if (typeof bid === 'number' && typeof ask === 'number' && bid > 0 && ask > 0) {
         this.depthActive = true
         if (this.tradeBtns) this.tradeBtns.setPrices(bid, ask)
+        this.instantPrices(bid, ask)
       }
       // Depth is the terminal's ONLY subscription for tradeable instruments,
       // so the chart ticks off depth.ltp -- a first-class field in every mode-3
@@ -7441,6 +8151,9 @@ export class TradingTerminal {
       product: this.product,
     }
     this.qty = 1
+    // The position box's SL/TP levels belong to the instrument: a new symbol
+    // loads its own (or none), so one chart's levels never bleed into another.
+    this.loadPosLevels()
     this.lsSet('symbol', JSON.stringify({ symbol: this.sym.symbol, exchange: this.sym.exchange }))
     // Tell the group before the history fetch below, so a linked grid starts
     // loading together rather than one pane at a time. The group's own echo
@@ -7647,6 +8360,7 @@ export class TradingTerminal {
   setQty(n: number) {
     this.qty = Math.max(1, Math.floor(n || 1))
     if (this.tradeBtns) this.tradeBtns.setQty(this.qtyChip())
+    this.syncInstantQty()
     this.refreshQtySliderText()
   }
   /**
@@ -7658,6 +8372,9 @@ export class TradingTerminal {
     if (this.armed === on) return
     this.armed = on
     this.applyTradeColors()
+    // The instant panel is the armed state's own affordance — it appears
+    // with the arm and goes with the disarm.
+    this.syncInstantPanel()
   }
   oneClickArmed(): boolean {
     return this.armed
@@ -8543,6 +9260,8 @@ export class TradingTerminal {
     this.detachObjects()
     this.detachDrawing()
     this.destroyQtySlider()
+    this.destroyInstantPanel()
+    this.destroyPosBox()
     if (this.bookTimer) clearInterval(this.bookTimer)
     this.bookTimer = null
     this.stopLtpFallback()

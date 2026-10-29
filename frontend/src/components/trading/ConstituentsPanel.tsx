@@ -32,7 +32,9 @@ export function ConstituentsPanel({ apiKey, activeSymbol, paneSymbols, onPick }:
       <div className={PANEL_HEADER}>
         <span className="text-[12px] font-medium">Constituents</span>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      {/* Full height, no scroll of its own: the tab's table owns the panel's
+          one scrollbar, and only when the rows ask for it. */}
+      <div className="min-h-0 flex-1 overflow-hidden">
         <IndexTab
           apiKey={apiKey}
           activeSymbol={activeSymbol}

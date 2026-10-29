@@ -217,6 +217,19 @@ export function TradingDock({
       ),
     [actions]
   )
+  /**
+   * Scale a position from its row: the dialog's side and size go out as the
+   * same market order a Repeat places — the honest wire, and the books
+   * refresh after.
+   */
+  const adjustPosition = useCallback(
+    (p: DockPosition, action: 'BUY' | 'SELL', quantity: number) =>
+      void repeatDockOrder(
+        { symbol: p.symbol, exchange: p.exchange, action, quantity, product: p.product },
+        actions
+      ),
+    [actions]
+  )
   const cancelAll = useCallback(() => cancelAllDockOrders(actions), [actions])
   const closeAll = useCallback(() => closeAllDockPositions(actions), [actions])
 
@@ -272,6 +285,7 @@ export function TradingDock({
           onPick={onPick}
           onClose={(p) => void closePosition(p)}
           onRepeat={repeatPosition}
+          onAdjust={adjustPosition}
           isLoading={isLoading}
         />
       )}

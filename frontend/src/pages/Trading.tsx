@@ -70,6 +70,7 @@ import {
   ChartBottomBar,
 } from '@/components/trading/ChartBottomBar'
 import { ChartPane } from '@/components/trading/ChartPane'
+import { DeployQuickBar } from '@/components/trading/DeployQuickBar'
 import { DrawingRail, DrawingRailTab } from '@/components/trading/DrawingRail'
 import {
   ChartOrderBridgeContext,
@@ -2101,6 +2102,18 @@ function TradingWorkspace({ account }: { account: string | null }) {
 
           {apiKey && wsUrl && <RightRail active={panel} onSelect={setPanel} />}
         </main>
+
+        {/* The quick deploy bar: the Deploy panel's buttons, parked stable
+            above the dock so a ladder fires without opening the panel. It
+            fetches its own numbers at press time, so it costs the feed
+            nothing between presses. */}
+        {apiKey && wsUrl && (
+          <DeployQuickBar
+            apiKey={apiKey}
+            refuse={refuseTrading}
+            onOpenStrategy={() => setPanel('strategy')}
+          />
+        )}
 
         {/* The bottom dock: orders, positions and trades across every symbol.
             Under the rails and the side panel, full width, because the books

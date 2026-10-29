@@ -2,11 +2,14 @@
  * The position book as a dock table. One row per (symbol, exchange, product),
  * so an MIS and an NRML position in the same contract are two rows, and the
  * zero-quantity rows the broker still reports stay visible with their
- * realised figure and no Close.
+ * realised figure — and a Repeat of their own, side picked in the dialog.
  *
  * Close is per row, through the web route that squares off one position.
- * The endpoint that squares off everything is behind the header's Close all
- * and nowhere near a row button.
+ * Add and Reduce sit beside it: a position is not only entered and flattened
+ * whole — the trader scales in and scales out, and the dialog's quantity
+ * stepper (percent chips on a reduce) keeps that to one press each. The
+ * endpoint that squares off everything is behind the header's Close all and
+ * nowhere near a row button.
  */
 
 import { useState } from 'react'
@@ -24,6 +27,7 @@ import { Button } from '@/components/ui/button'
 import type { SearchRow } from '@/lib/trading/terminal'
 import { cn } from '@/lib/utils'
 import { useOneClickStore } from '@/stores/oneClickStore'
+import { AdjustPositionDialog, type PositionAdjustKind } from './AdjustPositionDialog'
 import { type DockPosition, positionKey } from './blotter'
 import {
   EmptyRows,
@@ -48,6 +52,12 @@ interface Props {
   onClose(position: DockPosition): void
   /** Re-enter the position's side and quantity as a fresh market order. */
   onRepeat(position: DockPosition): void
+  /**
+   * Scale the position: add in the net direction, reduce part of it, or
+   * re-enter a flat row on the dialog's chosen side. The caller places the
+   * market order and refreshes the books.
+   */
+  onAdjust(position: DockPosition, action: 'BUY' | 'SELL', quantity: number): void
   isLoading?: boolean
 }
 
@@ -57,9 +67,15 @@ export function PositionsTable({
   onPick,
   onClose,
   onRepeat,
+  onAdjust,
   isLoading,
 }: Props) {
   const [pending, setPending] = useState<DockPosition | null>(null)
+  /** The row a size dialog is open for, and which way it is scaling. */
+  const [adjusting, setAdjusting] = useState<{
+    position: DockPosition
+    kind: PositionAdjustKind
+  } | null>(null)
   // One-Click armed, Close lands on the first press — the trader has said
   // the click is the order, and a row's Close is the most deliberate click
   // there is. The dialog stays for the disarmed path.
@@ -132,8 +148,26 @@ export function PositionsTable({
                 <td className={cn(TD_NUM, 'font-medium', toneClass(p.pnl))}>{signed(p.pnl)}</td>
                 <td className={cn(TD, 'text-right')}>
                   <span className="inline-flex gap-1">
-                    {open && (
+                    {open ? (
                       <>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-1.5 text-[11px] text-emerald-700 hover:text-emerald-700 dark:text-emerald-400"
+                          onClick={() => setAdjusting({ position: p, kind: 'add' })}
+                          aria-label={`Add to ${p.product} position in ${p.symbol}`}
+                        >
+                          Add
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-1.5 text-[11px] text-amber-700 hover:text-amber-700 dark:text-amber-400"
+                          onClick={() => setAdjusting({ position: p, kind: 'reduce' })}
+                          aria-label={`Reduce ${p.product} position in ${p.symbol}`}
+                        >
+                          Reduce
+                        </Button>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -153,6 +187,18 @@ export function PositionsTable({
                           Close
                         </Button>
                       </>
+                    ) : (
+                      // A flat row has no side to remember, so its Repeat asks:
+                      // the dialog picks side and size, then re-enters at market.
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 px-2 text-[11px]"
+                        onClick={() => setAdjusting({ position: p, kind: 'reopen' })}
+                        aria-label={`Re-enter ${p.product} in ${p.symbol}`}
+                      >
+                        Repeat
+                      </Button>
                     )}
                   </span>
                 </td>
@@ -161,6 +207,13 @@ export function PositionsTable({
           })}
         </tbody>
       </table>
+
+      <AdjustPositionDialog
+        position={adjusting?.position ?? null}
+        kind={adjusting?.kind ?? null}
+        onConfirm={(position, action, quantity) => onAdjust(position, action, quantity)}
+        onOpenChange={(value) => !value && setAdjusting(null)}
+      />
 
       <AlertDialog open={pending !== null} onOpenChange={(o) => !o && setPending(null)}>
         <AlertDialogContent>

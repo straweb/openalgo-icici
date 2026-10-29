@@ -33,7 +33,9 @@ export function StrategyPanel({ apiKey, wsUrl, activeSymbol, refuse, refresh }: 
       <div className={PANEL_HEADER}>
         <span className="text-[12px] font-medium">Strategy bots</span>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      {/* Full height, no scroll of its own: the tab owns the panel's one
+          scrollbar, so the ladder reads to the panel's bottom edge. */}
+      <div className="min-h-0 flex-1 overflow-hidden">
         <StrategyTab
           apiKey={apiKey}
           wsUrl={wsUrl}

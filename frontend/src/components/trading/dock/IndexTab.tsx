@@ -309,8 +309,8 @@ export function IndexTab({ apiKey, activeSymbol, paneSymbols, onPick }: Props) {
   }
 
   return (
-    <div className="h-full min-h-0">
-      <div className="flex items-center gap-2 border-b px-2 py-1">
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 items-center gap-2 border-b px-2 py-1">
         <span className="text-[10px] text-muted-foreground">
           Following <span className="font-mono font-semibold text-foreground">{index}</span>
           {spotQuote?.ltp != null && (
@@ -335,14 +335,12 @@ export function IndexTab({ apiKey, activeSymbol, paneSymbols, onPick }: Props) {
         </Button>
       </div>
       {error && !chain && (
-        <p className="border-b bg-muted/40 px-2 py-1 text-[10px] text-muted-foreground">
+        <p className="shrink-0 border-b bg-muted/40 px-2 py-1 text-[10px] text-muted-foreground">
           Level deploy reads the chain snapshot; it lands when the broker's master contract has{' '}
           {index}'s options. The constituents below read the quotes feed and work regardless.
         </p>
       )}
-      <div
-        className={error && !chain ? 'h-[calc(100%-58px)] min-h-0' : 'h-[calc(100%-29px)] min-h-0'}
-      >
+      <div className="min-h-0 flex-1">
         <IndexPanel
           underlying={index}
           indexSpot={spot}

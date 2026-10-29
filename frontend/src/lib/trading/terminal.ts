@@ -221,6 +221,7 @@ export interface DrawStats {
 }
 
 import type { AgentChartCommand } from '@/lib/agent/stream'
+import { constituentsFor } from '@/lib/hedging/indexConstituents'
 import type { AppMode, ThemeMode } from '@/stores/themeStore'
 import {
   type AlertChart,
@@ -259,6 +260,7 @@ import {
 } from './chartTheme'
 import { CHART_TYPES, volumeUnderElements } from './chartTypes'
 import { COMPARISON_PALETTE } from './comparisonColors'
+import { fnoBaseSymbol } from './deployPlan'
 import {
   type DrawLevels,
   type DrawSelectionDetails,
@@ -291,6 +293,12 @@ import {
 import { DRAW_TOOL_METADATA } from './drawingToolMetadata'
 import { fmtPrice, money, priceDp, snapTick, tickSize } from './format'
 import { GHOST_INTERVALS, GhostCandles, isGhostInterval } from './ghostCandles'
+import {
+  type IndexVolumeFeed,
+  istDateString,
+  pruneIndexVolumeFeeds,
+  sharedIndexVolumeFeed,
+} from './indexVolume'
 import { factsFor } from './instrumentFacts'
 import {
   type IntervalData,
@@ -1980,7 +1988,7 @@ export class TradingTerminal {
     const point = volumePoint(
       bar,
       this.rawBars.at(-2)?.close,
-      bar.volume ?? 0,
+      this.barVolume(bar, bar.volume),
       this.volumeCandleStyle(),
       settings['volume.colorByDirection'] === true
     )
@@ -2019,6 +2027,22 @@ export class TradingTerminal {
     return this.sym?.synthetic === true || !QUOTE_ONLY.has(this.sym?.exchange ?? '')
   }
 
+  /**
+   * Whether the histogram has something honest to draw. A member stock has
+   * its own volume; a quote-only index has it too once the synthesized feed
+   * is engaged — which is the only way an index chart's volume toggle does
+   * anything at all.
+   */
+  private volumeShown(): boolean {
+    return this.volumeAvailable() || this.syntheticVolumeMap != null
+  }
+
+  /** On a synthesized index chart, the bar's volume is the members' sum. */
+  private syntheticLegendBar(bar: Bar | null): Bar | null {
+    if (!bar || !this.syntheticVolumeMap) return bar
+    return { ...bar, volume: this.syntheticVolumeMap.get(bar.time) ?? 0 }
+  }
+
   private setVolumeData(prices: readonly Bar[], amounts?: readonly Bar[]): void {
     if (!this.volume || !this.chart) return
     const settings = volumeValues(this.chartSettingsSaved)
@@ -2028,7 +2052,9 @@ export class TradingTerminal {
       volumePoint(
         bar,
         prices[index - 1]?.close,
-        byTime?.get(bar.time) ?? bar.volume ?? 0,
+        // A synthesized index chart reads its own map; a member stock reads
+        // the bar's own volume, and a transformed re-render the series' last.
+        byTime?.get(bar.time) ?? this.barVolume(bar, bar.volume),
         style,
         settings['volume.colorByDirection'] === true
       )
@@ -2045,7 +2071,7 @@ export class TradingTerminal {
     this.volumeMA.applyOptions({
       visible:
         this.volumeOn &&
-        this.volumeAvailable() &&
+        this.volumeShown() &&
         !isProfileKind(this.ctype) &&
         settings['volume.showMA'] === true,
       color: String(settings['volume.maColor']),
@@ -2066,6 +2092,92 @@ export class TradingTerminal {
     // not yet replayed out of the last element.
     if (this.transformed()) this.setTransformedVolume(this.price.getData())
     else this.setVolumeData(this.price.getData(), this.volume.getData())
+  }
+
+  /* ── synthesized index volume ──────────────────────────────────────────── */
+
+  /**
+   * An index spot's volume, rebuilt from its constituent stocks (the module
+   * doc on ./indexVolume says why). When the loaded symbol is a quote-only
+   * index whose base has a member list, the chart subscribes to the shared
+   * per-index feed and the histogram — otherwise hidden or flat zero on such
+   * a chart — draws the sum of the members' turnover, binned onto this
+   * chart's own bar grid so it reads true at every timeframe.
+   */
+  private syntheticVolume: { feed: IndexVolumeFeed; off: () => void } | null = null
+  /** The feed's buckets binned onto the current rawBars, or null when off. */
+  private syntheticVolumeMap: Map<number, number> | null = null
+
+  /** The constituent profile this chart's symbol resolves to, if any. */
+  private syntheticProfile() {
+    if (!this.sym || this.sym.synthetic) return null
+    return (
+      constituentsFor(this.sym.symbol) ??
+      // An option or a suffixed alias resolves to its base's profile, which
+      // is what the Constituents table keys on too — though only a spot
+      // index chart (quote-only) ever engages the feed.
+      constituentsFor(fnoBaseSymbol(this.sym.symbol))
+    )
+  }
+
+  /** The volume the histogram draws for one bar: synthesized when engaged. */
+  private barVolume(bar: Bar, fallback: number | undefined): number {
+    if (this.syntheticVolumeMap) return this.syntheticVolumeMap.get(bar.time) ?? 0
+    return fallback ?? 0
+  }
+
+  /**
+   * Engage the feed for the symbol just loaded, or take it down when the
+   * symbol is not a synthesizable index. Called after the chart has its
+   * bars: a feed that is already warm (the same index on another pane, or
+   * this one on an earlier load) fills the histogram on the first callback.
+   */
+  private setupSyntheticVolume(): void {
+    const sym = this.sym
+    const profile = sym?.quoteOnly && !sym.synthetic ? this.syntheticProfile() : null
+    // Only intraday frames: a daily bar's volume would be one day's sum per
+    // bar, and this feed only knows today — an honest zero for every earlier
+    // day reads as a dead tape, not as information.
+    const intraday = intervalSeconds(this.interval) != null && this.interval !== 'D'
+    if (!profile || !intraday || !this.apiKey) {
+      this.stopSyntheticVolume()
+      return
+    }
+    if (this.syntheticVolume?.feed.dayKey === `${profile.underlying}:${istDateString()}`) {
+      // Same index, same day — a timeframe change re-bins on the next callback.
+      this.refreshSyntheticVolume()
+      return
+    }
+    this.stopSyntheticVolume()
+    const feed = sharedIndexVolumeFeed(this.apiKey, profile, () => {
+      // A feed with nothing to show keeps the histogram honest: visible only
+      // once real buckets exist, never as a flat zero line.
+      if (this.syntheticVolume?.feed === feed && feed.size() === 0)
+        this.volume?.applyOptions({ visible: false })
+    })
+    const off = feed.onChange(() => this.refreshSyntheticVolume())
+    this.syntheticVolume = { feed, off }
+    this.syntheticVolumeMap = null
+    this.refreshSyntheticVolume()
+  }
+
+  private stopSyntheticVolume(): void {
+    this.syntheticVolume?.off()
+    this.syntheticVolume = null
+    this.syntheticVolumeMap = null
+    pruneIndexVolumeFeeds()
+  }
+
+  /** Re-bin the feed's buckets onto the current bars and redraw the histogram. */
+  private refreshSyntheticVolume(): void {
+    const feed = this.syntheticVolume?.feed
+    if (!feed || !this.volume || this.destroyed) return
+    this.syntheticVolumeMap = feed.volumeForBars(this.rawBars, intervalSeconds(this.interval) || 60)
+    if (feed.size() === 0) return
+    if (this.replayOwnsDisplay()) return
+    if (this.transformed()) return
+    this.volume.applyOptions({ visible: this.volumeOn })
+    this.setVolumeData(this.rawBars)
   }
 
   /* ── legend (imperative; high-frequency, kept off React state) ────────── */
@@ -2169,7 +2281,9 @@ export class TradingTerminal {
       exchange: sym.exchange,
       lotsize: sym.lots ? sym.lotsize : null,
       bar:
-        bar && !this.volumeAvailable() ? { ...bar, volume: undefined } : this.withDrawnVolume(bar),
+        bar && !this.volumeShown()
+          ? { ...bar, volume: undefined }
+          : this.withDrawnVolume(this.syntheticLegendBar(bar)),
       prevClose: this.closeBefore(bar),
       fmt: (n) => this.fmt(n),
       fmtVolume: compactVolume,
@@ -2571,24 +2685,29 @@ export class TradingTerminal {
 
   /**
    * The pair of order buttons that ride the price scale: a B and an S beside
-   * the axis ladder, at the height of the price under the pointer — the
-   * quick-trade affordance TradingView puts on the scale and Dhan's chart
-   * copies, wired to this chart's right-click "Buy/Sell @ price".
+   * the axis ladder, parked in one fixed vertical line at the price pane's
+   * centre — the quick-trade affordance TradingView puts on the scale and
+   * Dhan's chart copies, wired to this chart's right-click "Buy/Sell @ price".
    *
    * They exist while the pointer is over the chart and hide the moment it
    * leaves, so the plot is clean the rest of the time; they sit just LEFT of
    * the axis column (never on it), so the ladder's price values stay readable
    * while the buttons are up, and the current bar's right margin keeps them
-   * off the candles. A press places at the price they are parked at, exactly
-   * the context menu's rows do: a valid-side price orders as a LIMIT there
-   * (One-Click off, the ticket opens prefilled at it), a wrong-side price —
-   * the broker would refuse the limit — goes as the order mode's market.
+   * off the candles. The line does NOT follow the pointer — an earlier cut
+   * tracked the cursor's price and the pair never stayed still long enough
+   * to press — so the hand can travel to a still target. The price they act
+   * on is the crosshair's: the price under the pointer as it moves over the
+   * plot, frozen the moment it lands on the buttons themselves. A press
+   * places there exactly the context menu's rows do: a valid-side price
+   * orders as a LIMIT there (One-Click off, the ticket opens prefilled at
+   * it), a wrong-side price — the broker would refuse the limit — goes as
+   * the order mode's market.
    */
   private scaleBtns: HTMLDivElement | null = null
   private offScaleBtns: (() => void) | null = null
   /** True while a press-drag (a pan) is in progress: buttons stay hidden. */
   private scaleDragging = false
-  /** The snapped price the buttons are parked at, for the click to act on. */
+  /** The snapped price the buttons act on: the crosshair's, frozen on hover. */
   private scalePrice: number | null = null
 
   private mountScaleButtons(): void {
@@ -2655,9 +2774,12 @@ export class TradingTerminal {
     this.container.appendChild(wrap)
     this.scaleBtns = wrap
 
-    // Track the pointer over the chart. Coalesced through rAF: a high-Hz
-    // mouse fires pointermove far more often than a frame paints, and each
-    // update reads layout (the axis slots, the pane's box).
+    // Visible while the pointer is anywhere over the chart, gone the moment
+    // it leaves. The pair itself never repositions with the pointer: it is
+    // parked once (per appearance) at the price pane's centre line, and only
+    // the price it acts on — read from the same move events the chart's own
+    // crosshair eats — changes underneath. Coalesced through rAF: a high-Hz
+    // mouse fires pointermove far more often than a frame paints.
     let last: PointerEvent | null = null
     let raf = 0
     const schedule = (ev: PointerEvent) => {
@@ -2668,6 +2790,7 @@ export class TradingTerminal {
         if (last) this.updateScaleButtons(last)
       })
     }
+    const enter = (ev: PointerEvent) => schedule(ev)
     const move = (ev: PointerEvent) => schedule(ev)
     const down = (ev: PointerEvent) => {
       if (ev.button === 0) this.scaleDragging = true
@@ -2677,6 +2800,7 @@ export class TradingTerminal {
       this.scaleDragging = false
     }
     const leave = () => this.hideScaleButtons()
+    this.container.addEventListener('pointerenter', enter)
     this.container.addEventListener('pointermove', move)
     this.container.addEventListener('pointerdown', down)
     this.container.addEventListener('pointerup', up)
@@ -2685,6 +2809,7 @@ export class TradingTerminal {
     this.offScaleBtns = () => {
       if (raf) cancelAnimationFrame(raf)
       raf = 0
+      this.container.removeEventListener('pointerenter', enter)
       this.container.removeEventListener('pointermove', move)
       this.container.removeEventListener('pointerdown', down)
       this.container.removeEventListener('pointerup', up)
@@ -2704,7 +2829,16 @@ export class TradingTerminal {
     if (this.scaleBtns) this.scaleBtns.style.display = 'none'
   }
 
-  /** Park the pair at the pointer's price, or take them off when it may not trade. */
+  /**
+   * Show the pair on its fixed centre line and keep the price it acts on
+   * tracking the crosshair — or take them off when the chart may not trade.
+   *
+   * The position is written only while the pair is parked (the first move
+   * after it appeared): the buttons must sit still for the hand to reach
+   * them, which was the whole point of taking them off the pointer.
+   * Everything about them that is not position — the crosshair price they
+   * will fire at, the titles that say so — keeps updating every frame.
+   */
   private updateScaleButtons(ev: PointerEvent): void {
     const wrap = this.scaleBtns
     const chart = this.chart
@@ -2716,32 +2850,42 @@ export class TradingTerminal {
       return
     }
     const box = this.container.getBoundingClientRect()
-    const localY = ev.clientY - box.top
-    // Only over the price pane: a y over the time axis or a study pane below
-    // maps to no price there.
+    // Only over the price pane: a pointer below it is over a study pane or
+    // the time axis, where the pair has no business standing.
     const pane = chart.panes()[0]
+    let paneTop = 0
+    let paneHeight = 0
     if (pane) {
       const rect = pane.element.getBoundingClientRect()
-      if (localY < rect.top - box.top || localY > rect.bottom - box.top) {
+      paneTop = rect.top - box.top
+      paneHeight = rect.height
+      if (ev.clientY - box.top < paneTop || ev.clientY - box.top > paneTop + paneHeight) {
         wrap.style.display = 'none'
         return
       }
     }
-    const p = chart.coordinateToPrice(localY, 0)
+    // The price under the pointer — the crosshair's, the same one the axis
+    // value marker shows. Frozen while the pointer is on the buttons: the
+    // wrapper stops their move events from reaching the chart, so the last
+    // plot-side price stands until the hand comes back.
+    const p = chart.coordinateToPrice(ev.clientY - box.top, 0)
     if (p == null || !Number.isFinite(p)) {
       wrap.style.display = 'none'
       return
     }
-    // Just left of the axis column — never over the ladder itself, so the
-    // values the trader is reading stay visible.
-    let rightInset = 0
-    for (const slot of chart.priceAxisLayout(0)) {
-      if (slot.side === 'right') rightInset += slot.width
+    // Park the line once per appearance: centred in the pane, just left of
+    // the axis column — never over the ladder itself, so the values the
+    // trader is reading stay visible.
+    if (wrap.style.display === 'none') {
+      let rightInset = 0
+      for (const slot of chart.priceAxisLayout(0)) {
+        if (slot.side === 'right') rightInset += slot.width
+      }
+      wrap.style.right = `${Math.round(rightInset) + 2}px`
+      wrap.style.top = `${Math.round(paneTop + paneHeight / 2)}px`
     }
     const price = this.snap(p)
     this.scalePrice = price
-    wrap.style.right = `${Math.round(rightInset) + 2}px`
-    wrap.style.top = `${Math.round(localY)}px`
     const lotTxt = this.sym?.lots
       ? `${Math.max(1, Math.floor(this.qty || 1))}L`
       : String(this.orderQty())
@@ -2765,12 +2909,13 @@ export class TradingTerminal {
   }
 
   /**
-   * The scale buttons' fire: the right-click menu's Buy/Sell @ price, parked
-   * wherever the pointer was. A valid-side price orders as a LIMIT there —
-   * armed straight to the wire, disarmed into the prefilled ticket, the
-   * menu's own fork. A wrong-side price would be a limit the broker refuses
-   * (the menu greys that row), and the press reads as "take it from here",
-   * so it goes as the global order mode's market order instead.
+   * The scale buttons' fire: the right-click menu's Buy/Sell @ price, at the
+   * price the crosshair last read before the hand reached the pair. A
+   * valid-side price orders as a LIMIT there — armed straight to the wire,
+   * disarmed into the prefilled ticket, the menu's own fork. A wrong-side
+   * price would be a limit the broker refuses (the menu greys that row), and
+   * the press reads as "take it from here", so it goes as the global order
+   * mode's market order instead.
    */
   private quickFire(side: OrderSide, price: number): void {
     this.ctxPrice = this.snap(price)
@@ -3712,7 +3857,7 @@ export class TradingTerminal {
     this.displayedVolume = []
     // A rebuild makes a fresh series, so the preference has to be re-applied
     // rather than assumed -- switching chart type or theme would show it again.
-    if (!this.volumeOn || !this.volumeAvailable() || isProfileKind(this.ctype))
+    if (!this.volumeOn || !this.volumeShown() || isProfileKind(this.ctype))
       this.volume.applyOptions({ visible: false })
     this.installObjects()
     // Same reasoning for the settings patch: a chart-type or theme switch
@@ -6855,12 +7000,12 @@ export class TradingTerminal {
   setVolumeVisible(on: boolean): void {
     this.volumeOn = on
     this.volume?.applyOptions({
-      visible: on && this.volumeAvailable() && !isProfileKind(this.ctype),
+      visible: on && this.volumeShown() && !isProfileKind(this.ctype),
     })
     this.volumeMA?.applyOptions({
       visible:
         on &&
-        this.volumeAvailable() &&
+        this.volumeShown() &&
         !isProfileKind(this.ctype) &&
         volumeValues(this.chartSettingsSaved)['volume.showMA'] === true,
     })
@@ -8112,6 +8257,7 @@ export class TradingTerminal {
     this.liveBucket = null
     this.noMoreHistory = false // the feed pages every leg
     this.expr = expr
+    this.stopSyntheticVolume()
     this.buildChart()
     this.connectExpressionLive(expr)
     return true
@@ -8182,6 +8328,10 @@ export class TradingTerminal {
     // previous instrument's data onto the new one.
     this.stopReplay()
     this.comparisons?.detach()
+    // The synthesized index volume belongs to the outgoing symbol: detach it
+    // here so a chart leaving an index stops its listener even when the next
+    // load fails halfway.
+    this.stopSyntheticVolume()
     // swap the live stream: drop the previous symbol's subscription
     if (
       this.ws &&
@@ -8330,6 +8480,10 @@ export class TradingTerminal {
     }
     this.cb.onLtp(this.lastLtp)
     this.cb.onSymbolLoaded(this.sym)
+    // A quote-only index with a member list draws the members' summed
+    // turnover as its own volume histogram (see ./indexVolume). Everything
+    // else just took the previous symbol's feed down, above.
+    this.setupSyntheticVolume()
 
     // live subscription (swap the previous symbol's stream)
     this.connectLive()
@@ -9346,6 +9500,7 @@ export class TradingTerminal {
     this.replayInvalidation = null
     if (this.workspaceReplayMember || this.workspaceReplayPick) this.stopReplay()
     this.destroyed = true
+    this.stopSyntheticVolume()
     let comparisonError: unknown
     let comparisonFailed = false
     try {

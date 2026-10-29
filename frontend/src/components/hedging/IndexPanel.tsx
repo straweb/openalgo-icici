@@ -1,4 +1,4 @@
-import { ChartLine, Loader2, RefreshCcw } from 'lucide-react'
+import { ChartLine, Loader2, RefreshCcw, Search } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Dialog,
@@ -24,21 +24,25 @@ import { cn } from '@/lib/utils'
  * Every stock of the index (Nifty 50, Bank Nifty, Sensex 30, Fin Nifty —
  * the static profiles in lib/hedging/indexConstituents) shows its current
  * price, traded volume and its % change since the session open (0% is the
- * open, per the spec). Two 1-minute studies sit above the list: a combined
- * volume stack (each minute's traded volume as stacked per-stock segments)
- * and the weighted price-% trail — every stock's series starts at 0% at the
- * session open. The contribution bubble pack shows, per stock, how much of
- * the index's move it explains (weight × move), so the stock driving the
- * index is visible at a glance; clicking a bubble or a row opens the stock's
- * detail popup. A chart icon on each row loads that stock straight into the
- * focused chart pane — the same quick action the side panels carry.
+ * open, per the spec). A filter box above the table narrows the list while
+ * the quotes keep running. The contribution bubble pack shows, per stock,
+ * how much of the index's move it explains (weight × move); clicking a
+ * circle opens the donut — the same contribution ledger drawn as slices,
+ * with each stock's numbers beside it. Clicking a row opens the stock's
+ * own detail popup. A chart icon on each row loads that stock straight
+ * into the focused chart pane — the same quick action the side panels
+ * carry.
  *
- * The minute series accumulates in this tab only while it is open; the %
- * reference itself is the day open, so a reopened tab still reads the
- * session correctly and just rebuilds its 1m history.
+ * The 1m series behind the row sparkline accumulates in this tab only while
+ * it is open; the % reference itself is the day open, so a reopened tab
+ * still reads the session correctly and just rebuilds its 1m history. The
+ * old combined 1m studies (the stacked per-minute volume and the weighted
+ * %/min trail) are gone: the volume half moved onto the index chart itself,
+ * rebuilt there from the same members (lib/trading/indexVolume), where it
+ * belongs at every timeframe.
  */
 
-/** Maximum minute buckets kept for the 1m studies. */
+/** Maximum minute buckets kept for the row sparkline. */
 const MAX_MINUTES = 24
 
 const STOCK_COLORS = [
@@ -68,11 +72,8 @@ const fmtVol = (value: number) => {
 interface MinuteSeries {
   /** Per-minute % change snapshots (session-open referenced). */
   points: number[]
-  /** Per-minute traded volume deltas aligned with `points`. */
-  volumes: number[]
   lastBucket: number
   firstLtp: number
-  lastVolume: number
 }
 
 export interface IndexPanelProps {
@@ -93,8 +94,6 @@ interface StockRow {
   points: Contribution
   /** 1m % change snapshots since session open. */
   spark: number[]
-  /** Per-minute traded-volume deltas, aligned with `spark`. */
-  volumes: number[]
 }
 
 /** Columns the constituent table sorts on; weight (index order) is the default. */
@@ -127,8 +126,12 @@ function IndexLive(props: IndexPanelProps & { profile: IndexProfile }) {
   const { profile } = props
   const [tick, setTick] = useState(0)
   const [detail, setDetail] = useState<StockRow | null>(null)
+  /** The donut's focused stock: the circle that was clicked, or null when shut. */
+  const [donut, setDonut] = useState<string | null>(null)
   const [sortKey, setSortKey] = useState<ConstituentSort>('weight')
   const [sortDir, setSortDir] = useState<1 | -1>(1)
+  /** The filter box above the table: a symbol substring, case-insensitive. */
+  const [query, setQuery] = useState('')
 
   // Quote everything at once: the constituents + the index spot itself, in
   // Quote mode so volumes and opens ride along with the LTPs.
@@ -155,22 +158,18 @@ function IndexLive(props: IndexPanelProps & { profile: IndexProfile }) {
         const quote = quotesRef.current.get(`${profile.stockExchange}:${row.symbol}`)?.data
         let series = seriesRef.current.get(row.symbol)
         if (!series) {
-          series = { points: [], volumes: [], lastBucket: bucket, firstLtp: 0, lastVolume: 0 }
+          series = { points: [], lastBucket: bucket, firstLtp: 0 }
           seriesRef.current.set(row.symbol, series)
         }
         const ltp = quote?.ltp ?? 0
         if (ltp > 0 && series.firstLtp === 0) series.firstLtp = ltp
-        const volume = quote?.volume ?? 0
         if (bucket !== series.lastBucket) {
-          // A new minute closed: snapshot % change and the volume delta.
+          // A new minute closed: snapshot % change for the sparkline.
           const reference = sessionReference(quote, series.firstLtp)
           series.points.push(reference ? ((ltp - reference) / reference) * 100 : 0)
-          series.volumes.push(Math.max(0, volume - series.lastVolume))
           if (series.points.length > MAX_MINUTES) series.points.shift()
-          if (series.volumes.length > MAX_MINUTES) series.volumes.shift()
           series.lastBucket = bucket
         }
-        series.lastVolume = volume
       }
       setTick((value) => value + 1)
     }, 1000)
@@ -210,7 +209,6 @@ function IndexLive(props: IndexPanelProps & { profile: IndexProfile }) {
             share: 0,
           },
           spark: series?.points ?? [],
-          volumes: series?.volumes ?? [],
         }
       }),
     [profile, quotes, pctBySymbol, ledger]
@@ -274,10 +272,18 @@ function IndexLive(props: IndexPanelProps & { profile: IndexProfile }) {
     }
   }
 
+  /** The filter's case-insensitive symbol substring, trimmed. */
+  const needle = query.trim().toUpperCase()
+  const visibleRows = needle ? sortedRows.filter((row) => row.symbol.includes(needle)) : sortedRows
+
   return (
-    <div className="flex flex-col">
-      <div className="flex items-stretch gap-2 border-b px-1.5 py-1">
-        {/* Spot + combined 1m studies */}
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 items-stretch gap-2 border-b px-1.5 py-1">
+        {/* Spot line + the contribution pack, one band. The combined 1m studies
+            that used to sit under the spot line are gone — their volume half
+            now lives on the index chart itself, rebuilt from these same
+            members (lib/trading/indexVolume), where it reads at every
+            timeframe instead of only after a minute closes. */}
         <div className="flex min-w-0 flex-1 flex-col gap-1">
           <div className="flex items-center gap-2">
             <span className="text-[11px] font-semibold">{profile.label}</span>
@@ -304,19 +310,44 @@ function IndexLive(props: IndexPanelProps & { profile: IndexProfile }) {
               )}
               <span className="ml-1">{profile.constituents.length} stocks</span>
             </span>
-            <span className="ml-auto text-[9px] text-muted-foreground">
-              weights indicative · 1m series builds while this tab is open
+          </div>
+          {/* The filter: a substring over the symbol column, live while the
+              quotes run. Sorted state and filter compose — a narrowed view
+              keeps the trader's sort. */}
+          <div className="flex items-center gap-1 rounded border bg-background/50 px-1.5 py-0.5">
+            <Search className="h-3 w-3 shrink-0 text-muted-foreground" />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Filter stocks…"
+              aria-label="Filter constituents"
+              className="h-5 w-full min-w-0 bg-transparent text-[11px] outline-none placeholder:text-muted-foreground/60"
+            />
+            {query && (
+              <button
+                type="button"
+                aria-label="Clear the filter"
+                className="text-[10px] text-muted-foreground hover:text-foreground"
+                onClick={() => setQuery('')}
+              >
+                ✕
+              </button>
+            )}
+            <span className="shrink-0 text-[9px] text-muted-foreground">
+              {visibleRows.length}/{rows.length}
             </span>
           </div>
-          <MinuteStudies rows={rows} colorOf={colorOf} />
         </div>
 
-        {/* Contribution bubble pack */}
-        <ContributionBubbles rows={rows} onPick={setDetail} />
+        {/* Contribution bubble pack — click a circle for the donut */}
+        <ContributionBubbles rows={rows} onDonut={setDonut} />
       </div>
 
-      {/* Constituents table — click a header to sort, click again to flip */}
-      <div className="max-h-52 overflow-y-auto">
+      {/* Constituents table — click a header to sort, click again to flip.
+          The table owns the panel's one scroll: it stretches to everything
+          below the header band, so the panel reads full height and only
+          ever shows a scrollbar when the rows ask for one. */}
+      <div className="min-h-0 flex-1 overflow-y-auto">
         <table className="w-full border-collapse text-[10px]">
           <thead className="sticky top-0 z-10 bg-background">
             <tr className="text-[9px] uppercase tracking-wide text-muted-foreground">
@@ -352,7 +383,7 @@ function IndexLive(props: IndexPanelProps & { profile: IndexProfile }) {
             </tr>
           </thead>
           <tbody>
-            {sortedRows.map((row) => (
+            {visibleRows.map((row) => (
               <StockRowLine
                 key={row.symbol}
                 row={row}
@@ -369,6 +400,12 @@ function IndexLive(props: IndexPanelProps & { profile: IndexProfile }) {
       </div>
 
       <StockDetailDialog row={detail} profile={profile} onClose={() => setDetail(null)} />
+      <ContributionDonut
+        rows={rows}
+        profile={profile}
+        focused={donut}
+        onClose={() => setDonut(null)}
+      />
     </div>
   )
 }
@@ -539,137 +576,177 @@ export function Sparkline(props: { points: number[]; width: number; height: numb
   )
 }
 
-/* ── Combined 1m studies: stacked volume + weighted price % ─────────────── */
+/* ── Who moves the index: the donut ─────────────────────────────────────── */
 
-function MinuteStudies(props: { rows: StockRow[]; colorOf(symbol: string): string }) {
-  const { rows, colorOf } = props
-  // The stacked volume frame: per minute, per stock volume deltas. Bucket
-  // epochs come from the clock at build time — every stock pushes at the
-  // same tick, so their series share one length and one clock.
-  const frame = useMemo(() => {
-    const lastBucket = Math.floor(Date.now() / 60000) - 1
-    const stocks = [...rows].sort((a, b) => (b.volume ?? 0) - (a.volume ?? 0))
-    const length = Math.max(0, ...stocks.map((row) => row.volumes.length))
-    const minutes: Array<{
-      bucket: number
-      total: number
-      segments: Array<{ symbol: string; value: number; color: string }>
-    }> = []
-    for (let minute = 0; minute < length; minute++) {
-      let total = 0
-      const segments: Array<{ symbol: string; value: number; color: string }> = []
-      for (const row of stocks) {
-        const value = row.volumes[minute] ?? 0
-        if (value <= 0) continue
-        total += value
-        segments.push({ symbol: row.symbol, value, color: colorOf(row.symbol) })
-      }
-      if (total > 0) {
-        minutes.push({
-          bucket: (lastBucket - (length - 1 - minute)) * 60000,
-          total,
-          segments,
-        })
-      }
-    }
-    return minutes
-  }, [rows, colorOf])
+/**
+ * The contribution ledger as a donut, opened by clicking a bubble.
+ *
+ * Slices are each stock's share of the index's absolute move — area, not
+ * direction — and the fill says which way it pushed: green lifted, red
+ * dragged. The centre carries the net. Beside the ring, every slice's own
+ * numbers: the stock's move, the index points it explains, the share. The
+ * circle that was clicked is outlined and first in the list, so the click
+ * reads as an answer to "this one — how much of it was this stock?".
+ */
+function ContributionDonut(props: {
+  rows: StockRow[]
+  profile: IndexProfile
+  focused: string | null
+  onClose(): void
+}) {
+  const { focused } = props
+  const slices = useMemo(() => {
+    const live = props.rows
+      .filter((row) => row.ltp != null && Math.abs(row.points.points) > 0)
+      .sort((a, b) => Math.abs(b.points.points) - Math.abs(a.points.points))
+    const total = live.reduce((sum, row) => sum + Math.abs(row.points.points), 0)
+    if (total <= 0) return { slices: [], total: 0, net: 0 }
+    const net = props.rows.reduce((sum, row) => sum + row.points.points, 0)
+    // The focused circle leads, however small it is; the rest keep size order.
+    const ordered = focused
+      ? [
+          ...live.filter((row) => row.symbol === focused),
+          ...live.filter((row) => row.symbol !== focused),
+        ]
+      : live
+    return { slices: ordered, total, net }
+  }, [props.rows, focused])
 
-  const maxMinute = Math.max(1, ...frame.map((minute) => minute.total))
-
-  // The weighted price-% trail, one bar per minute bucket.
-  const pctTrail = useMemo(() => {
-    const length = Math.max(0, ...rows.map((row) => row.spark.length))
-    const out: number[] = []
-    for (let minute = 0; minute < length; minute++) {
-      let move = 0
-      for (const row of rows) {
-        const value = row.spark[minute]
-        if (value == null) continue
-        move += (row.weight * value) / 100
-      }
-      out.push(move)
-    }
-    return out
-  }, [rows])
-  const maxAbsPct = Math.max(0.05, ...pctTrail.map((value) => Math.abs(value)))
-
-  if (frame.length === 0 && pctTrail.length === 0) {
-    return (
-      <div className="flex h-14 items-center rounded border border-dashed px-2 text-[9px] text-muted-foreground">
-        1m volume stack + price-% trail appear as the first minute closes…
-      </div>
-    )
-  }
+  const netPct = weightedIndexMove(props.profile, new Map(props.rows.map((r) => [r.symbol, r.pct])))
+  const R = 58
+  const CX = 76
+  const CY = 76
+  let acc = -Math.PI / 2
+  const arcs = slices.slices.slice(0, 10).map((row) => {
+    const frac = Math.abs(row.points.points) / slices.total
+    const start = acc
+    const end = acc + frac * Math.PI * 2
+    acc = end
+    const large = end - start > Math.PI ? 1 : 0
+    const p = (angle: number, radius: number) =>
+      `${CX + Math.cos(angle) * radius},${CY + Math.sin(angle) * radius}`
+    const d = `M${p(start, R)} A${R},${R} 0 ${large} 1 ${p(end, R)} L${CX},${CY} Z`
+    return { row, d, frac }
+  })
 
   return (
-    <div className="flex h-14 gap-2">
-      {/* Stacked per-minute volume, segments = stocks */}
-      <div className="flex min-w-0 flex-1 flex-col rounded border px-1 pt-0.5">
-        <span className="text-[8px] uppercase tracking-wide text-muted-foreground">
-          Volume / min — stacked by stock (hover a segment)
-        </span>
-        <div className="flex min-h-0 flex-1 items-end gap-px">
-          {frame.slice(-MAX_MINUTES).map((minute) => (
-            <div
-              key={minute.bucket}
-              className="flex min-w-[3px] flex-1 flex-col-reverse overflow-hidden rounded-[1px]"
-              style={{ height: `${(minute.total / maxMinute) * 100}%` }}
-              title={`${minuteLabel(minute.bucket)} · ${fmtVol(minute.total)} traded`}
+    <Dialog open={focused != null} onOpenChange={(value) => !value && props.onClose()}>
+      <DialogContent className="max-w-sm p-4 text-xs">
+        <DialogHeader>
+          <DialogTitle className="text-sm">
+            Who moves {props.profile.label}
+            {focused && <span className="font-mono"> — {focused}</span>}
+          </DialogTitle>
+          <DialogDescription className="text-[10px]">
+            Slice area = share of the index's absolute move; green lifted it, red dragged it.
+          </DialogDescription>
+        </DialogHeader>
+        {arcs.length === 0 ? (
+          <p className="py-6 text-center text-[11px] text-muted-foreground">
+            Awaiting live quotes — the split lands with them.
+          </p>
+        ) : (
+          <div className="flex items-center gap-3">
+            <svg
+              width={152}
+              height={152}
+              role="img"
+              aria-label="Contribution donut"
+              className="shrink-0"
             >
-              {minute.segments.map((segment) => (
-                <div
-                  key={segment.symbol}
-                  style={{
-                    height: `${(segment.value / minute.total) * 100}%`,
-                    backgroundColor: segment.color,
-                  }}
-                  title={`${segment.symbol} · ${fmtVol(segment.value)} · ${minuteLabel(minute.bucket)}`}
-                />
-              ))}
+              {arcs.map(({ row, d }) => {
+                const positive = row.points.points >= 0
+                const isFocused = row.symbol === focused
+                return (
+                  <path
+                    key={row.symbol}
+                    d={d}
+                    fill={positive ? '#10b981' : '#ef4444'}
+                    fillOpacity={isFocused ? 0.85 : 0.45}
+                    stroke={isFocused ? (positive ? '#047857' : '#b91c1c') : 'transparent'}
+                    strokeWidth={isFocused ? 2 : 0}
+                  >
+                    <title>{`${row.symbol} · ${fmtPct(row.pct)} · ${row.points.points >= 0 ? '+' : ''}${row.points.points.toFixed(2)}pt · ${row.points.share >= 0 ? '+' : ''}${row.points.share.toFixed(0)}% of move`}</title>
+                  </path>
+                )
+              })}
+              <text
+                x={CX}
+                y={CY - 6}
+                textAnchor="middle"
+                fontSize={13}
+                className="fill-foreground font-semibold"
+              >
+                {slices.net >= 0 ? '+' : ''}
+                {slices.net.toFixed(2)}
+              </text>
+              <text
+                x={CX}
+                y={CY + 9}
+                textAnchor="middle"
+                fontSize={9}
+                className="fill-muted-foreground"
+              >
+                net move pt
+              </text>
+              <text
+                x={CX}
+                y={CY + 22}
+                textAnchor="middle"
+                fontSize={9}
+                className={netPct >= 0 ? 'fill-emerald-500' : 'fill-red-500'}
+              >
+                {fmtPct(netPct)}
+              </text>
+            </svg>
+            <div className="min-w-0 flex-1">
+              <table className="w-full border-collapse text-[10px]">
+                <thead>
+                  <tr className="text-[8px] uppercase tracking-wide text-muted-foreground">
+                    <th className="px-0.5 py-0.5 text-left font-medium">Stock</th>
+                    <th className="px-0.5 py-0.5 text-right font-medium">Chg%</th>
+                    <th className="px-0.5 py-0.5 text-right font-medium">Pt</th>
+                    <th className="px-0.5 py-0.5 text-right font-medium">Share</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {arcs.map(({ row }) => (
+                    <tr key={row.symbol} className="border-t border-border/50">
+                      <td className="px-0.5 py-0.5 font-mono font-medium">{row.symbol}</td>
+                      <td
+                        className={cn(
+                          'px-0.5 py-0.5 text-right font-mono tabular-nums',
+                          row.pct >= 0 ? 'text-emerald-500' : 'text-red-500'
+                        )}
+                      >
+                        {fmtPct(row.pct)}
+                      </td>
+                      <td className="px-0.5 py-0.5 text-right font-mono tabular-nums">
+                        {row.points.points >= 0 ? '+' : ''}
+                        {row.points.points.toFixed(2)}
+                      </td>
+                      <td className="px-0.5 py-0.5 text-right font-mono tabular-nums">
+                        {row.points.share >= 0 ? '+' : ''}
+                        {row.points.share.toFixed(0)}%
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="mt-1 text-[9px] text-muted-foreground">
+                Weights are indicative free-float figures; contribution = weight × stock move.
+              </p>
             </div>
-          ))}
-        </div>
-      </div>
-      {/* Weighted price-% per minute */}
-      <div className="flex w-36 flex-col rounded border px-1 pt-0.5">
-        <span className="text-[8px] uppercase tracking-wide text-muted-foreground">
-          Index % / min
-        </span>
-        <div className="relative min-h-0 flex-1">
-          <div className="absolute top-1/2 w-full border-t border-dashed border-muted-foreground/30" />
-          <div className="flex h-full items-center gap-px">
-            {pctTrail.slice(-MAX_MINUTES).map((value, index) => {
-              const length = pctTrail.length
-              const bucket = Math.floor(Date.now() / 60000) - 1 - (length - 1 - index)
-              return (
-                <div
-                  key={index}
-                  className={cn(
-                    'min-w-[3px] flex-1 self-center rounded-[1px]',
-                    value >= 0 ? 'bg-emerald-500/80' : 'bg-red-500/80'
-                  )}
-                  style={{ height: `${(Math.abs(value) / maxAbsPct) * 48}%` }}
-                  title={`${minuteLabel(bucket)} · ${fmtPct(value)} weighted`}
-                />
-              )
-            })}
           </div>
-        </div>
-      </div>
-    </div>
+        )}
+      </DialogContent>
+    </Dialog>
   )
-}
-
-function minuteLabel(bucket: number): string {
-  // `bucket` is a minute-epoch (floor(Date.now()/60000) of that minute).
-  const date = new Date(bucket * 60000)
-  return date.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
 /* ── Contribution bubble pack ────────────────────────────────────────────── */
 
-function ContributionBubbles(props: { rows: StockRow[]; onPick(row: StockRow): void }) {
+function ContributionBubbles(props: { rows: StockRow[]; onDonut(symbol: string): void }) {
   const W = 210
   const H = 132
   const layout = useMemo(() => {
@@ -717,7 +794,7 @@ function ContributionBubbles(props: { rows: StockRow[]; onPick(row: StockRow): v
   return (
     <div className="w-[218px] shrink-0 rounded border px-1 pt-0.5">
       <span className="text-[8px] uppercase tracking-wide text-muted-foreground">
-        Who moves the index — click a circle
+        Who moves the index — click a circle for the donut
       </span>
       {layout.circles.length === 0 ? (
         <div className="flex h-[118px] items-center justify-center text-[9px] text-muted-foreground">
@@ -734,7 +811,11 @@ function ContributionBubbles(props: { rows: StockRow[]; onPick(row: StockRow): v
           {layout.circles.map(({ row, cx, cy, r }) => {
             const positive = row.points.points >= 0
             return (
-              <g key={row.symbol} onClick={() => props.onPick(row)} className="cursor-pointer">
+              <g
+                key={row.symbol}
+                onClick={() => props.onDonut(row.symbol)}
+                className="cursor-pointer"
+              >
                 <title>
                   {`${row.symbol} ${fmtPct(row.pct)} · ${row.points.points >= 0 ? '+' : ''}${row.points.points.toFixed(2)}pt · ${row.points.share >= 0 ? '+' : ''}${row.points.share.toFixed(0)}% of move`}
                 </title>

@@ -128,6 +128,7 @@ import {
 } from '@/lib/trading/workspaceReplay'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
+import { useOneClickStore } from '@/stores/oneClickStore'
 import { showToast } from '@/utils/toast'
 
 const NO_DRAW: DrawStats = {
@@ -148,11 +149,11 @@ const LAYOUT_KEY = 'oa-trading-layout'
 const SYNC_KEY = 'oa-trading-sync'
 const PANEL_KEY = 'oa-trading-panel'
 /**
- * One-Click, the scalping terminal's convention ('1' / '0'). Off by default
- * and off whenever the key is unreadable: a chart must never open with its
- * Buy button live because storage was cleared or blocked.
+ * One-Click, the scalping terminal's convention ('1' / '0'). The state itself
+ * lives in the oneClickStore now, so the dock, the chart menus and the deploy
+ * panel read the same switch the toolbar drives; the key and its '1' / '0'
+ * form are unchanged.
  */
-const ARMED_KEY = 'oa-trading-armed'
 /** The drawing rail folded away ('1') or shown ('0'), beside the rail's last tools. */
 const RAIL_FOLDED_KEY = 'oa-trading-rail-folded'
 
@@ -200,14 +201,6 @@ function loggedToFire(row: LoggedFire): AlertFire {
     ...(typeof row.price === 'number' ? { price: row.price } : {}),
     firedAt: row.firedAt ?? 0,
     delivered: row.delivered,
-  }
-}
-
-function readArmed(): boolean {
-  try {
-    return localStorage.getItem(ARMED_KEY) === '1'
-  } catch {
-    return false
   }
 }
 
@@ -290,9 +283,12 @@ function TradingWorkspace({ account }: { account: string | null }) {
   /**
    * One-Click for the whole workspace. Every pane follows it, like sync: the
    * on-chart Buy in one pane must not fire while the same button in the next
-   * pane asks first.
+   * pane asks first. The store owns the state and its persistence — and the
+   * dock, the position rows and the deploy panel read the same value, so a
+   * confirm skipped on the chart is skipped everywhere.
    */
-  const [armed, setArmed] = useState<boolean>(readArmed)
+  const armed = useOneClickStore((s) => s.armed)
+  const setArmed = useOneClickStore((s) => s.setArmed)
   /**
    * The workspace-level chart settings — the dialog that fans a change out
    * to every open pane. Beside the One-Click switch, which is its neighbor
@@ -855,15 +851,6 @@ function TradingWorkspace({ account }: { account: string | null }) {
     writeDockTab(dock)
   }, [dock])
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(ARMED_KEY, armed ? '1' : '0')
-    } catch {
-      // Storage refused (private mode, quota): the switch still works for
-      // this visit, it just does not survive a reload.
-    }
-  }, [armed])
-
   /**
    * Escape closes the open panel, the way it disarms a drawing tool. Without
    * it the only way back to a full-width chart is a 32px target in the corner.
@@ -1066,7 +1053,8 @@ function TradingWorkspace({ account }: { account: string | null }) {
       setMagnet(draw.magnetMode)
       setStay(draw.stay)
     },
-    [updateReplayMembers]
+    // The store's setArmed is a stable action; the listing documents it.
+    [updateReplayMembers, setArmed]
   )
   const workspace = useWorkspaceGridTransition(account, publishWorkspace, lockWorkspace)
 
@@ -1122,7 +1110,7 @@ function TradingWorkspace({ account }: { account: string | null }) {
   }, [activeWorkspaceId, saveStamp, autosave.markSaved])
   useEffect(() => {
     if (workspace.pending) setArmed(false)
-  }, [workspace.pending])
+  }, [workspace.pending, setArmed])
   const openWorkspace = async (document: WorkspaceDocument) => {
     const revision = workspaceCatalog.catalog?.revision
     await workspace.open(

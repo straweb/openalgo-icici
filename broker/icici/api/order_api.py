@@ -462,6 +462,78 @@ def get_holdings(auth):
 # Place / smart order
 # ---------------------------------------------------------------------------
 
+
+def _auto_limit_price(data: dict, auth) -> float | None:
+    """
+    The live price an auto-priced limit rests at, or None when the quote
+    cannot be read.
+
+    ICICI Direct's API desk rejects market orders outright ("ALGO_CHK: MKT
+    Order type not allowed for API order") and a limit at zero price
+    ("Order price cannot be zero"), so every MARKET and every zero-priced
+    LIMIT resolves here to a marketable limit at the live price — the same
+    price the UI's MPP mode would pick.
+    """
+
+    symbol = str(data.get("symbol") or "")
+    exchange = str(data.get("exchange") or "")
+
+    if not symbol or not exchange:
+        return None
+
+    try:
+        # Imported here rather than at the top: data.py pulls the mapping
+        # layer, and a quote failure must degrade to None, not break import.
+        from broker.icici.api.data import BrokerData
+
+        quote = BrokerData(auth).get_quotes(symbol, exchange)
+    except Exception as exc:
+        logger.warning(
+            "ICICI auto-price quote failed for %s:%s: %s", exchange, symbol, exc
+        )
+        return None
+
+    try:
+        ltp = float(quote.get("ltp") or 0)
+    except (TypeError, ValueError):
+        return None
+
+    return ltp if ltp > 0 else None
+
+
+def _price_marketable_limit(payload: dict, data: dict, auth) -> str | None:
+    """
+    Rewrite a payload the broker would refuse into a limit at the live
+    price. Returns the refusal message when no price could be resolved,
+    None when the payload is sendable as (possibly rewritten) is.
+    """
+
+    order_type = str(payload.get("order_type") or "").lower()
+
+    try:
+        price_val = float(payload.get("price") or 0)
+    except (TypeError, ValueError):
+        price_val = 0.0
+
+    if order_type not in ("market", "limit") or price_val > 0:
+        return None
+
+    ltp = _auto_limit_price(data, auth)
+
+    if ltp is None:
+        reason = (
+            "MARKET order type is not allowed for API orders on ICICI Direct"
+            if order_type == "market"
+            else "Order price cannot be zero"
+        )
+        return f"{reason} and no live price was available to price a limit"
+
+    payload["order_type"] = "limit"
+    payload["price"] = str(round(ltp, 2))
+
+    return None
+
+
 def place_order_api(data, auth):
     """
     Place an order. Returns (response, response_data, orderid) where
@@ -474,6 +546,18 @@ def place_order_api(data, auth):
         logger.exception("ICICI order payload transform failed")
 
         return _error(f"Invalid order payload: {exc}", 400)
+
+    # MARKET and zero-priced LIMIT both go out as a marketable limit at the
+    # live price: the two rejections the API desk answers with otherwise
+    # ("MKT Order type not allowed for API order", "Order price cannot be
+    # zero"). A quote that cannot be read refuses here with the reason,
+    # instead of forwarding a payload the broker rejects anyway.
+    refusal = _price_marketable_limit(payload, data, auth)
+
+    if refusal:
+        logger.error("ICICI order refused pre-send: %s", refusal)
+
+        return _error(refusal, 400)
 
     logger.info("Payload for ICICI place_order_api: %s", payload)
 

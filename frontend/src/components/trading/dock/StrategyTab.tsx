@@ -18,12 +18,15 @@
  * conditions need.
  */
 
-import { Plus, Trash2 } from 'lucide-react'
+import { Plus, Search, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { hedgingApi } from '@/api/hedging'
+import { type SymbolHit, searchInstruments } from '@/components/trading/SymbolCombobox'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import {
+  describeConditions,
   evalConditions,
   exitReason,
   istSecondsNow,
@@ -76,6 +79,119 @@ function splitActive(activeSymbol: string | null): { symbol: string; exchange: s
   const at = activeSymbol.indexOf(':')
   if (at <= 0) return null
   return { exchange: activeSymbol.slice(0, at), symbol: activeSymbol.slice(at + 1) }
+}
+
+/**
+ * The underlying, picked the deploy panel's way: type ahead, the broker-wide
+ * search answers, a hit sets symbol and exchange in one press. The plain
+ * input it replaces made the trader know the exact symbol AND the exchange
+ * it trades on — two guesses where one search should be.
+ */
+function UnderlyingPick({
+  apiKey,
+  current,
+  onPick,
+}: {
+  apiKey: string
+  current: { symbol: string; exchange: string }
+  onPick(hit: SymbolHit): void
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [hits, setHits] = useState<SymbolHit[]>([])
+  const [searching, setSearching] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    const trimmed = query.trim()
+    if (trimmed.length < 2) {
+      setHits([])
+      setSearching(false)
+      return
+    }
+    let alive = true
+    setSearching(true)
+    const timer = window.setTimeout(async () => {
+      try {
+        const list = await searchInstruments(apiKey, trimmed)
+        if (alive) setHits(list)
+      } catch {
+        if (alive) setHits([])
+      } finally {
+        if (alive) setSearching(false)
+      }
+    }, 250)
+    return () => {
+      alive = false
+      window.clearTimeout(timer)
+    }
+  }, [apiKey, open, query])
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next)
+        if (!next) setQuery('')
+      }}
+    >
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 gap-1 px-2 text-[12px] font-mono"
+          aria-label="Pick the underlying — search the broker's instruments"
+        >
+          <Search className="h-3 w-3 opacity-60" />
+          <span className="max-w-[150px] truncate">{current.symbol || 'pick underlying…'}</span>
+          <span className="rounded bg-muted px-1 text-[9px] text-muted-foreground">
+            {current.exchange}
+          </span>
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[260px] p-2" align="start">
+        <Input
+          autoFocus
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="NIFTY, SENSEX, RELIANCE…"
+          className="h-7 text-xs"
+          aria-label="Search the underlying"
+        />
+        <div className="mt-1 max-h-[200px] overflow-y-auto">
+          {searching && <p className="px-1 py-1 text-[10px] text-muted-foreground">Searching…</p>}
+          {!searching && hits.length === 0 && query.trim().length >= 2 && (
+            <p className="px-1 py-1 text-[10px] text-muted-foreground">No instrument found.</p>
+          )}
+          {!searching && query.trim().length < 2 && (
+            <p className="px-1 py-1 text-[10px] text-muted-foreground">
+              Type two letters — indexes, stocks, anything the broker lists.
+            </p>
+          )}
+          {hits.map((hit) => (
+            <button
+              key={`${hit.exchange}:${hit.symbol}`}
+              type="button"
+              onClick={() => {
+                onPick(hit)
+                setOpen(false)
+                setQuery('')
+              }}
+              className="flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-[11px] hover:bg-accent"
+            >
+              <span className="font-mono font-semibold">{hit.symbol}</span>
+              <span className="rounded bg-muted px-1 text-[9px] text-muted-foreground">
+                {hit.exchange}
+              </span>
+              {hit.name && (
+                <span className="truncate text-[10px] text-muted-foreground">{hit.name}</span>
+              )}
+            </button>
+          ))}
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
 }
 
 /** One condition row's editors, shared by the entry and exit lists. */
@@ -386,6 +502,11 @@ export function StrategyTab({ apiKey, wsUrl, activeSymbol, refuse, refresh }: Pr
     if (ok) patch(bot.id, { status: 'completed', closedAt: Date.now(), note: 'manual exit' })
   }
 
+  const legNameOf = useCallback(
+    (bot: StrategyBot) => (legId: string) => bot.legs.find((l) => l.id === legId)?.symbol,
+    []
+  )
+
   const startDraft = () => {
     const seed = splitActive(activeSymbol)
     setDraft({
@@ -446,14 +567,15 @@ export function StrategyTab({ apiKey, wsUrl, activeSymbol, refuse, refresh }: Pr
               aria-label="Bot name"
               className="h-7 w-[140px] text-[12px]"
             />
-            <Input
-              value={draft.underlying.symbol}
-              onChange={(e) =>
-                setDraft({ ...draft, underlying: { ...draft.underlying, symbol: e.target.value } })
+            <UnderlyingPick
+              apiKey={apiKey}
+              current={draft.underlying}
+              onPick={(hit) =>
+                setDraft({
+                  ...draft,
+                  underlying: { symbol: hit.symbol, exchange: hit.exchange },
+                })
               }
-              aria-label="Underlying index symbol"
-              placeholder="NIFTY 50"
-              className="h-7 w-[130px] text-[12px]"
             />
             <select
               value={draft.underlying.exchange}
@@ -654,6 +776,18 @@ export function StrategyTab({ apiKey, wsUrl, activeSymbol, refuse, refresh }: Pr
             </div>
           </div>
 
+          {/* The bot's query, as Start will read it — the preview of what is
+              selected, before it is armed. */}
+          <div
+            role="note"
+            aria-label="Condition query preview"
+            className="mt-2 rounded border bg-background/60 px-1.5 py-1 font-mono text-[10px] leading-relaxed text-muted-foreground"
+          >
+            <span className="font-semibold text-foreground">QUERY</span> {draft.side} when{' '}
+            {describeConditions(draft.entry, legNameOf(draft))} · exit when{' '}
+            {describeConditions(draft.exit, legNameOf(draft))} · {draft.product} · {draft.pricetype}
+          </div>
+
           <div className="mt-2 flex flex-wrap items-center gap-1.5">
             <label className="flex items-center gap-1 text-[11px] text-muted-foreground">
               Target (pts)
@@ -788,6 +922,16 @@ export function StrategyTab({ apiKey, wsUrl, activeSymbol, refuse, refresh }: Pr
                     </button>
                   )}
                 </span>
+              </div>
+              {/* The query the bot acts on, in the words the conditions are
+                  written in — the same sentence the draft shows before Save. */}
+              <div
+                role="note"
+                aria-label={`${bot.name} condition query`}
+                className="mt-0.5 font-mono text-[9.5px] leading-relaxed text-muted-foreground"
+              >
+                {bot.side} when {describeConditions(bot.entry, legNameOf(bot))} · exit when{' '}
+                {describeConditions(bot.exit, legNameOf(bot))}
               </div>
               {running && (
                 <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[10px] tabular-nums text-muted-foreground">

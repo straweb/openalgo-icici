@@ -3,7 +3,10 @@
  *
  * Cancel all and Close all are risk-reducing, so they are not behind the
  * One-Click switch: disarming must never disable the way out. They are
- * behind a confirm instead, because each acts on everything at once.
+ * behind a confirm instead, because each acts on everything at once — and
+ * One-Click armed, the confirm steps aside: the trader has said they want
+ * their clicks to land without a second question, and these are their
+ * clicks.
  */
 
 import {
@@ -20,6 +23,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { useOneClickStore } from '@/stores/oneClickStore'
 import { toneClass } from './cells'
 import { signed } from './format'
 
@@ -67,6 +71,34 @@ export function PnlStrip({
   onCloseAll,
   formatCurrency,
 }: Props) {
+  // One-Click armed, the flatten buttons fire where they stand. The dialogs
+  // stay mounted for the disarmed path — the same buttons, one question.
+  const armed = useOneClickStore((s) => s.armed)
+
+  const cancelAllButton = (
+    <Button
+      variant="outline"
+      size="sm"
+      className="h-6 px-2 text-[11px]"
+      disabled={workingOrders === 0}
+      onClick={armed ? onCancelAll : undefined}
+    >
+      Cancel all
+    </Button>
+  )
+
+  const closeAllButton = (
+    <Button
+      variant="outline"
+      size="sm"
+      className="h-6 px-2 text-[11px] text-rose-600 hover:text-rose-600 dark:text-rose-400"
+      disabled={openCount === 0}
+      onClick={armed ? onCloseAll : undefined}
+    >
+      Close all
+    </Button>
+  )
+
   return (
     <div className="flex min-w-0 items-center gap-3">
       <Figure label={`Open (${openCount})`} value={openPnl} format={formatCurrency} />
@@ -77,56 +109,46 @@ export function PnlStrip({
         </Badge>
       )}
 
-      <AlertDialog>
-        <AlertDialogTrigger asChild>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-6 px-2 text-[11px]"
-            disabled={workingOrders === 0}
-          >
-            Cancel all
-          </Button>
-        </AlertDialogTrigger>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Cancel all open orders?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Every working order is withdrawn, across every symbol. {workingOrders} in the book.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Keep</AlertDialogCancel>
-            <AlertDialogAction onClick={onCancelAll}>Cancel all orders</AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      {armed ? (
+        cancelAllButton
+      ) : (
+        <AlertDialog>
+          <AlertDialogTrigger asChild>{cancelAllButton}</AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Cancel all open orders?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Every working order is withdrawn, across every symbol. {workingOrders} in the book.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Keep</AlertDialogCancel>
+              <AlertDialogAction onClick={onCancelAll}>Cancel all orders</AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      )}
 
-      <AlertDialog>
-        <AlertDialogTrigger asChild>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-6 px-2 text-[11px] text-rose-600 hover:text-rose-600 dark:text-rose-400"
-            disabled={openCount === 0}
-          >
-            Close all
-          </Button>
-        </AlertDialogTrigger>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Close all positions?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Every open position is squared off at market, across every symbol and product.{' '}
-              {openCount} open.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Keep</AlertDialogCancel>
-            <AlertDialogAction onClick={onCloseAll}>Close all positions</AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      {armed ? (
+        closeAllButton
+      ) : (
+        <AlertDialog>
+          <AlertDialogTrigger asChild>{closeAllButton}</AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Close all positions?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Every open position is squared off at market, across every symbol and product.{' '}
+                {openCount} open.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Keep</AlertDialogCancel>
+              <AlertDialogAction onClick={onCloseAll}>Close all positions</AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      )}
     </div>
   )
 }

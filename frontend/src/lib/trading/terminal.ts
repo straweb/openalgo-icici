@@ -2236,13 +2236,6 @@ export class TradingTerminal {
     )
   }
 
-  private posLabel(): string {
-    if (!this.position) return ''
-    const mark = this.lastLtp != null ? this.lastLtp : this.position.avg
-    const pnl = (mark - this.position.avg) * this.position.net
-    return `@ ${this.fmt(this.position.avg)}  ${pnl >= 0 ? '+' : '-'}₹${money(Math.abs(pnl))}`
-  }
-
   private renderPosition(pos: Record<string, unknown> | undefined) {
     if (this.posLine && this.chart) {
       this.chart.removePrimitive(this.posLine)
@@ -2262,6 +2255,9 @@ export class TradingTerminal {
       this.renderPosBox()
       return
     }
+    // The line carries the marker (badge + qty + inline ✕) at its end; the
+    // "@ price, P&L" readout lives in the box docked top-right, where the
+    // trader reads a position's numbers — not painted over the plot.
     this.posLine = this.chart.addPriceLine(
       {
         price: this.position.avg,
@@ -2273,7 +2269,6 @@ export class TradingTerminal {
         closeButton: true,
         badge: this.position.net > 0 ? 'LONG' : 'SHORT',
         qty: Math.abs(this.position.net),
-        leftLabel: this.posLabel(),
       },
       0
     )
@@ -2478,6 +2473,14 @@ export class TradingTerminal {
       'style="border:0;border-radius:6px;cursor:pointer;padding:5px 10px 3px;color:#fff;background:#26a69a;' +
       'display:flex;flex-direction:column;align-items:center;line-height:1.1">B' +
       '<span data-i-buypx style="font-weight:400;font-size:9px;opacity:0.9"></span></button>'
+    // The strip is an order-entry control, not a chart surface: every
+    // pointer gesture it owns stays its own. Without this, a press on the
+    // buttons or the slider also reached the chart's own handlers — the pane
+    // took focus, the gesture read as a pan — and a click that should have
+    // fired an order moved the plot instead.
+    for (const type of ['pointerdown', 'pointerup', 'mousedown', 'touchstart'] as const) {
+      panel.addEventListener(type, (e) => e.stopPropagation())
+    }
     const sellBtn = panel.querySelector<HTMLButtonElement>('[data-i-sell]')
     const buyBtn = panel.querySelector<HTMLButtonElement>('[data-i-buy]')
     sellBtn?.addEventListener('click', (e) => {
@@ -2533,9 +2536,6 @@ export class TradingTerminal {
     if (!this.instantPanel) return
     const show = this.armed && !this.workspaceReplayLocked
     this.instantPanel.style.display = show ? 'flex' : 'none'
-    // The position box stacks under the strip, so its top follows the
-    // strip's visibility.
-    this.refreshPosBoxTop()
   }
 
   /** Keep the panel's prices and size readout in step with the quote. */
@@ -2631,6 +2631,10 @@ export class TradingTerminal {
       })
       this.toast(`instant ${summary} — ${pricing.note} (id ${r.orderId})`, 'ok')
       this.pollBook()
+      // The order just consumed (or freed) margin: re-read the funds now
+      // rather than waiting out the 30s poll, so the strip's next size
+      // reads against the broker's own number.
+      void this.pollCapital()
     } catch (e) {
       this.toast(this.cleanError(e), 'err')
     }
@@ -2677,23 +2681,16 @@ export class TradingTerminal {
   }
 
   /**
-   * The left edge both docked boxes share. The position box stacks under the
-   * Buy/Sell strip when the strip is on the chart, and takes the strip's own
-   * top when it is not, so an armed chart reads one column: strip, then
-   * position, then nothing.
+   * Both docked boxes share the top band of the chart. The Buy/Sell strip
+   * docks top-left below the legend; the position box docks top-right, so a
+   * chart with a position on it reads strip left, position right, and the
+   * position's numbers sit beside the price axis where the eye already is.
    */
   private posBoxTop(): number {
-    const strip = this.instantPanel
-    if (strip && strip.style.display !== 'none') return TRADE_PANEL.y + strip.offsetHeight + 6
     return TRADE_PANEL.y
   }
 
-  /** Re-read the position box's top after the strip's visibility moves. */
-  private refreshPosBoxTop(): void {
-    if (this.posBox) this.posBox.style.top = `${this.posBoxTop()}px`
-  }
-
-  /** Build (once) and refresh the open-position box docked top-left. */
+  /** Build (once) and refresh the open-position box docked top-right. */
   private renderPosBox(): void {
     if (!this.sym || this.sym.quoteOnly) {
       this.posBox?.remove()
@@ -2705,7 +2702,7 @@ export class TradingTerminal {
       box.setAttribute('data-pos-box', '1')
       box.style.cssText = [
         'position:absolute',
-        `left:${TRADE_PANEL.x}px`,
+        `right:${TRADE_PANEL.x}px`,
         `top:${TRADE_PANEL.y}px`,
         'display:none',
         'z-index:38',
@@ -2724,15 +2721,25 @@ export class TradingTerminal {
         '<span data-p-badge style="border-radius:4px;padding:1px 5px;font-size:9px;color:#fff"></span>' +
         '<span data-p-qty style="font-variant-numeric:tabular-nums"></span>' +
         '<span data-p-avg style="font-variant-numeric:tabular-nums;font-weight:400;opacity:0.8"></span>' +
+        // The inline close: the box's own exit. No panel, no confirm — the
+        // ✕ is the whole conversation, same as the line's ✕ and the pill's.
+        '<button data-p-x title="Close this position now — opposite side, priced at the live market" ' +
+        'style="margin-left:auto;border:0;background:transparent;color:var(--muted-foreground,#a1a1aa);' +
+        'cursor:pointer;font-size:11px;line-height:1;padding:1px 3px;border-radius:4px">✕</button>' +
         '</div>' +
         '<div data-p-pnl style="font-variant-numeric:tabular-nums;font-weight:600"></div>' +
-        '<div data-p-levels style="display:none;gap:3px;margin-top:3px;flex-wrap:wrap"></div>' +
-        '<button data-p-close title="Close this position now — market order, opposite side" ' +
-        'style="margin-top:4px;width:100%;border:0;border-radius:6px;cursor:pointer;' +
-        'padding:4px 0;color:#fff;background:#ef5350;font:600 10px/1.2 inherit">CLOSE</button>'
-      box.querySelector('[data-p-close]')?.addEventListener('click', (e) => {
+        '<div data-p-levels style="display:none;gap:3px;margin-top:3px;flex-wrap:wrap"></div>'
+      const px = box.querySelector<HTMLButtonElement>('[data-p-x]')
+      px?.addEventListener('click', (e) => {
         e.preventDefault()
+        e.stopPropagation()
         void this.closePositionNow()
+      })
+      px?.addEventListener('pointerenter', () => {
+        if (px) px.style.color = '#f87171'
+      })
+      px?.addEventListener('pointerleave', () => {
+        if (px) px.style.color = 'var(--muted-foreground, #a1a1aa)'
       })
       this.container.appendChild(box)
       this.posBox = box
@@ -2981,7 +2988,8 @@ export class TradingTerminal {
    * position, the position's own product first — and one retry with the
    * terminal's product when the book row's product is refused — because a
    * close button that needs a second explanation is not a close button.
-   * The pill's ✕ and the box's CLOSE both land here.
+   * The pill's ✕, the line's ✕ and the box's inline ✕ all land here, and
+   * none of them ask twice.
    */
   async closePositionNow(): Promise<void> {
     if (this.closingPosition) return
@@ -3006,6 +3014,7 @@ export class TradingTerminal {
       })
       this.toast(`closed ${qty} ${this.sym.symbol} at market — position flat`, 'ok')
       this.pollBook()
+      void this.pollCapital()
     } catch (e) {
       const alt = product !== this.product ? (this.product as 'CNC' | 'NRML' | 'MIS') : null
       if (alt) {
@@ -3021,6 +3030,7 @@ export class TradingTerminal {
           })
           this.toast(`closed ${qty} ${this.sym.symbol} (${alt}) — position flat`, 'ok')
           this.pollBook()
+          void this.pollCapital()
         } catch (e2) {
           this.toast(this.cleanError(e2), 'err')
         }
@@ -3129,6 +3139,7 @@ export class TradingTerminal {
       })
       this.toast(`placed ${summary}${note ? ` — ${note}` : ''} (id ${r.orderId})`, 'ok')
       this.pollBook()
+      void this.pollCapital()
     } catch (e) {
       this.toast(this.cleanError(e), 'err')
     }
@@ -3160,6 +3171,7 @@ export class TradingTerminal {
         mode: this.tradeMode(),
       })
       this.pollBook()
+      void this.pollCapital()
       return { orderId: r.orderId }
     } catch (e) {
       throw new Error(this.cleanError(e))
@@ -7421,10 +7433,7 @@ export class TradingTerminal {
     if (!this.sym || (e.symbol && e.symbol !== this.sym.symbol)) return
     this.lastLtp = e.ltp
     this.cb.onLtp(e.ltp)
-    // Recolour with the price: the line belongs to the forming candle, so it
-    // follows that candle's direction rather than sitting amber forever.
-    if (this.position && this.posLine) this.posLine.setLeftLabel(this.posLabel())
-    // The top-right box's P&L row follows the tick too.
+    // The box's P&L row follows the tick; the line carries only the marker.
     this.renderPosBoxPnl()
     // No depth? The panel still gets a price to show: the LTP marks both
     // sides rather than leaving the strip blank on a quote-only feed.

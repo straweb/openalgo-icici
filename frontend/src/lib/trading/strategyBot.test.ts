@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  describeConditions,
   entryEdge,
   evalConditions,
   exitReason,
@@ -208,5 +209,36 @@ describe('loadBots', () => {
     globalThis.localStorage.setItem('oa-trading-strategy-bots', '{not json')
     expect(loadBots()).toEqual([])
     globalThis.localStorage.removeItem('oa-trading-strategy-bots')
+  })
+})
+
+describe('describeConditions', () => {
+  it("reads a list left to right with each row's joiner in front", () => {
+    const conds = [
+      cond(),
+      cond({ id: 'c2', join: 'and', field: 'index', op: '>=', value: 72000 }),
+      cond({ id: 'c3', join: 'or', field: 'time', op: '>', value: 10 * 3600 }),
+    ]
+    expect(describeConditions(conds)).toBe('index < 73800 AND index >= 72000 OR time > 10:00:00')
+  })
+
+  it('names a strike condition by its leg, not its id', () => {
+    const conds = [cond({ field: 'strike', legId: 'leg-ce', op: '>=', value: 120 })]
+    expect(
+      describeConditions(conds, (id) => (id === 'leg-ce' ? 'NIFTY28OCT2626000CE' : undefined))
+    ).toBe('NIFTY28OCT2626000CE >= 120')
+  })
+
+  it('falls back to "strike" when the leg is unnamed, times read as clocks', () => {
+    expect(describeConditions([cond({ field: 'strike', op: '<', value: 50 })])).toBe('strike < 50')
+    expect(
+      describeConditions([
+        cond({ field: 'time', op: 'between', value: 9.25 * 3600, value2: 10.5 * 3600 }),
+      ])
+    ).toBe('time within 09:15:00–10:30:00')
+  })
+
+  it('says nothing is set when the list is empty', () => {
+    expect(describeConditions([])).toBe('nothing set')
   })
 })

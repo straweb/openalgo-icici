@@ -268,3 +268,48 @@ export function newId(): string {
 export function newCondition(field: StrategyField = 'index'): StrategyCondition {
   return { id: newId(), join: 'and', field, op: '<', value: 0 }
 }
+
+/* ── the conditions as the trader reads them ─────────────────────────────── */
+
+/**
+ * One condition as a phrase — `index < 25000`, the leg's symbol in place of
+ * its id when the caller can name it, the clock the way the inputs show it.
+ * The comparison reads exactly as the select does, `between` as `within`.
+ */
+export function describeCondition(
+  cond: StrategyCondition,
+  legName?: (legId: string) => string | undefined
+): string {
+  if (cond.field === 'time') {
+    const from = secToClock(cond.value)
+    return cond.op === 'between'
+      ? `time within ${from}–${secToClock(cond.value2 ?? cond.value)}`
+      : `time ${cond.op} ${from}`
+  }
+  const noun =
+    cond.field === 'strike'
+      ? cond.legId
+        ? (legName?.(cond.legId) ?? 'strike')
+        : 'strike'
+      : 'index'
+  return `${noun} ${cond.op} ${cond.value}`
+}
+
+/**
+ * The list read the way it evaluates: left to right, each row wearing the
+ * joiner it carries against the row above. This is the bot's query — the
+ * sentence a Start acts on, shown before it is armed so what is selected is
+ * what was meant.
+ */
+export function describeConditions(
+  conds: readonly StrategyCondition[],
+  legName?: (legId: string) => string | undefined
+): string {
+  if (conds.length === 0) return 'nothing set'
+  return conds
+    .map(
+      (cond, i) =>
+        (i === 0 ? '' : ` ${cond.join.toUpperCase()} `) + describeCondition(cond, legName)
+    )
+    .join('')
+}

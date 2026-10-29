@@ -974,6 +974,17 @@ export function ChartPane({
     : null
 
   /**
+   * One-Click armed, the menu's order rows land on the first press: the
+   * trader has said the click is the order, and a menu row they opened on
+   * purpose is as deliberate as the dialog's own button. Disarmed, the
+   * confirmation asks first, as it always did.
+   */
+  const requestOrderAction = (action: ChartOrderAction) => {
+    if (armedRef.current) void runOrderAction(action)
+    else setPendingOrder(action)
+  }
+
+  /**
    * Keep the open menu on screen. Its rows depend on what was under the
    * pointer, so its height is read once it is drawn rather than guessed.
    */
@@ -2222,7 +2233,7 @@ export function ChartPane({
                     className={ctxRow}
                     onClick={() =>
                       run(() =>
-                        setPendingOrder({
+                        requestOrderAction({
                           kind: 'cancel',
                           symbol: orderRows.symbol,
                           exchange: orderRows.exchange,
@@ -2245,7 +2256,9 @@ export function ChartPane({
                       <button
                         type="button"
                         className={ctxRow}
-                        onClick={() => run(() => setPendingOrder({ kind: 'close', row, lotSize }))}
+                        onClick={() =>
+                          run(() => requestOrderAction({ kind: 'close', row, lotSize }))
+                        }
                       >
                         {row.suffix ? `Close ${row.suffix} position` : 'Close position'}
                       </button>
@@ -2254,7 +2267,9 @@ export function ChartPane({
                         className={cn(ctxRow, row.half === 0 && 'cursor-not-allowed opacity-40')}
                         disabled={row.half === 0}
                         title={row.halfReason}
-                        onClick={() => run(() => setPendingOrder({ kind: 'half', row, lotSize }))}
+                        onClick={() =>
+                          run(() => requestOrderAction({ kind: 'half', row, lotSize }))
+                        }
                       >
                         Close half{tag}
                       </button>
@@ -2264,7 +2279,7 @@ export function ChartPane({
                         disabled={!!row.reverseReason}
                         title={row.reverseReason}
                         onClick={() =>
-                          run(() => setPendingOrder({ kind: 'reverse', row, lotSize }))
+                          run(() => requestOrderAction({ kind: 'reverse', row, lotSize }))
                         }
                       >
                         {row.suffix ? `Reverse ${row.suffix} position` : 'Reverse position'}

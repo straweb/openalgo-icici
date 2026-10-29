@@ -649,7 +649,11 @@ function HedgingTerminal({ apiKey, wsUrl }: { apiKey: string; wsUrl: string }) {
         ltp: marketDataRef.current.get(`${row.exchange}:${row.symbol}`)?.data.ltp,
       })
       const pricetype: 'MARKET' | 'LIMIT' = overridePricetype ?? resolved.pricetype
-      const wirePrice = price ?? (mode === 'limit' ? row.entry : resolved.price)
+      // A levelled entry rests at its level; anything else — a row without an
+      // entry, a priced mode — rides the resolver's price. Falling back to the
+      // entry when it is unset sent a LIMIT at 0.0, which the broker refuses.
+      const wirePrice =
+        price ?? (mode === 'limit' && row.entry != null ? row.entry : resolved.price)
       return {
         legid: row.id,
         symbol: row.symbol,

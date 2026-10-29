@@ -23,6 +23,7 @@ import {
 import { Button } from '@/components/ui/button'
 import type { SearchRow } from '@/lib/trading/terminal'
 import { cn } from '@/lib/utils'
+import { useOneClickStore } from '@/stores/oneClickStore'
 import { type DockPosition, positionKey } from './blotter'
 import {
   EmptyRows,
@@ -59,6 +60,15 @@ export function PositionsTable({
   isLoading,
 }: Props) {
   const [pending, setPending] = useState<DockPosition | null>(null)
+  // One-Click armed, Close lands on the first press — the trader has said
+  // the click is the order, and a row's Close is the most deliberate click
+  // there is. The dialog stays for the disarmed path.
+  const armed = useOneClickStore((s) => s.armed)
+
+  const requestClose = (p: DockPosition) => {
+    if (armed) onClose(p)
+    else setPending(p)
+  }
 
   return (
     <>
@@ -137,7 +147,7 @@ export function PositionsTable({
                           variant="ghost"
                           size="sm"
                           className="h-6 px-2 text-[11px] text-rose-600 hover:text-rose-600 dark:text-rose-400"
-                          onClick={() => setPending(p)}
+                          onClick={() => requestClose(p)}
                           aria-label={`Close ${p.product} position in ${p.symbol}`}
                         >
                           Close

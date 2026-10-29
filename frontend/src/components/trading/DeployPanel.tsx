@@ -609,25 +609,29 @@ export function DeployPanel({
   }, [apiKey, rowSymbols])
 
   /* ── funds: the pool the weight shares divide ─────────────────────────── */
-  useEffect(() => {
-    let alive = true
-    const poll = async () => {
-      try {
-        const res = await tradingApi.getFunds(apiKey)
-        if (alive && res.status === 'success' && res.data) {
-          setFunds(Number(res.data.availablecash) || 0)
-        }
-      } catch {
-        // manual lots keep working without a funds snapshot
+  /**
+   * The broker's own available-cash read. Besides the 15s poll, every fire
+   * and every close re-reads it immediately: an order just moved the cash,
+   * and the next sizing — this panel's shares and the chart strip's lots —
+   * should price against the broker's number, not a snapshot that is now a
+   * quarter of a minute stale.
+   */
+  const refetchFunds = useCallback(async () => {
+    try {
+      const res = await tradingApi.getFunds(apiKey)
+      if (res.status === 'success' && res.data) {
+        setFunds(Number(res.data.availablecash) || 0)
       }
-    }
-    void poll()
-    const timer = window.setInterval(() => void poll(), FUNDS_POLL_MS)
-    return () => {
-      alive = false
-      window.clearInterval(timer)
+    } catch {
+      // manual lots keep working without a funds snapshot
     }
   }, [apiKey])
+
+  useEffect(() => {
+    void refetchFunds()
+    const timer = window.setInterval(() => void refetchFunds(), FUNDS_POLL_MS)
+    return () => window.clearInterval(timer)
+  }, [refetchFunds])
 
   /* ── positions + live orders: P&L, Close, and the row highlights ──────── */
   useEffect(() => {
@@ -919,6 +923,30 @@ export function DeployPanel({
     []
   )
 
+  /**
+   * The plan a close fires: what is actually open on these rows, not what
+   * the funds would size. Deploying spent the cash, so a close sized from
+   * the funds can answer zero lots for a position that is very much alive —
+   * the "no rows the funds can size" trap. Each open row flattens: the
+   * opposite side, the position's own quantity. Rows with nothing open
+   * contribute nothing.
+   */
+  const closePlan = useCallback(
+    (rows: DeployRow[]): Array<{ row: DeployRow; qty: number; action: 'BUY' | 'SELL' }> => {
+      const out: Array<{ row: DeployRow; qty: number; action: 'BUY' | 'SELL' }> = []
+      for (const row of rows) {
+        if (!row.enabled) continue
+        const pos = positions.get(`${row.exchange}:${row.symbol}`)
+        const qty = pos ? Math.abs(Number(pos.quantity) || 0) : 0
+        if (pos && qty > 0) {
+          out.push({ row, qty, action: pos.quantity > 0 ? 'SELL' : 'BUY' })
+        }
+      }
+      return out
+    },
+    [positions]
+  )
+
   const placeOrders = useCallback(
     async (orders: PanelOrder[]) => {
       let placed = 0
@@ -964,9 +992,12 @@ export function DeployPanel({
         showToast.info(
           `${rested} order${rested === 1 ? '' : 's'} resting LIMIT — target/SL attach the moment they fill`
         )
+      // Placed or failed, the orders moved the cash: re-read the funds now
+      // rather than waiting out the 15s poll.
+      void refetchFunds()
       return { placed, failed }
     },
-    [apiKey, state.product, armBracket]
+    [apiKey, state.product, armBracket, refetchFunds]
   )
 
   const report = useCallback((label: string, placed: number, failed: number) => {
@@ -1015,39 +1046,84 @@ export function DeployPanel({
     [quotes, chain]
   )
 
+  /**
+   * One row's exit. The open position's own quantity and side when there is
+   * one — the sizing share cannot be trusted to exit what the deploy already
+   * bought — falling back to the funds-sized quantity for a row with
+   * nothing open (a deliberate short against the row).
+   */
+  const exitRow = useCallback(
+    (row: DeployRow | undefined): void => {
+      if (!row) return
+      const pos = positions.get(`${row.exchange}:${row.symbol}`)
+      const held = pos ? Math.abs(Number(pos.quantity) || 0) : 0
+      if (pos && held > 0) {
+        void placeOrders([toPanelOrder(row, held, pos.quantity > 0 ? 'SELL' : 'BUY')])
+        return
+      }
+      const qty = rowQtyOf(row, sizing)
+      if (qty <= 0) {
+        showToast.warning(`Exit: ${row.symbol} has no open position and the funds cannot size one`)
+        return
+      }
+      void placeOrders([toPanelOrder(row, qty, 'SELL')])
+    },
+    [positions, placeOrders, toPanelOrder, sizing]
+  )
+
   const fire = useCallback(
     async (action: 'BUY' | 'SELL', target: 'CE' | 'PE', busyKey: BusyKey, label: string) => {
       const rows = ladder[target === 'CE' ? 'ce' : 'pe']
-      const plan = firingRows(rows, sizing)
+      // A close flattens the open positions on these rows — sizing it from
+      // the funds failed exactly once the deploy had spent them. A deploy
+      // keeps the funds sizing it always used.
+      const plan =
+        action === 'SELL'
+          ? closePlan(rows).map(({ row, qty, action: act }) => toPanelOrder(row, qty, act))
+          : firingRows(rows, sizing).map(({ row, qty }) => toPanelOrder(row, qty, action))
       if (plan.length === 0) {
-        showToast.warning(`${label}: no ${target} rows the funds can size right now`)
+        showToast.warning(
+          action === 'SELL'
+            ? `${label}: nothing open on the ${target} rows to close`
+            : `${label}: no ${target} rows the funds can size right now`
+        )
         return
       }
       setBusy((previous) => ({ ...previous, [busyKey]: true }))
-      const { placed, failed } = await placeOrders(
-        plan.map(({ row, qty }) => toPanelOrder(row, qty, action))
-      )
+      const { placed, failed } = await placeOrders(plan)
       setBusy((previous) => ({ ...previous, [busyKey]: false }))
       report(label, placed, failed)
     },
-    [ladder, sizing, placeOrders, toPanelOrder, report]
+    [ladder, sizing, closePlan, placeOrders, toPanelOrder, report]
   )
 
   const fireStocks = useCallback(
-    async (action: 'BUY' | 'SELL', busyKey: BusyKey, label: string) => {
-      const plan = firingRows(state.stocks, sizing)
+    async (action: 'BUY' | 'SELL', busyKey: BusyKey, label: string, fromPositions = false) => {
+      // Exit All flattens what is open on the stock rows; Sell All is the
+      // deliberate short, still sized from the funds.
+      const plan = fromPositions
+        ? closePlan(state.stocks)
+        : firingRows(state.stocks, sizing).map(({ row, qty }) => ({
+            row,
+            qty,
+            action: action as 'BUY' | 'SELL',
+          }))
       if (plan.length === 0) {
-        showToast.warning(`${label}: no stock rows the funds can size right now`)
+        showToast.warning(
+          fromPositions
+            ? `${label}: nothing open on the stock rows to exit`
+            : `${label}: no stock rows the funds can size right now`
+        )
         return
       }
       setBusy((previous) => ({ ...previous, [busyKey]: true }))
       const { placed, failed } = await placeOrders(
-        plan.map(({ row, qty }) => toPanelOrder(row, qty, action))
+        plan.map(({ row, qty, action: act }) => toPanelOrder(row, qty, act))
       )
       setBusy((previous) => ({ ...previous, [busyKey]: false }))
       report(label, placed, failed)
     },
-    [state.stocks, sizing, placeOrders, toPanelOrder, report]
+    [state.stocks, sizing, closePlan, placeOrders, toPanelOrder, report]
   )
 
   const runSwap = useCallback(
@@ -1073,21 +1149,21 @@ export function DeployPanel({
 
   const exitAll = useCallback(async () => {
     if (optionsMode) {
-      const plan = firingRows([...ladder.ce, ...ladder.pe], sizing)
+      const plan = closePlan([...ladder.ce, ...ladder.pe])
       if (plan.length === 0) {
-        showToast.warning('Exit All: no enabled rows')
+        showToast.warning('Exit All: nothing open on the ladder rows to exit')
         return
       }
       setBusy((previous) => ({ ...previous, exitAll: true }))
       const { placed, failed } = await placeOrders(
-        plan.map(({ row, qty }) => toPanelOrder(row, qty, 'SELL' as const))
+        plan.map(({ row, qty, action }) => toPanelOrder(row, qty, action))
       )
       setBusy((previous) => ({ ...previous, exitAll: false }))
       report('Exit All', placed, failed)
     } else {
-      await fireStocks('SELL', 'exitAll', 'Exit All')
+      await fireStocks('SELL', 'exitAll', 'Exit All', true)
     }
-  }, [optionsMode, ladder, sizing, placeOrders, fireStocks, toPanelOrder, report])
+  }, [optionsMode, ladder, closePlan, placeOrders, fireStocks, toPanelOrder, report])
 
   /* ── Schedule: the dock's dialog, pointed at this panel's ladder ──────── */
   const spot = useMemo(() => {
@@ -1520,16 +1596,7 @@ export function DeployPanel({
                   }
                   void placeOrders([toPanelOrder(row, qty, action)])
                 }}
-                onExit={(symbol) => {
-                  const row = ladder.ce.find((r) => r.symbol === symbol)
-                  if (!row) return
-                  const qty = rowQtyOf(row, sizing)
-                  if (qty <= 0) {
-                    showToast.warning('Exit: nothing to sell at the current size')
-                    return
-                  }
-                  void placeOrders([toPanelOrder(row, qty, 'SELL')])
-                }}
+                onExit={(symbol) => exitRow(ladder.ce.find((r) => r.symbol === symbol))}
                 onChart={(row) =>
                   onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })
                 }
@@ -1583,16 +1650,7 @@ export function DeployPanel({
                   }
                   void placeOrders([toPanelOrder(row, qty, action)])
                 }}
-                onExit={(symbol) => {
-                  const row = ladder.pe.find((r) => r.symbol === symbol)
-                  if (!row) return
-                  const qty = rowQtyOf(row, sizing)
-                  if (qty <= 0) {
-                    showToast.warning('Exit: nothing to sell at the current size')
-                    return
-                  }
-                  void placeOrders([toPanelOrder(row, qty, 'SELL')])
-                }}
+                onExit={(symbol) => exitRow(ladder.pe.find((r) => r.symbol === symbol))}
                 onChart={(row) =>
                   onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })
                 }
@@ -1653,14 +1711,7 @@ export function DeployPanel({
                   }
                   void placeOrders([toPanelOrder(row, qty, action)])
                 }}
-                onExit={() => {
-                  const qty = (row.lots > 0 ? row.lots : rowQtyOf(row, sizing)) * row.lotSize
-                  if (qty <= 0) {
-                    showToast.warning('Exit: nothing to sell at the current size')
-                    return
-                  }
-                  void placeOrders([toPanelOrder(row, qty, 'SELL')])
-                }}
+                onExit={() => exitRow(row)}
                 onChart={() =>
                   onPick({ symbol: row.symbol, exchange: row.exchange, name: row.name })
                 }

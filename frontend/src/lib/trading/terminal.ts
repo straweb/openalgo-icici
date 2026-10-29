@@ -1224,10 +1224,9 @@ export class TradingTerminal {
    * The one-click panel — the chart's single Buy/Sell strip, docked top-left:
    * SELL at the bid, the capital-percent slider in the middle (always on it,
    * never a hover reveal), BUY at the ask. One-Click armed, a press fires the
-   * global order mode's order at once; disarmed, it opens the order ticket.
+   * global order mode's order at once; the strip shows only while armed.
    */
   private instantPanel: HTMLDivElement | null = null
-  private instantPanelOn = true
   /**
    * The open position's box, docked top-right: side, size, average, live
    * P&L, an instant CLOSE, and the SL/TP levels the drag handles set.
@@ -2429,13 +2428,13 @@ export class TradingTerminal {
   /**
    * The chart's single Buy/Sell strip, docked top-left where the old canvas
    * primitive sat: SELL at the bid, the capital-percent slider ON the strip
-   * (no hover reveal — it is the middle third of the panel), BUY at the ask,
-   * and the One-Click tag. The slider drives the toolbar's quantity from the
-   * pane's share of the funds; the readout shows the size a press sends and
-   * the 100% capacity. NRML rides the derivative segments, MIS the cash ones.
-   * One-Click armed, a press fires the global order mode's order at once;
-   * disarmed, it opens the order ticket — the old panel's two habits, one
-   * affordance now.
+   * (no hover reveal — it is the middle third of the panel), BUY at the ask.
+   * The slider drives the toolbar's quantity from the pane's share of the
+   * funds; the readout shows the size a press sends and the 100% capacity.
+   * NRML rides the derivative segments, MIS the cash ones. The strip exists
+   * only while One-Click is armed — a press fires the global order mode's
+   * order at once; the visibility is the One-Click switch's own job, not a
+   * second toggle's.
    */
   private mountInstantPanel(): void {
     if (this.instantPanel) return
@@ -2477,9 +2476,7 @@ export class TradingTerminal {
       '<button data-i-buy title="BUY — the global order mode prices it (One-Click off opens the ticket)" ' +
       'style="border:0;border-radius:6px;cursor:pointer;padding:5px 10px 3px;color:#fff;background:#26a69a;' +
       'display:flex;flex-direction:column;align-items:center;line-height:1.1">B' +
-      '<span data-i-buypx style="font-weight:400;font-size:9px;opacity:0.9"></span></button>' +
-      '<span data-i-tag title="One-Click state" ' +
-      'style="margin-left:2px;font-size:9px;color:var(--muted-foreground,#a1a1aa)">1-CLICK</span>'
+      '<span data-i-buypx style="font-weight:400;font-size:9px;opacity:0.9"></span></button>'
     const sellBtn = panel.querySelector<HTMLButtonElement>('[data-i-sell]')
     const buyBtn = panel.querySelector<HTMLButtonElement>('[data-i-buy]')
     sellBtn?.addEventListener('click', (e) => {
@@ -2526,16 +2523,15 @@ export class TradingTerminal {
   }
 
   /**
-   * The panel exists while its toggle is on and the chart is not replaying —
-   * armed or not. Disarmed it still shows: a press then opens the order
-   * ticket instead of firing, which is exactly what the old canvas panel did.
+   * The panel exists while One-Click is armed and the chart is not replaying.
+   * Arming shows it on every chart; disarming takes it off. The disarmed
+   * branch in `instantFire` stays as a race safety net, but nothing on the
+   * strip reaches it any more.
    */
   private syncInstantPanel(): void {
     if (!this.instantPanel) return
-    const show = this.instantPanelOn && !this.workspaceReplayLocked
+    const show = this.armed && !this.workspaceReplayLocked
     this.instantPanel.style.display = show ? 'flex' : 'none'
-    const tag = this.instantPanel.querySelector('[data-i-tag]')
-    if (tag) tag.textContent = this.armed ? '1-CLICK' : 'TICKET'
   }
 
   /** Keep the panel's prices and size readout in step with the quote. */
@@ -3495,8 +3491,6 @@ export class TradingTerminal {
     // OHLC legend. The canvas Buy/Sell primitive this used to sit beside is
     // gone — this panel IS the order entry affordance now.
     if (!this.sym!.quoteOnly) {
-      // The toolbar's panel toggle, persisted per pane (default on).
-      this.instantPanelOn = this.lsGet('instantpanel') !== '0'
       this.mountInstantPanel()
     } else {
       this.destroyInstantPanel()
@@ -7231,16 +7225,6 @@ export class TradingTerminal {
    */
   private showTradeButtons(_on: boolean): void {
     this.syncInstantPanel()
-  }
-
-  setInstantPanelVisible(on: boolean): void {
-    this.instantPanelOn = on
-    this.lsSet('instantpanel', on ? '1' : '0')
-    this.syncInstantPanel()
-  }
-
-  instantPanelVisible(): boolean {
-    return this.instantPanelOn
   }
 
   /**

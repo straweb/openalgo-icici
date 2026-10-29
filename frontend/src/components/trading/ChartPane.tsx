@@ -2,7 +2,7 @@
 // toggle only, which the engine's chrome set has no picture for; they are
 // drawn at the engine's line weight.
 // Everything else in the toolbar and the menus is the engine's chrome set.
-import { Scissors, Zap } from 'lucide-react'
+import { Scissors } from 'lucide-react'
 import type { ChartObjects, LinkGroup } from 'openalgo-charts'
 import type { MagnetMode } from 'openalgo-charts/draw'
 import type { WorkspacePane } from 'openalgo-charts/workspace'
@@ -387,7 +387,6 @@ export function ChartPane({
    * The one trade panel's visibility, read off the terminal once it boots
    * (it persists the choice per pane) and pushed back on every toggle.
    */
-  const [instantPanelOn, setInstantPanelOn] = useState(true)
   /**
    * The load state drawn over the chart: dots for a slow load, a card for no
    * data or a failure. The gate holds the dots back for a fast load.
@@ -746,23 +745,6 @@ export function ChartPane({
     terminalRef.current?.setWorkspaceTransitionLocked(transitionLocked)
     terminalRef.current?.setArmed(armed && !transitionLocked)
   }, [armed, transitionLocked])
-
-  /* ── the trade-panel toggle: read at boot, push on toggle ─────────── */
-  // biome-ignore lint/correctness/useExhaustiveDependencies: ready is the trigger — the persisted choice reads once the terminal exists
-  useEffect(() => {
-    if (!ready) return
-    // Guarded read: a test double (or a terminal from before the toggle)
-    // ships no method, and defaults to shown.
-    const terminal = terminalRef.current
-    setInstantPanelOn(
-      typeof terminal?.instantPanelVisible === 'function' ? terminal.instantPanelVisible() : true
-    )
-  }, [ready])
-  const toggleInstantPanel = () => {
-    const next = !instantPanelOn
-    setInstantPanelOn(next)
-    terminalRef.current?.setInstantPanelVisible(next)
-  }
 
   /* ── keep the canvas theme in sync with the app theme ─────────────────── */
   // biome-ignore lint/correctness/useExhaustiveDependencies: mode/appMode are the trigger — the effect re-themes the canvas whenever the app theme changes
@@ -1397,28 +1379,6 @@ export function ChartPane({
                 className={cn(TB_BTN, TB_ON, 'px-2.5 text-xs font-semibold tracking-wide')}
               >
                 {sym.product}
-              </button>
-            </Tip>
-          )}
-
-          {/* The trade panel's toggle, one icon: the bolt is the SELL · slider
-              · BUY strip — the chart's only Buy/Sell buttons. On by default;
-              it remembers its own off. */}
-          {sym && !sym.quoteOnly && (
-            <Tip
-              tip={{
-                title: instantPanelOn ? 'Buy/Sell panel is on' : 'Buy/Sell panel is hidden',
-                sub: 'The on-chart SELL · slider · BUY strip — a press fires when One-Click is on, opens the ticket when off',
-              }}
-            >
-              <button
-                type="button"
-                aria-label="Toggle the Buy/Sell panel"
-                aria-pressed={instantPanelOn}
-                className={cn(TB_BTN, TB_ICON, instantPanelOn && TB_ON)}
-                onClick={toggleInstantPanel}
-              >
-                <Zap className="h-4 w-4" />
               </button>
             </Tip>
           )}

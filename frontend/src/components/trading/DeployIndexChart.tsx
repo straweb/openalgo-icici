@@ -104,7 +104,11 @@ export function DeployIndexChart({ apiKey, wsUrl, symbol, exchange, name }: Prop
         </div>
       </div>
       {!folded && (
-        <div className="h-[170px]">
+        // The strip is a positioned flex column of its own: the chart root's
+        // `relative` resolves against it, so the candles stay in the 170px
+        // band and cannot paint over the header, the ladder or the deploy
+        // buttons the way an absolute fill of the panel's aside did.
+        <div className="flex h-[170px] flex-col overflow-hidden">
           <OpenAlgoChart
             feed={feed}
             symbol={symbol}
@@ -115,7 +119,6 @@ export function DeployIndexChart({ apiKey, wsUrl, symbol, exchange, name }: Prop
             statusline={false}
             indicators={false}
             volume
-            className="absolute inset-0"
           />
         </div>
       )}

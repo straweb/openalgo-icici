@@ -1054,7 +1054,7 @@ def broker_callback(broker, para=None):
         # For brokers that have user_id and feed_token from authenticate_broker
         if broker in ["angel", "compositedge", "pocketful", "definedge", "dhan", "motilal", "rmoney", "iiflcapital"]:
             # For OAuth brokers, handle missing session user
-            if broker in ("compositedge", "rmoney", "iiflcapital") and "user" not in session:
+            if broker in ("compositedge", "rmoney", "iiflcapital", "icici") and "user" not in session:
                 # Get the admin user from the database
                 from database.user_db import find_user_by_username
 

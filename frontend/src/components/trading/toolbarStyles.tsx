@@ -30,11 +30,15 @@ export const TB_ICON = 'w-7 px-0'
 export const TB_ON =
   'bg-primary/15 text-primary hover:bg-primary/20 hover:text-primary data-[state=open]:bg-primary/20 data-[state=open]:text-primary'
 
-/** A label that gives way to its glyph below 1536px; the button keeps an aria-label. */
-export const TB_LABEL_2XL = 'hidden 2xl:inline'
+/**
+ * A label the row does not carry: the bar is icon-only, the way the hedging
+ * terminal's compact band is. The exports stay so a control keeps one place
+ * to name its label span, and a Tip (plus the aria-label) carries the name.
+ */
+export const TB_LABEL_2XL = 'hidden'
 
-/** A label for the less used controls, shown only where the row has room for all of them. */
-export const TB_LABEL_WIDE = 'hidden min-[1800px]:inline'
+/** The less used controls' label, retired with the rest: the bar is icon-only. */
+export const TB_LABEL_WIDE = 'hidden'
 
 /** The count chip Indicators and Compare wear. */
 export const TB_COUNT =

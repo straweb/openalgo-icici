@@ -1522,23 +1522,9 @@ function TradingWorkspace({ account }: { account: string | null }) {
           state said twice, and the badge said it in the loudest colour in the
           row while sitting at a different height from every button around it.
           The border makes it one control at the row's own height and the
-          switch is still what you press.
-
-          ON, not ARMED. The state is worth shouting about, because it is the
-          one where a click on the chart sends a live order, and the capitals
-          and the red are what do the shouting. The word itself only has to
-          say which way the switch is thrown, and a trader should not have to
-          learn a second vocabulary to read a toggle. */}
-        <span className="whitespace-nowrap">
-          {/* The name stays at every width, because "off" alone does not say
-            what is off. The state word is the part that gives way: the switch
-            beside it already shows the state, and when it is on the whole
-            control is in the on-state red. The word comes back from 2xl, where
-            the row has room. The accessible name is the switch's own
-            aria-label, so it never depends on this text. */}
-          One-Click
-          <span className="hidden 2xl:inline"> {armed ? 'ON' : 'off'}</span>
-        </span>
+          switch is still what you press. The row is icon-only — the words
+          gave way to the Tip and the switch's own state — so the control is
+          the switch alone, ringed red while One-Click is on. */}
       </label>
     </Tip>
   )
@@ -1612,9 +1598,8 @@ function TradingWorkspace({ account }: { account: string | null }) {
             them scroll on a narrow screen. */}
         <div className="oa-terminal-band flex h-10 shrink-0 items-center border-b">
           <Tip tip={{ title: 'Dashboard', sub: 'Leave the terminal for the dashboard' }}>
-            <Link to="/dashboard" aria-label="Dashboard" className={cn(TB_BTN, 'ml-1 gap-1')}>
+            <Link to="/dashboard" aria-label="Dashboard" className={cn(TB_BTN, TB_ICON, 'ml-1')}>
               <ChromeIcon id="chevron-left" size={14} className="opacity-70" />
-              <span className="hidden md:inline">Dashboard</span>
             </Link>
           </Tip>
           <ToolbarDivider />

@@ -78,7 +78,6 @@ export function GlobalChartSettingsDialog({ open, onClose, getTerminals, getFocu
   const [ghost, setGhost] = useState<string | null>(null)
   const [grid, setGrid] = useState({ vertical: true, horizontal: true })
   const [volumeOn, setVolumeOn] = useState(true)
-  const [panelOn, setPanelOn] = useState(true)
   const [chartSettingsReq, setChartSettingsReq] = useState<ChartSettingsRequest | null>(null)
   const [busy, setBusy] = useState(false)
 
@@ -93,7 +92,6 @@ export function GlobalChartSettingsDialog({ open, onClose, getTerminals, getFocu
     setGhost(focused ? readGhost(focused) : null)
     setGrid(focused ? focused.gridState() : { vertical: true, horizontal: true })
     setVolumeOn(focused ? focused.volumeVisible() : true)
-    setPanelOn(focused ? focused.instantPanelVisible() : true)
     setChartSettingsReq(null)
   }, [open])
 
@@ -349,18 +347,6 @@ export function GlobalChartSettingsDialog({ open, onClose, getTerminals, getFocu
                   }, 'Horizontal grid')
                 }}
                 aria-label="Global horizontal grid"
-              />
-            </Row>
-            <Row label="Buy / Sell strip" hint="The SELL · slider · BUY buttons on every chart">
-              <Switch
-                checked={panelOn}
-                onCheckedChange={(v) => {
-                  setPanelOn(v)
-                  each((t) => {
-                    t.setInstantPanelVisible(v)
-                  }, 'Buy/Sell strip')
-                }}
-                aria-label="Global Buy/Sell strip"
               />
             </Row>
           </Section>

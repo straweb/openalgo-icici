@@ -43,6 +43,32 @@ import { useThemeStore } from '@/stores/themeStore'
 const FALLBACK_INTERVAL = 'D'
 
 /**
+ * The store a persisted chart reads, pinned to `localStorage`.
+ *
+ * `persist` alone lets the widget choose its store, and where the page has it
+ * that choice is IndexedDB — an asynchronous store, whose first read is a
+ * namespace load the widget races against a four-second timer. When that open
+ * never settles (a blocked partition, a private window's refusal) every
+ * persisted chart announced "Saved chart settings could not be read, so
+ * changes are kept for this session only: no answer within 4000 ms" and spent
+ * the session in memory. A synchronous store — `localStorage` itself, which
+ * satisfies `StorageLike` by carrying no `entries` method, the marker the
+ * widget reads a store's shape by — is read inside `createWidget` rather than
+ * behind a promise: there is no load to wait out, so there is no window the
+ * timer can close, and the saved layout applies before the constructor
+ * returns. A browser that refuses `localStorage` gets `null`, and the widget
+ * keeps its session in memory, exactly the degradation the async path
+ * announced as a failure.
+ */
+function syncPersistStorage(): Storage | null {
+  try {
+    return globalThis.localStorage ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Run an engine call that is allowed to reject its argument.
  *
  * `setInterval` and `setChartType` throw on a code the engine does not know,
@@ -355,7 +381,7 @@ export function OpenAlgoChart({
         indicators,
         ...(p.intervals ? { intervals: p.intervals } : {}),
         ...(p.symbolSearch ? { symbolSearch: p.symbolSearch } : {}),
-        ...(persistKey ? { persist: persistKey } : {}),
+        ...(persistKey ? { persist: persistKey, storage: syncPersistStorage() } : {}),
         // onOrder is deliberately absent. Without it the right-click menu
         // draws no trade rows, which is how this chart is kept unable to
         // place an order.

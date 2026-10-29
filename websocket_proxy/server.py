@@ -773,7 +773,7 @@ class WebSocketProxy:
             # Accept both 'action' and 'type' fields for better compatibility with different clients
             action = data.get("action") or data.get("type")
             # OPTIMIZATION: Only log important actions, not every subscribe/unsubscribe
-            if action not in ["subscribe", "unsubscribe"]:
+            if action not in ["subscribe", "unsubscribe","ping"]:
                 logger.info(f"Client {client_id} requested action: {action}")
 
             if action in ["authenticate", "auth"]:

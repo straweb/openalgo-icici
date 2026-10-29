@@ -62,6 +62,27 @@ describe('RightRail', () => {
     expect(onSelect).toHaveBeenCalledWith('data')
   })
 
+  it('carries the two working surfaces the dock gave up, after Deploy', () => {
+    // Strategy bots and Constituents moved here from the bottom dock: both
+    // are aimed at one underlying (the focused chart's), both fire orders
+    // the way the deploy ladder does, and the dock stays to the books.
+    rail()
+    expect(screen.getByRole('button', { name: 'Strategy bots' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Constituents' })).toBeInTheDocument()
+  })
+
+  it('parks the moved panels after Deploy and before the chart-introspective ones', () => {
+    // The rail's order is the trader's reading order: market views and their
+    // working surfaces first (watchlist → option chain → deploy → the two
+    // the dock gave up), the chart's own furniture after.
+    rail()
+    const buttons = screen.getAllByRole('button')
+    const labels = buttons.map((b) => b.getAttribute('aria-label'))
+    expect(labels.indexOf('Deploy')).toBeLessThan(labels.indexOf('Constituents'))
+    expect(labels.indexOf('Constituents')).toBeLessThan(labels.indexOf('Strategy bots'))
+    expect(labels.indexOf('Strategy bots')).toBeLessThan(labels.indexOf('Objects'))
+  })
+
   it('still opens every panel a trader had open before the data window existed', () => {
     for (const saved of [
       'watchlist',

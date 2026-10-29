@@ -8,7 +8,17 @@
  * closes it.
  */
 
-import { Bot, FileCode2, FlaskConical, type LucideIcon, Rocket, Shapes, Table2 } from 'lucide-react'
+import {
+  Bot,
+  FileCode2,
+  FlaskConical,
+  Layers,
+  type LucideIcon,
+  Rocket,
+  Shapes,
+  Table2,
+  Workflow,
+} from 'lucide-react'
 import { useEffect, useRef } from 'react'
 import { ChromeIcon, lineStroke24 } from '@/lib/trading/glyphs'
 import { cn } from '@/lib/utils'
@@ -49,6 +59,22 @@ const PANELS = [
     label: 'Deploy',
     icon: Rocket,
     hint: 'Build a strike ladder and fire it with one tap',
+  },
+  // The two working surfaces the bottom dock used to carry, parked after the
+  // Deploy panel: both are aimed at one underlying (the focused chart's),
+  // both fire orders the way the deploy ladder does, and the dock stays to
+  // the account's books over every symbol.
+  {
+    id: 'index',
+    label: 'Constituents',
+    icon: Layers,
+    hint: "The charted index's members, live, with its level deploy",
+  },
+  {
+    id: 'strategy',
+    label: 'Strategy bots',
+    icon: Workflow,
+    hint: 'Condition-driven entry and exit, placed onto strikes',
   },
   {
     id: 'objects',

@@ -1,6 +1,7 @@
 import json
 import os
 
+from broker.shoonya.api.rate_limiter import API_LIMITER
 from broker.shoonya.mapping.margin_data import parse_margin_response, transform_margin_positions
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
@@ -60,6 +61,10 @@ def calculate_margin_api(positions, auth):
     logger.info(f"Shoonya basket margin payload: {safe_payload}")
 
     client = get_httpx_client()
+
+    # The margin read rides the account's one shared request budget
+    # (broker/shoonya/api/rate_limiter.py).
+    API_LIMITER.acquire()
 
     try:
         response = client.post(

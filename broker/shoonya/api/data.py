@@ -10,6 +10,12 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pandas as pd
 
+from broker.shoonya.api.rate_limiter import (
+    API_LIMITER,
+    MAX_RATE_LIMIT_RETRIES,
+    note_rate_limit_rejection,
+    rate_limit_retry_delay,
+)
 from database.token_db import get_br_symbol, get_oa_symbol, get_token
 from utils import runtime
 from utils.httpx_client import get_httpx_client
@@ -267,19 +273,35 @@ def get_api_response(endpoint, auth, method="POST", payload=None):
     }
     url = f"https://api.shoonya.com{endpoint}"
 
-    response = client.request(method, url, content=payload_str, headers=headers)
-    data = response.text
+    # Noren budgets the whole account's requests — quotes, orders, funds —
+    # against one rolling window (see rate_limiter.py for the rejection that
+    # proved it), so every call through here books a slot in the one shared
+    # limiter before it goes out. Under the gthread worker a caller whose
+    # slot is too far away is refused at once instead of holding a thread.
+    parsed: dict | None = None
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        API_LIMITER.acquire()
+        response = client.request(method, url, content=payload_str, headers=headers)
+        data = response.text
 
-    # Log response status and raw data for debugging
-    logger.info(f"API Response [{endpoint}] status={response.status_code} body={data[:500]}")
+        # Log response status and raw data for debugging
+        logger.info(f"API Response [{endpoint}] status={response.status_code} body={data[:500]}")
 
-    try:
-        parsed = json.loads(data)
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON: {e}")
-        logger.debug(f"Response data: {data}")
-        raise
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON: {e}")
+            logger.debug(f"Response data: {data}")
+            raise
 
+        # Reads are safe to re-issue on a fresh slot; the limiter learned the
+        # broker's ceiling from the rejection, so the retry is paced too.
+        delay = rate_limit_retry_delay(parsed, attempt, context=endpoint)
+        if delay is None:
+            return parsed
+        time.sleep(delay)
+
+    assert parsed is not None
     return parsed
 
 
@@ -311,17 +333,31 @@ def get_chart_api_response(endpoint, auth, method="POST", payload=None):
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     url = f"https://api.shoonya.com{endpoint}"
 
-    response = client.request(method, url, content=payload_str, headers=headers)
-    data = response.text
+    # Chart history rides the account's one shared request budget like
+    # everything else (see rate_limiter.py); reads only, so a rate-limit
+    # reply is safe to re-issue on a fresh slot.
+    parsed: dict | None = None
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        API_LIMITER.acquire()
+        response = client.request(method, url, content=payload_str, headers=headers)
+        data = response.text
 
-    logger.info(f"Chart API Response [{endpoint}] status={response.status_code} body={data[:500]}")
+        logger.info(f"Chart API Response [{endpoint}] status={response.status_code} body={data[:500]}")
 
-    try:
-        return json.loads(data)
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding chart JSON: {e}")
-        logger.debug(f"Chart response data: {data}")
-        raise
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding chart JSON: {e}")
+            logger.debug(f"Chart response data: {data}")
+            raise
+
+        delay = rate_limit_retry_delay(parsed, attempt, context=endpoint)
+        if delay is None:
+            return parsed
+        time.sleep(delay)
+
+    assert parsed is not None
+    return parsed
 
 
 class BrokerData:
@@ -455,11 +491,18 @@ class BrokerData:
             # that cannot be resolved carries an error instead of a price, so
             # one bad symbol does not fail the whole batch.
             for attempt in range(1, QUOTE_ATTEMPTS + 1):
+                # Same shared budget as get_api_response — a batch of these is
+                # exactly the burst that blew the account's minute window.
+                API_LIMITER.acquire()
                 # Use httpx.post for sync requests
                 http_response = httpx.post(url, content=payload_str, headers=headers, timeout=10.0)
                 response = http_response.json()
 
                 if response.get("stat") != "Ok":
+                    # The row still carries the error — but a rate-limit reply
+                    # names the account's ceiling, so the limiter learns it
+                    # before the next batch is built.
+                    note_rate_limit_rejection(response)
                     return {
                         "symbol": symbol,
                         "exchange": exchange,
@@ -526,10 +569,14 @@ class BrokerData:
 
             # Same rule as the sync path above - see _fetch_single_quote_sync.
             for attempt in range(1, QUOTE_ATTEMPTS + 1):
+                # The async batch rides the same shared budget; awaiting the
+                # slot keeps the event loop free while the windows drain.
+                await API_LIMITER.acquire_async()
                 http_response = await client.post(url, content=payload_str, headers=headers)
                 response = http_response.json()
 
                 if response.get("stat") != "Ok":
+                    note_rate_limit_rejection(response)
                     return {
                         "symbol": symbol,
                         "exchange": exchange,

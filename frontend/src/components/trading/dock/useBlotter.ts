@@ -58,6 +58,19 @@ const FRAME_SETTLE_MS = 150
 
 const ROOT = 'trading-dock'
 
+/**
+ * The window event a blotter refresh is asked through, so code that lives
+ * outside the dock — the Strategy bots panel, which moved here from a dock
+ * tab — can still flush the books the moment its bot fires, without the
+ * page threading a prop through every layer between.
+ */
+const BLOTTER_REFRESH_EVENT = 'oa:blotter-refresh'
+
+/** Ask every mounted blotter to refetch its books (throttled, as always). */
+export function refreshBlotters(): void {
+  window.dispatchEvent(new CustomEvent(BLOTTER_REFRESH_EVENT))
+}
+
 export function ordersKey(appMode: AppMode) {
   return [ROOT, 'orders', appMode] as const
 }
@@ -154,6 +167,13 @@ export function useBlotter({ apiKey, appMode, enabled = true }: Options): Blotte
     },
     []
   )
+
+  // The panel-borne refresh: the strategy bot tab's `refresh` prop rides
+  // this event into the same throttled invalidation.
+  useEffect(() => {
+    window.addEventListener(BLOTTER_REFRESH_EVENT, refresh)
+    return () => window.removeEventListener(BLOTTER_REFRESH_EVENT, refresh)
+  }, [refresh])
 
   useOrderEventRefresh(refresh, { events: BOOK_EVENTS, delay: 150, enabled: active })
 

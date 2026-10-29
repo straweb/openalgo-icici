@@ -27,20 +27,18 @@ describe('DockShell', () => {
       'false',
       'false',
       'false',
-      'false',
-      'false',
     ])
     // The badge is a separate text node, so the accessible name has no space.
     expect(screen.getByRole('tab', { name: /^Orders\s*2$/ })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: /^Trades\s*7$/ })).toBeInTheDocument()
     // No count was given for GTT, so it carries no badge, not a zero.
     expect(screen.getByRole('tab', { name: 'GTT' })).toBeInTheDocument()
-    expect(screen.getByRole('tab', { name: 'Strategy' })).toBeInTheDocument()
-    // The hedging terminal's shared book, the constituents breakdown (the
-    // tab the charting terminal once called Index) and the depth board sit
-    // at the end of the strip.
+    // The strategy bots and the constituents breakdown moved to the right
+    // rail (RightRail's panels); the dock keeps the books and the depth
+    // board at the end of the strip.
+    expect(screen.queryByRole('tab', { name: 'Strategy' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: 'Constituents' })).not.toBeInTheDocument()
     expect(screen.getByRole('tab', { name: 'Scheduled' })).toBeInTheDocument()
-    expect(screen.getByRole('tab', { name: 'Constituents' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: 'Depth' })).toBeInTheDocument()
     expect(screen.queryByRole('tabpanel')).not.toBeInTheDocument()
   })

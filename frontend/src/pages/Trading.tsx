@@ -43,6 +43,17 @@ const WatchlistPanel = lazy(() =>
 const DeployPanel = lazy(() =>
   import('@/components/trading/DeployPanel').then((m) => ({ default: m.DeployPanel }))
 )
+// The two working surfaces the dock gave up, on the rail after Deploy: the
+// strategy bots (which pull the tick-hub wire in with them) and the
+// constituents table.
+const StrategyPanel = lazy(() =>
+  import('@/components/trading/StrategyPanel').then((m) => ({ default: m.StrategyPanel }))
+)
+const ConstituentsPanel = lazy(() =>
+  import('@/components/trading/ConstituentsPanel').then((m) => ({
+    default: m.ConstituentsPanel,
+  }))
+)
 // The global chart settings pull the terminal's full settings machinery —
 // loaded only when the dialog first opens, like the panels above.
 const GlobalChartSettingsDialog = lazy(() =>
@@ -71,7 +82,8 @@ import {
   readDockTab,
   writeDockTab,
 } from '@/components/trading/dock/dockState'
-import { TradingDock } from '@/components/trading/dock/TradingDock'
+import { REPLAY_REFUSAL, TradingDock } from '@/components/trading/dock/TradingDock'
+import { refreshBlotters } from '@/components/trading/dock/useBlotter'
 import { GridDividers } from '@/components/trading/GridDividers'
 import { IndicatorTemplates } from '@/components/trading/IndicatorTemplates'
 import { ObjectsPanel } from '@/components/trading/ObjectsPanel'
@@ -689,6 +701,19 @@ function TradingWorkspace({ account }: { account: string | null }) {
       ),
     []
   )
+
+  /**
+   * The replay lock, asked the way a panel asks it: refuse with the chart's
+   * own words. The dock builds the same for its rows; the Strategy bots
+   * panel needs one too now that it lives on the rail rather than in the
+   * dock, and the words come from TradingDock so every surface refuses in
+   * one voice.
+   */
+  const refuseTrading = useCallback(() => {
+    if (!tradingLocked()) return false
+    showToast.error(REPLAY_REFUSAL)
+    return true
+  }, [tradingLocked])
 
   /** Bound to the focused pane so panel search returns broker-supported rows. */
   const searchFromFocusedPane = useCallback(
@@ -1924,6 +1949,29 @@ function TradingWorkspace({ account }: { account: string | null }) {
               />
             </Suspense>
           )}
+          {apiKey && wsUrl && panel === 'index' && (
+            <Suspense fallback={null}>
+              <ConstituentsPanel
+                apiKey={apiKey}
+                activeSymbol={paneSymbols[focusedPane] ?? null}
+                paneSymbols={paneSymbols}
+                onPick={sendToFocusedPane}
+              />
+            </Suspense>
+          )}
+          {apiKey && wsUrl && panel === 'strategy' && (
+            <Suspense fallback={null}>
+              <StrategyPanel
+                apiKey={apiKey}
+                wsUrl={wsUrl}
+                activeSymbol={paneSymbols[focusedPane] ?? null}
+                refuse={refuseTrading}
+                // The blotter flush now rides the window event useBlotter
+                // listens for — the dock no longer owns this tab.
+                refresh={refreshBlotters}
+              />
+            </Suspense>
+          )}
           {apiKey && wsUrl && panel === 'agent' && (
             <Suspense fallback={null}>
               <AgentPanel
@@ -2062,10 +2110,8 @@ function TradingWorkspace({ account }: { account: string | null }) {
             tab={dock}
             onTabChange={setDock}
             apiKey={apiKey}
-            wsUrl={wsUrl}
             onPick={sendToFocusedPane}
             activeSymbol={paneSymbols[focusedPane] ?? null}
-            paneSymbols={paneSymbols}
             tradingLocked={tradingLocked}
             bridge={orderBridge}
           />

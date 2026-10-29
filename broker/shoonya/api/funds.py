@@ -5,6 +5,7 @@ import os
 
 import httpx
 
+from broker.shoonya.api.rate_limiter import API_LIMITER
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
@@ -41,6 +42,10 @@ def get_margin_data(auth_token):
     }
 
     url = "https://api.shoonya.com/NorenWClientAPI/Limits"
+
+    # The funds read rides the account's one shared request budget
+    # (broker/shoonya/api/rate_limiter.py).
+    API_LIMITER.acquire()
 
     # Send the POST request to Shoonya's API
     response = client.post(url, content=payload_str, headers=headers)

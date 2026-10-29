@@ -5,6 +5,7 @@ import httpx
 import threading
 import time
 
+from broker.shoonya.api.rate_limiter import API_LIMITER, note_rate_limit_rejection
 from broker.shoonya.mapping.order_data import normalize_order_status
 from broker.shoonya.mapping.transform_data import (
     map_product_type,
@@ -45,15 +46,21 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
     }
     url = f"https://api.shoonya.com{endpoint}"
 
+    # Book reads in the account's one shared request budget (rate_limiter.py).
+    # Not retried here: the callers above this layer already report a broker
+    # emsg verbatim, and the books poll again on their own cadence.
+    API_LIMITER.acquire()
     response = client.request(method, url, content=payload_str, headers=headers)
     data = response.text
 
     try:
-        return json.loads(data)
+        parsed = json.loads(data)
     except json.JSONDecodeError as e:
         logger.error(f"Error decoding JSON: {e}")
         logger.debug(f"Response data: {data}")
         raise
+    note_rate_limit_rejection(parsed)
+    return parsed
 
 
 def get_order_book(auth):
@@ -174,8 +181,14 @@ def place_order_api(data, auth):
     client = get_httpx_client()
     url = "https://api.shoonya.com/NorenWClientAPI/PlaceOrder"
 
+    # A placement books its slot like every other call — the broker's minute
+    # window counts orders and quotes together — but is never auto-retried:
+    # a reply lost after the broker accepted the order reads exactly like a
+    # rate rejection, and a duplicate order is the worse failure.
+    API_LIMITER.acquire()
     response = client.post(url, content=payload_str, headers=headers)
     response_data = json.loads(response.text)
+    note_rate_limit_rejection(response_data)
 
     # Add compatibility for service layer that expects .status attribute
     response.status = response.status_code
@@ -344,8 +357,11 @@ def cancel_order(orderid, auth):
     client = get_httpx_client()
     url = "https://api.shoonya.com/NorenWClientAPI/CancelOrder"
 
+    # Same budget, same no-retry rule as PlaceOrder (see place_order_api).
+    API_LIMITER.acquire()
     response = client.post(url, content=payload_str, headers=headers)
     data = json.loads(response.text)
+    note_rate_limit_rejection(data)
     logger.debug(f"CancelOrder Response: {data}")
 
     # Add compatibility for service layer that expects .status attribute
@@ -386,8 +402,11 @@ def modify_order(data, auth):
     client = get_httpx_client()
     url = "https://api.shoonya.com/NorenWClientAPI/ModifyOrder"
 
+    # Same budget, same no-retry rule as PlaceOrder (see place_order_api).
+    API_LIMITER.acquire()
     response = client.post(url, content=payload_str, headers=headers)
     response_data = json.loads(response.text)
+    note_rate_limit_rejection(response_data)
     logger.debug(f"Modify order response: {response_data}")
 
     # Add compatibility for service layer that expects .status attribute

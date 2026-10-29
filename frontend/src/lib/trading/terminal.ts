@@ -2567,6 +2567,218 @@ export class TradingTerminal {
     this.refreshQtySliderText()
   }
 
+  /* ── price-scale quick trade buttons ─────────────────────────────────── */
+
+  /**
+   * The pair of order buttons that ride the price scale: a B and an S beside
+   * the axis ladder, at the height of the price under the pointer — the
+   * quick-trade affordance TradingView puts on the scale and Dhan's chart
+   * copies, wired to this chart's right-click "Buy/Sell @ price".
+   *
+   * They exist while the pointer is over the chart and hide the moment it
+   * leaves, so the plot is clean the rest of the time; they sit just LEFT of
+   * the axis column (never on it), so the ladder's price values stay readable
+   * while the buttons are up, and the current bar's right margin keeps them
+   * off the candles. A press places at the price they are parked at, exactly
+   * the context menu's rows do: a valid-side price orders as a LIMIT there
+   * (One-Click off, the ticket opens prefilled at it), a wrong-side price —
+   * the broker would refuse the limit — goes as the order mode's market.
+   */
+  private scaleBtns: HTMLDivElement | null = null
+  private offScaleBtns: (() => void) | null = null
+  /** True while a press-drag (a pan) is in progress: buttons stay hidden. */
+  private scaleDragging = false
+  /** The snapped price the buttons are parked at, for the click to act on. */
+  private scalePrice: number | null = null
+
+  private mountScaleButtons(): void {
+    if (this.scaleBtns) return
+    const wrap = document.createElement('div')
+    wrap.setAttribute('data-scale-btns', '1')
+    wrap.style.cssText = [
+      'position:absolute',
+      'top:0',
+      'right:0',
+      'display:none',
+      'flex-direction:column',
+      'align-items:center',
+      'z-index:37',
+      // The wrapper only positions; the buttons take the pointer. Gestures
+      // between the two fall through to the chart.
+      'pointer-events:none',
+      'transform:translateY(-50%)',
+      'touch-action:none',
+    ].join(';')
+    const mkBtn = (side: 'BUY' | 'SELL') => {
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.dataset.scaleSide = side
+      btn.textContent = side === 'BUY' ? 'B' : 'S'
+      btn.style.cssText = [
+        'pointer-events:auto',
+        'display:flex',
+        'align-items:center',
+        'justify-content:center',
+        'width:20px',
+        'height:17px',
+        'margin:1px 0',
+        'padding:0',
+        'border:1px solid rgba(0,0,0,0.3)',
+        'border-radius:4px',
+        'cursor:pointer',
+        'color:#fff',
+        `background:${side === 'BUY' ? '#26a69a' : '#ef5350'}`,
+        'font:700 10px/1 ui-sans-serif, system-ui, sans-serif',
+        'box-shadow:0 1px 4px rgba(0,0,0,0.35)',
+      ].join(';')
+      return btn
+    }
+    // BUY above SELL: the same green-over-red reading as a rising ladder.
+    wrap.appendChild(mkBtn('BUY'))
+    wrap.appendChild(mkBtn('SELL'))
+    // The buttons are order entry, not chart surface: a press on one must
+    // not also reach the chart's own handlers as a pan or a pick (the instant
+    // panel stops the same gestures for the same reason).
+    for (const type of ['pointerdown', 'pointerup', 'mousedown', 'touchstart'] as const) {
+      wrap.addEventListener(type, (e) => e.stopPropagation())
+    }
+    for (const side of ['BUY', 'SELL'] as const) {
+      wrap
+        .querySelector<HTMLButtonElement>(`[data-scale-side="${side}"]`)
+        ?.addEventListener('click', (e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          if (this.scalePrice == null) return
+          this.quickFire(side, this.scalePrice)
+        })
+    }
+    this.container.appendChild(wrap)
+    this.scaleBtns = wrap
+
+    // Track the pointer over the chart. Coalesced through rAF: a high-Hz
+    // mouse fires pointermove far more often than a frame paints, and each
+    // update reads layout (the axis slots, the pane's box).
+    let last: PointerEvent | null = null
+    let raf = 0
+    const schedule = (ev: PointerEvent) => {
+      last = ev
+      if (raf) return
+      raf = requestAnimationFrame(() => {
+        raf = 0
+        if (last) this.updateScaleButtons(last)
+      })
+    }
+    const move = (ev: PointerEvent) => schedule(ev)
+    const down = (ev: PointerEvent) => {
+      if (ev.button === 0) this.scaleDragging = true
+      this.hideScaleButtons()
+    }
+    const up = () => {
+      this.scaleDragging = false
+    }
+    const leave = () => this.hideScaleButtons()
+    this.container.addEventListener('pointermove', move)
+    this.container.addEventListener('pointerdown', down)
+    this.container.addEventListener('pointerup', up)
+    this.container.addEventListener('pointercancel', up)
+    this.container.addEventListener('pointerleave', leave)
+    this.offScaleBtns = () => {
+      if (raf) cancelAnimationFrame(raf)
+      raf = 0
+      this.container.removeEventListener('pointermove', move)
+      this.container.removeEventListener('pointerdown', down)
+      this.container.removeEventListener('pointerup', up)
+      this.container.removeEventListener('pointercancel', up)
+      this.container.removeEventListener('pointerleave', leave)
+    }
+  }
+
+  private destroyScaleButtons(): void {
+    this.offScaleBtns?.()
+    this.offScaleBtns = null
+    this.scaleBtns?.remove()
+    this.scaleBtns = null
+  }
+
+  private hideScaleButtons(): void {
+    if (this.scaleBtns) this.scaleBtns.style.display = 'none'
+  }
+
+  /** Park the pair at the pointer's price, or take them off when it may not trade. */
+  private updateScaleButtons(ev: PointerEvent): void {
+    const wrap = this.scaleBtns
+    const chart = this.chart
+    if (!wrap || !chart || this.destroyed) return
+    const tradable =
+      this.sym != null && !this.sym.synthetic && !this.sym.quoteOnly && !this.drawTool
+    if (!tradable || this.scaleDragging || this.workspaceReplayLocked) {
+      wrap.style.display = 'none'
+      return
+    }
+    const box = this.container.getBoundingClientRect()
+    const localY = ev.clientY - box.top
+    // Only over the price pane: a y over the time axis or a study pane below
+    // maps to no price there.
+    const pane = chart.panes()[0]
+    if (pane) {
+      const rect = pane.element.getBoundingClientRect()
+      if (localY < rect.top - box.top || localY > rect.bottom - box.top) {
+        wrap.style.display = 'none'
+        return
+      }
+    }
+    const p = chart.coordinateToPrice(localY, 0)
+    if (p == null || !Number.isFinite(p)) {
+      wrap.style.display = 'none'
+      return
+    }
+    // Just left of the axis column — never over the ladder itself, so the
+    // values the trader is reading stay visible.
+    let rightInset = 0
+    for (const slot of chart.priceAxisLayout(0)) {
+      if (slot.side === 'right') rightInset += slot.width
+    }
+    const price = this.snap(p)
+    this.scalePrice = price
+    wrap.style.right = `${Math.round(rightInset) + 2}px`
+    wrap.style.top = `${Math.round(localY)}px`
+    const lotTxt = this.sym?.lots
+      ? `${Math.max(1, Math.floor(this.qty || 1))}L`
+      : String(this.orderQty())
+    const m = this.marketPrice()
+    const atPrice = this.fmt(price)
+    const buy = wrap.querySelector<HTMLButtonElement>('[data-scale-side="BUY"]')
+    const sell = wrap.querySelector<HTMLButtonElement>('[data-scale-side="SELL"]')
+    if (buy) {
+      buy.title =
+        m != null && price > m
+          ? `Buy ${lotTxt} — market (above LTP ${this.fmt(m)})`
+          : `Buy ${lotTxt} Limit @ ${atPrice}`
+    }
+    if (sell) {
+      sell.title =
+        m != null && price < m
+          ? `Sell ${lotTxt} — market (below LTP ${this.fmt(m)})`
+          : `Sell ${lotTxt} Limit @ ${atPrice}`
+    }
+    wrap.style.display = 'flex'
+  }
+
+  /**
+   * The scale buttons' fire: the right-click menu's Buy/Sell @ price, parked
+   * wherever the pointer was. A valid-side price orders as a LIMIT there —
+   * armed straight to the wire, disarmed into the prefilled ticket, the
+   * menu's own fork. A wrong-side price would be a limit the broker refuses
+   * (the menu greys that row), and the press reads as "take it from here",
+   * so it goes as the global order mode's market order instead.
+   */
+  private quickFire(side: OrderSide, price: number): void {
+    this.ctxPrice = this.snap(price)
+    const m = this.marketPrice()
+    const wrongSide = m != null && (side === 'BUY' ? this.ctxPrice > m : this.ctxPrice < m)
+    void this.placeFromMenu(side, wrongSide ? 'MARKET' : 'LIMIT')
+  }
+
   /**
    * The global order mode's wire shape for this instrument: MARKET, or the
    * LIMIT the mode computes off the live price (an MPP buffer, the screen
@@ -3335,6 +3547,7 @@ export class TradingTerminal {
     // ghosts — the panel going dead after a theme change was exactly that.
     this.destroyInstantPanel()
     this.destroyPosBox()
+    this.destroyScaleButtons()
     if (this.chart) this.chart.destroy()
     this.priceAxis.detach()
     // The primitives registered here belonged to the chart just destroyed.
@@ -3546,6 +3759,11 @@ export class TradingTerminal {
       this.destroyInstantPanel()
       this.destroyPosBox()
     }
+
+    // The price scale's quick-trade pair, up while the pointer is over the
+    // chart. Guards inside (synthetic, quote-only, replay, an armed drawing
+    // tool) decide per move whether it shows.
+    this.mountScaleButtons()
 
     this.chart.subscribeCrosshairMove((e) => {
       this.legendTime = e.bar?.time ?? null
@@ -9154,6 +9372,7 @@ export class TradingTerminal {
     this.detachDrawing()
     this.destroyInstantPanel()
     this.destroyPosBox()
+    this.destroyScaleButtons()
     if (this.bookTimer) clearInterval(this.bookTimer)
     this.bookTimer = null
     this.stopLtpFallback()

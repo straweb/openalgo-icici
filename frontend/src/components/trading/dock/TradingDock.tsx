@@ -48,13 +48,11 @@ import { useBlotter } from './useBlotter'
 const GttTab = lazy(() => import('../GttTab'))
 
 import { DepthTab } from './DepthTab'
-import { IndexTab } from './IndexTab'
-// The scheduled book and the index breakdown are static: they are small,
-// and a lazy chunk that fails to load (a stale build, a cached shell) left
-// this tab saying "Loading" forever — a placeholder the trader could not
-// click past. The code arrives with the dock now, and the tab renders.
+// The scheduled book is static: it is small, and a lazy chunk that fails to
+// load (a stale build, a cached shell) left this tab saying "Loading"
+// forever — a placeholder the trader could not click past. The code arrives
+// with the dock now, and the tab renders.
 import { ScheduledTab } from './ScheduledTab'
-import { StrategyTab } from './StrategyTab'
 import { useBracketEngine } from './useBracketEngine'
 import { useTradingScheduler } from './useTradingScheduler'
 
@@ -65,13 +63,9 @@ interface Props {
   tab: DockTab | null
   onTabChange(tab: DockTab | null): void
   apiKey: string
-  /** The WebSocket proxy URL, the tick hub's wire (the strategy tab). */
-  wsUrl: string
   /** Charts a row in the focused pane, the way a watchlist row does. */
   onPick(row: SearchRow): void
   activeSymbol: string | null
-  /** Every open pane's `EXCHANGE:SYMBOL`, for the Constituents tab's candidates. */
-  paneSymbols: Record<string, string | null>
   /** True while any pane is replaying or picking a replay start. */
   tradingLocked(): boolean
   /** Filled with the books and the actions, for the chart's right-click menu. */
@@ -82,10 +76,8 @@ export function TradingDock({
   tab,
   onTabChange,
   apiKey,
-  wsUrl,
   onPick,
   activeSymbol,
-  paneSymbols,
   tradingLocked,
   bridge,
 }: Props) {
@@ -307,24 +299,7 @@ export function TradingDock({
         // hedging terminal's fire there.
         <ScheduledTab apiKey={apiKey} activeSymbol={activeSymbol} />
       )}
-      {tab === 'index' && (
-        <IndexTab
-          apiKey={apiKey}
-          activeSymbol={activeSymbol}
-          paneSymbols={paneSymbols}
-          onPick={onPick}
-        />
-      )}
       {tab === 'depth' && <DepthTab apiKey={apiKey} onPick={onPick} />}
-      {tab === 'strategy' && (
-        <StrategyTab
-          apiKey={apiKey}
-          wsUrl={wsUrl}
-          activeSymbol={activeSymbol}
-          refuse={refuse}
-          refresh={refresh}
-        />
-      )}
       <ModifyOrderDialog
         order={modifying}
         onOpenChange={(open) => !open && setModifying(null)}

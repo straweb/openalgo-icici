@@ -39,11 +39,12 @@ from services.castrade_service import (
     DEFAULT_WINDOW_START,
     IST_OFFSET_SECONDS,
     IST_TZ,
+    LADDER_OFFSETS,
     SIDE_CE,
     SIDE_PE,
-    SIDE_OFFSETS,
     TV_OF_DEEP_ITM,
     VALID_FO_EXCHANGES,
+    VOTE_MARGIN,
     WIN_THRESHOLD,
     _bar_at,
     _bar_color,
@@ -119,11 +120,17 @@ class CastradeLiveSession:
             decision_hhmm = (decision_hhmm[0] - 1, decision_hhmm[1] + 60)
         self.pattern_hhmm = pattern_hhmm
         self.decision_hhmm = decision_hhmm
+        if _minutes(self.exit_hhmm) <= _minutes(self.entry_hhmm):
+            raise ValueError(
+                f"exit_time {_fmt_hhmm(self.exit_hhmm)} must be after "
+                f"entry_time {_fmt_hhmm(self.entry_hhmm)}"
+            )
 
         self.quote_symbol = ""
         self.quote_exchange = ""
         self.ce_atm: float = 0.0
         self.pe_atm: float = 0.0
+        self.ladder: list = []
         self.step: float = 0.0
         self.lot_size = 0
 
@@ -226,18 +233,21 @@ class CastradeLiveManager:
         # Replace any previous session for this user.
         self.stop(username, reason="replaced by a new live session")
 
-        sess = CastradeLiveSession(
-            username=username,
-            broker=broker,
-            api_key=api_key,
-            underlying=underlying,
-            fo_exchange=fo_exchange,
-            expiry=expiry,
-            trade_date=trade_date,
-            window_start=window_start,
-            entry_time=entry_time,
-            exit_time=exit_time,
-        )
+        try:
+            sess = CastradeLiveSession(
+                username=username,
+                broker=broker,
+                api_key=api_key,
+                underlying=underlying,
+                fo_exchange=fo_exchange,
+                expiry=expiry,
+                trade_date=trade_date,
+                window_start=window_start,
+                entry_time=entry_time,
+                exit_time=exit_time,
+            )
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}, 400
 
         # --- underlying candles + spot reference (same as replay) ---------
         quote_symbol, quote_exchange = _underlying_quote(underlying, fo_exchange)
@@ -285,12 +295,13 @@ class CastradeLiveManager:
                 ),
             }, 400
 
-        # --- strike universe (per side: 1 ITM + own ATM + 6 OTM) ----------
+        # --- strike universe (7-strike shared ladder x CE/PE = 14 legs) ----
         uni = _resolve_universe(underlying, fo_exchange, sess.expiry, sess.spot_ref)
         if "error" in uni:
             return {"status": "error", "message": uni["error"]}, 400
         sess.ce_atm = uni["ce_atm"]
         sess.pe_atm = uni["pe_atm"]
+        sess.ladder = list(uni.get("ladder") or [])
         sess.step = uni["strike_step"]
         sess.lot_size = uni["lot_size"] or 0
 
@@ -493,7 +504,17 @@ class CastradeLiveManager:
                 return
             sess.last_eval = now
         try:
-            self._evaluate(sess, full=False)
+            payload = self._evaluate(sess, full=False)
+            # Push the fresh state to the browser immediately - without this
+            # the page only ever saw the slow REST-poll fallback.
+            try:
+                from extensions import emit_from_any_thread
+
+                emit_from_any_thread(
+                    "castrade_update", {"status": "success", "data": payload}
+                )
+            except Exception as e:  # pragma: no cover - socket down is non-fatal
+                logger.debug(f"castrade_update emit failed: {e}")
         except Exception as e:
             logger.exception(f"castrade live: evaluate failed: {e}")
 
@@ -625,6 +646,11 @@ class CastradeLiveManager:
     # payload builders
     # ------------------------------------------------------------------
 
+    def _leg_moneyness(self, sess: CastradeLiveSession, leg: dict) -> tuple[str, int]:
+        """Per-side moneyness label of a leg, relative to that side's own ATM."""
+        side_atm = sess.ce_atm if leg["side"] == SIDE_CE else sess.pe_atm
+        return _moneyness(leg["side"], leg["strike"], side_atm, sess.step)
+
     def _leg_meta(self, sess: CastradeLiveSession, leg: dict, cond_a: dict, spot_hat) -> dict:
         window = leg["window_bars"]
         sc = (
@@ -665,7 +691,7 @@ class CastradeLiveManager:
                             }
                         )
 
-        moneyness, otm_steps = _moneyness(leg["side"], leg["offset"])
+        moneyness, otm_steps = self._leg_moneyness(sess, leg)
         return {
             "offset": leg["offset"],
             "moneyness": moneyness,
@@ -759,6 +785,7 @@ class CastradeLiveManager:
             "atm": sess.ce_atm,  # legacy single-ATM key (CE side)
             "ce_atm": sess.ce_atm,
             "pe_atm": sess.pe_atm,
+            "ladder": list(sess.ladder),
             "strike_step": sess.step,
             "lot_size": sess.lot_size,
             "window": {
@@ -778,7 +805,9 @@ class CastradeLiveManager:
                 "ce": round(votes["ce"], 3),
                 "pe": round(votes["pe"], 3),
                 "winning": votes["winning"],
+                "margin": round(votes.get("margin", 0.0), 3),
                 "threshold": WIN_THRESHOLD,
+                "vote_margin": VOTE_MARGIN,
             },
             "cond_a": {
                 side: {
@@ -839,7 +868,7 @@ class CastradeLiveManager:
             # page can (re)build all charts. Same shape as the replay payload.
             legs_out = []
             for side in (SIDE_CE, SIDE_PE):
-                for off in SIDE_OFFSETS[side]:
+                for off in LADDER_OFFSETS:
                     matches = [
                         leg
                         for leg in sess.legs_by_key.values()

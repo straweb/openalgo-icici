@@ -153,6 +153,8 @@ export interface CastradeAnalysisData {
   /** Per-side ATM (one-strike-difference): CE = strike at/below spot, PE = at/above. */
   ce_atm?: number
   pe_atm?: number
+  /** The 7-strike shared ladder around the 15:15 baseline spot (ascending). */
+  ladder?: number[]
   strike_step: number
   lot_size: number
   window: {
@@ -171,7 +173,11 @@ export interface CastradeAnalysisData {
     ce: number
     pe: number
     winning: 'CE' | 'PE' | null
+    /** winning vote total minus the other side's total */
+    margin?: number
     threshold: number
+    /** minimum margin the winner must hold over the other side */
+    vote_margin?: number
   }
   cond_a: { CE: CastradeCondA; PE: CastradeCondA }
   pattern: CastradePattern

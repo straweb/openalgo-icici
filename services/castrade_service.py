@@ -4,11 +4,13 @@ CAS Trade Service - expiry-day closing-window CAS prediction, analysis only.
 Powers the /castrade page. It ports the validated cas_prediction strategy
 logic (phase-1 OHLC strike picker + the 15:19/15:20 cross-side red/green
 confirmation + Cond A crash filter + intrinsic projection) into a service:
-it fetches 1-minute candles for the underlying and the strike universe (per
-side: ONE ITM strike + ATM + SIX OTM strikes), replays the strategy timeline
-on them and returns the charts, per-strike analysis and the single final
-winning trade (buy 15:21, sell 15:29). services/castrade_live.py reuses this
-module's engine functions to run the same timeline tick-by-tick on live feeds.
+it fetches 1-minute candles for the underlying and the strike universe (SEVEN
+strikes on one shared ladder around the 15:15 baseline spot - 3 below + ATM +
+3 above - each strike carrying a CE and a PE leg, 14 legs total), replays the
+strategy timeline on them and returns the charts, per-strike analysis and the
+single final winning trade (buy 15:21, sell 15:29). services/castrade_live.py
+reuses this module's engine functions to run the same timeline tick-by-tick on
+live feeds.
 
 HARD RULES (identical to the strategy):
 - No indicators, no volume, no OI, no IV. Only candle-vs-candle 1m OHLC.
@@ -58,22 +60,19 @@ IST_TZ = timezone(timedelta(hours=5, minutes=30))
 SIDE_CE = "CE"
 SIDE_PE = "PE"
 
-# Strike matrix: BOTH sides show exactly ONE ITM strike, the ATM strike and
-# SIX OTM strikes - built around each side's OWN ATM (per-side ATM):
-#   CE ATM = the listed strike AT/BELOW the spot (floor strike). It carries the
-#     small intrinsic and behaves like the spot for calls; every strike ABOVE
-#     it is OTM for CE, every strike BELOW it is ITM.
-#   PE ATM = the listed strike AT/ABOVE the spot (ceil strike). Every strike
-#     BELOW it is OTM for PE, every strike ABOVE it is ITM.
-# Example (spot 22760.75, step 50): CE ATM 22750, PE ATM 22800 - one strike
-# apart. CE legs 22700(ITM) 22750(ATM) 22800..23100(OTM); PE legs
-# 22850(ITM) 22800(ATM) 22750..22500(OTM). Offsets are strike-ladder steps
-# relative to the SIDE's ATM, signed toward higher strikes on both sides.
-CE_OFFSETS = [-1, 0, 1, 2, 3, 4, 5, 6]  # 1 ITM, ATM, 6 OTM
-PE_OFFSETS = [1, 0, -1, -2, -3, -4, -5, -6]  # 1 ITM, ATM, 6 OTM (mirrored)
-SIDE_OFFSETS = {SIDE_CE: CE_OFFSETS, SIDE_PE: PE_OFFSETS}
+# Strike universe: SEVEN strikes on ONE shared ladder around the 15:15
+# baseline spot - 3 below + ATM + 3 above (the ladder is centered on the CE
+# ATM = the floor strike; the PE ATM = the ceil strike is the +1 rung when the
+# spot sits between two strikes). Every strike carries BOTH a CE and a PE leg
+# (14 legs total). Moneyness labels stay PER-SIDE relative to that side's own
+# ATM: for CE everything above the CE ATM is OTM and below is ITM; for PE
+# everything below the PE ATM is OTM and above is ITM.
+# Example (spot 22760.75, step 50): ladder 22600..22900, CE ATM 22750,
+# PE ATM 22800 - the same spot, one ladder, both ATMs visible.
+LADDER_OFFSETS = [-3, -2, -1, 0, 1, 2, 3]  # strike-ladder steps from the baseline ATM
 
-WIN_THRESHOLD = 0.30  # side vote threshold on summed per-leg norms
+WIN_THRESHOLD = 0.30  # side vote: the winner must score above this
+VOTE_MARGIN = 0.20  # ...and beat the other side by at least this much
 TV_OF_DEEP_ITM = 2.0  # assumed time value of the deepest ITM CE (spot backout)
 DECAY = 0.35  # projection decay over the remaining bars
 EXIT_BARS = 8  # 15:21 read -> 15:29 exit
@@ -424,14 +423,23 @@ def _side_atm(strikes_sorted: list[float], spot: float, side: str) -> float:
     return float(above[0]) if above else float(strikes_sorted[-1])
 
 
-def _moneyness(side: str, offset: int) -> tuple[str, int]:
-    """Classify a leg for the UI: ('ITM'|'ATM'|'OTM', otm_steps 0..6)."""
-    if offset == 0:
+def _moneyness(side: str, strike: float, side_atm: float, step: float) -> tuple[str, int]:
+    """Classify a leg for the UI, relative to THAT side's own ATM.
+
+    CE: strikes above the CE ATM are OTM (otm_steps 1..3), below are ITM.
+    PE: strikes below the PE ATM are OTM (otm_steps 1..4), above are ITM.
+    Returns ('ITM'|'ATM'|'OTM', otm_steps) with otm_steps 0 for ITM/ATM.
+    """
+    diff = strike - side_atm
+    if abs(diff) < step / 2.0:
         return "ATM", 0
-    itm = offset < 0 if side == SIDE_CE else offset > 0
-    if itm:
+    if side == SIDE_CE:
+        if diff > 0:
+            return "OTM", int(round(diff / step))
         return "ITM", 0
-    return "OTM", abs(offset)
+    if diff < 0:
+        return "OTM", int(round(-diff / step))
+    return "ITM", 0
 
 
 def _resolve_universe(
@@ -440,13 +448,12 @@ def _resolve_universe(
     expiry: str,
     spot_ref: float,
 ) -> dict:
-    """Per side: ONE ITM strike + ATM + SIX OTM strikes, with symbols/lot size.
+    """SEVEN strikes (3 below + ATM + 3 above the 15:15 baseline) x CE/PE.
 
-    Everything comes from the master contract: step inferred from the listed
-    strikes, each side's ATM picked per the per-side convention (CE = strike
-    at/below spot, PE = strike at/above spot - they are one strike apart when
-    the spot is between two strikes), symbols constructed in OpenAlgo format
-    and verified against SymToken.
+    One shared ladder centered on the CE ATM (floor strike), so the PE ATM
+    (ceil strike) is the +1 rung when the spot sits between two strikes.
+    Symbols are constructed in OpenAlgo format and verified against SymToken;
+    moneyness is labeled per side relative to that side's own ATM.
     """
     ce_strikes = get_available_strikes(underlying, expiry, SIDE_CE, fo_exchange)
     if not ce_strikes:
@@ -457,28 +464,30 @@ def _resolve_universe(
     if step <= 0:
         step = float(FALLBACK_STRIKE_STEPS.get(underlying.upper(), 0)) or 50.0
 
-    # Per-side ATMs (see module docstring): CE floor strike, PE ceil strike.
+    # Per-side ATMs (CE = floor strike, PE = ceil strike) and the shared ladder.
     ce_atm = _side_atm(strikes_sorted, spot_ref, SIDE_CE)
     pe_atm = _side_atm(strikes_sorted, spot_ref, SIDE_PE)
-    side_atms = {SIDE_CE: ce_atm, SIDE_PE: pe_atm}
 
-    # Walk outward from EACH side's own ATM collecting offset strikes that
-    # exist. lo/hi walk independently per side so ladder-edge clamping cannot
-    # bleed across sides.
-    picked: dict[tuple[str, int], float] = {}
-    for side in (SIDE_CE, SIDE_PE):
-        s_atm = side_atms[side]
-        s_idx = strikes_sorted.index(s_atm)
-        lo, hi = s_idx, s_idx
-        for off in SIDE_OFFSETS[side]:
-            if off < 0:
-                lo = max(0, lo - 1)
-                picked[(side, off)] = strikes_sorted[lo]
-            elif off > 0:
-                hi = min(len(strikes_sorted) - 1, hi + 1)
-                picked[(side, off)] = strikes_sorted[hi]
-            else:
-                picked[(side, 0)] = s_atm
+    # Build the 7-strike ladder: rung N = ce_atm + N x step when listed,
+    # else clamped to the nearest listed strike on that side of the spot
+    # (edge clamping never reorders or duplicates rungs).
+    ladder: list[float] = []
+    seen: set[float] = set()
+    listed = set(strikes_sorted)
+    for off in LADDER_OFFSETS:
+        target = ce_atm + off * step
+        if target in listed:
+            strike = target
+        elif off < 0:
+            below = [s for s in strikes_sorted if s <= target]
+            strike = below[-1] if below else strikes_sorted[0]
+        else:
+            above = [s for s in strikes_sorted if s >= target]
+            strike = above[0] if above else strikes_sorted[-1]
+        if strike in seen:
+            continue
+        seen.add(strike)
+        ladder.append(strike)
 
     expiry_db = f"{expiry[:2]}-{expiry[2:5]}-{expiry[5:]}".upper()
     legs = []
@@ -491,9 +500,9 @@ def _resolve_universe(
         symbol_session = None
 
     for side in (SIDE_CE, SIDE_PE):
-        for off in SIDE_OFFSETS[side]:
-            strike = picked[(side, off)]
-            moneyness, otm_steps = _moneyness(side, off)
+        side_atm = ce_atm if side == SIDE_CE else pe_atm
+        for strike in ladder:
+            moneyness, otm_steps = _moneyness(side, strike, side_atm, step)
             symbol = construct_option_symbol(underlying, expiry, strike, side)
             ls = 0
             exists = True
@@ -516,7 +525,7 @@ def _resolve_universe(
                     exists = True
             legs.append(
                 {
-                    "offset": off,
+                    "offset": int(round((strike - ce_atm) / step)),
                     "moneyness": moneyness,
                     "otm_steps": otm_steps,
                     "strike": float(strike),
@@ -531,6 +540,7 @@ def _resolve_universe(
         "atm": float(ce_atm),  # legacy single-ATM key (kept for older clients)
         "ce_atm": float(ce_atm),
         "pe_atm": float(pe_atm),
+        "ladder": [float(s) for s in ladder],
         "strike_step": step,
         "legs": legs,
         "lot_size": lot_size,
@@ -584,6 +594,15 @@ def _cond_a_state(
 
 
 def _side_votes(window_bars_by_key: dict, legs_by_key: dict, cond_a: dict) -> dict:
+    """Side vote: the STRONGER side wins when it is decisive.
+
+    The winner is the side with the higher summed norm, provided it scores
+    above WIN_THRESHOLD AND beats the other side by at least VOTE_MARGIN and
+    is not Cond-A-banned. This replaces the old double-negative rule (one side
+    above +0.30 AND the other below -0.30), which demanded the losing side be
+    actively falling: a calm CE +0.52 vs PE +0.02 read is a valid bullish
+    verdict, not 'mixed' - that case now picks CE.
+    """
     ce_total = 0.0
     pe_total = 0.0
     for key, bars in window_bars_by_key.items():
@@ -596,11 +615,16 @@ def _side_votes(window_bars_by_key: dict, legs_by_key: dict, cond_a: dict) -> di
         else:
             pe_total += norm
     winning = None
-    if ce_total > WIN_THRESHOLD and pe_total < -WIN_THRESHOLD and not cond_a[SIDE_CE]["banned"]:
-        winning = SIDE_CE
-    elif pe_total > WIN_THRESHOLD and ce_total < -WIN_THRESHOLD and not cond_a[SIDE_PE]["banned"]:
-        winning = SIDE_PE
-    return {"ce": ce_total, "pe": pe_total, "winning": winning}
+    margin = 0.0
+    if ce_total >= pe_total:
+        best, other, best_side = ce_total, pe_total, SIDE_CE
+    else:
+        best, other, best_side = pe_total, ce_total, SIDE_PE
+    side_clean = not cond_a[best_side]["banned"]
+    margin = best - other
+    if best > WIN_THRESHOLD and margin >= VOTE_MARGIN - 1e-9 and side_clean:
+        winning = best_side
+    return {"ce": ce_total, "pe": pe_total, "winning": winning, "margin": margin}
 
 
 def _mirror_leg(
@@ -1012,7 +1036,7 @@ def _run_cas_analysis_inner(
             "time": _fmt_hhmm(decision_hhmm),
             "text": (
                 f"Side votes: CE {votes['ce']:+.2f} / PE {votes['pe']:+.2f} "
-                f"(threshold {WIN_THRESHOLD:+.2f})"
+                f"(threshold {WIN_THRESHOLD:+.2f}, margin {VOTE_MARGIN:.2f})"
                 + (f" -> {votes['winning']} side" if votes["winning"] else " -> no vote")
             ),
         }
@@ -1069,12 +1093,13 @@ def _run_cas_analysis_inner(
         }
 
     # --- assemble the leg payload ------------------------------------------
-    # Strike values come straight from the listed ladder (not synthesized),
-    # so the output walks the actual legs in the per-side matrix order
-    # (1 ITM, ATM, then the OTMs walking away from ATM).
+    # Strike values come straight from the shared ladder (not synthesized),
+    # so the output walks the actual legs in ladder order per side
+    # (ascending strikes, CE side then PE side).
     legs_out = []
     for side in (SIDE_CE, SIDE_PE):
-        for off in SIDE_OFFSETS[side]:
+        side_atm = ce_atm if side == SIDE_CE else pe_atm
+        for off in LADDER_OFFSETS:
             matches = [
                 cand
                 for cand in legs_by_key.values()
@@ -1116,7 +1141,7 @@ def _run_cas_analysis_inner(
                 }
                 for b in bars
             ]
-            moneyness, otm_steps = _moneyness(side, off)
+            moneyness, otm_steps = _moneyness(side, leg["strike"], side_atm, step)
             legs_out.append(
                 {
                     "offset": off,
@@ -1237,6 +1262,7 @@ def _run_cas_analysis_inner(
         "atm": ce_atm,  # legacy single-ATM key (CE side)
         "ce_atm": ce_atm,
         "pe_atm": pe_atm,
+        "ladder": uni["ladder"],
         "strike_step": step,
         "lot_size": lot_size,
         "window": {
@@ -1255,7 +1281,9 @@ def _run_cas_analysis_inner(
             "ce": round(votes["ce"], 3),
             "pe": round(votes["pe"], 3),
             "winning": votes["winning"],
+            "margin": round(votes.get("margin", 0.0), 3),
             "threshold": WIN_THRESHOLD,
+            "vote_margin": VOTE_MARGIN,
         },
         "cond_a": {
             "CE": {

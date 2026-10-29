@@ -10,18 +10,16 @@ for the tick-by-tick live engine — same functions, same numbers).
 
 ## 1. The strike universe (what is watched)
 
-1. At the window open (15:15) the spot is captured and each side gets its **OWN ATM** (the one-strike-difference convention):
-   - **CE ATM = the listed strike AT/BELOW the spot** (floor strike). It carries the small intrinsic and behaves like the spot for calls — every strike ABOVE it is OTM for CE, every strike BELOW it is ITM.
-   - **PE ATM = the listed strike AT/ABOVE the spot** (ceil strike) — every strike BELOW it is OTM for PE, every strike ABOVE it is ITM.
-   - Example (spot 22760.75, step 50): **CE ATM 22750, PE ATM 22800 — one strike apart.** The old single-shared-ATM build put PE's ladder one wall too low and could recommend 22750 PE (an OTM put that decays to zero) where the correct pick is 22800 PE (PE's ATM).
-   - When the spot sits exactly on a listed strike both sides share that strike.
-2. Strike step comes from the master contract (NIFTY 50, BANKNIFTY 100, …) — nothing is hard-coded.
-3. **Each side (CE and PE) shows exactly: 1 ITM + its own ATM + 6 OTM strikes.**
-   - CE: ITM = CE ATM−1, OTM = CE ATM+1 … CE ATM+6.
-   - PE (mirrored): ITM = PE ATM+1, OTM = PE ATM−1 … PE ATM−6.
-   - Earlier builds watched ATM−1..ATM+4 on both sides around ONE shared ATM, which made PE look ITM-heavy; the matrix is now symmetric AND per-side anchored: one ITM leg each, six OTM legs each.
-4. Leg symbols are constructed in OpenAlgo format and verified against the master contract; lot size comes from the contract too.
-5. Works for ANY index or F&O underlying (NFO/BFO/MCX/CDS) — symbol, step and lot are resolved, never assumed.
+1. At the window open (15:15) the spot is captured once and frozen - this is the **baseline spot**.
+2. **ONE shared ladder of SEVEN strikes**: 3 strikes BELOW + the baseline ATM + 3 strikes ABOVE the 15:15 baseline spot (the ladder is centered on the CE ATM = the strike at/below the spot; the PE ATM = the strike at/above the spot is the +1 rung when the spot sits between two strikes).
+3. Every strike carries BOTH a CE and a PE leg - **7 strikes x 2 sides = 14 legs**.
+4. Moneyness labels stay **per-side** relative to that side's own ATM (the one-strike-difference convention):
+   - **CE ATM = the listed strike AT/BELOW the spot** (floor strike) - every strike ABOVE it is OTM for CE, every strike BELOW it is ITM.
+   - **PE ATM = the listed strike AT/ABOVE the spot** (ceil strike) - every strike BELOW it is OTM for PE, every strike ABOVE it is ITM.
+   - Example (spot 22760.75, step 50): ladder 22600..22900, **CE ATM 22750, PE ATM 22800** - one spot, one ladder, both ATMs visible. The old single-shared-ATM build put PE's labels one wall too low; the per-side labeling fixes that while the display stays one symmetric ladder.
+5. Strike step comes from the master contract (NIFTY 50, BANKNIFTY 100, …) — nothing is hard-coded; ladder rungs clamp to the nearest listed strike at the ladder edges.
+6. Leg symbols are constructed in OpenAlgo format and verified against the master contract; lot size comes from the contract too.
+7. Works for ANY index or F&O underlying (NFO/BFO/MCX/CDS) — symbol, step and lot are resolved, never assumed.
 
 ## 2. The candle transition score (per leg, per bar pair)
 
@@ -54,8 +52,9 @@ For each 1-minute bar versus the previous bar of the SAME leg:
 ## 5. The side vote
 
 1. Sum the normalized scores of every tradable leg on each side.
-2. A side "wins" only if it scores **> +0.30** while the other scores **< −0.30** (`WIN_THRESHOLD`).
-3. The winning side is where the BUY candidate comes from.
+2. The **STRONGER side wins** when it is decisive: its total must be above **+0.30** (`WIN_THRESHOLD`) AND it must beat the other side by at least **+0.20** (`VOTE_MARGIN`), and it must not be Cond-A-banned.
+3. This replaces the old double-negative rule (one side above +0.30 AND the other below −0.30), which wrongly answered NO TRADE for reads like CE +0.52 / PE +0.02 — a calm bullish verdict where the losing side is merely flat. The margin guard keeps true conflicts out: CE +0.52 vs PE +0.40 (margin 0.12) is still no trade.
+4. The winning side is where the BUY candidate comes from; a tie (equal totals) can never win.
 
 ## 6. The 15:19 / 15:20 cross-side confirmation (the pattern — highest priority)
 
@@ -89,14 +88,15 @@ For each 1-minute bar versus the previous bar of the SAME leg:
 
 ## 9. Tick-by-tick execution (live mode)
 
-1. On `Go Live` the session seeds today's 1-minute candles from history and subscribes the underlying + all 16 legs (LTP ticks) on the broker feed.
+1. On `Go Live` the session seeds today's 1-minute candles from history and subscribes the underlying + all 14 legs (LTP ticks) on the broker feed.
 2. Every tick folds into the **forming bar** (o/h/l/c built tick by tick) — nothing waits for the minute to close.
 3. The whole engine (§2–§7) re-runs on every tick pass (0.5 s throttle), so verdicts, votes, Cond A and the pattern preview move **tick by tick**.
-4. Updates stream to the page as `castrade_update` socket.io events (5 s REST poll fallback).
+4. Every engine pass is **pushed to the browser** as a `castrade_update` socket.io event (`emit_from_any_thread`, safe from the feed callback thread); a 5 s REST poll is only a fallback. Before this push existed the page depended on the slow poll and looked frozen.
+5. The window/entry/exit times are editable in the toolbar; an exit time at or before the entry time is rejected up front (a stale persisted exit of 15:20 used to silently disarm every order button).
 
 ## 10. Order safety rails
 
-1. Every **tradable strike of the live session universe** (the 16 legs) can be traded from the page — the locked final pick via the Final Trade panel's BUY/SELL, and ANY strike row via its quick **B / S** buttons. Symbols outside the session universe are rejected server-side.
+1. Every **tradable strike of the live session universe** (the 14 legs) can be traded from the page — the locked final pick via the Final Trade panel's BUY/SELL, and ANY strike row via its quick **B / S** buttons. Symbols outside the session universe are rejected server-side.
 2. BUY is open from the window start (15:15) until the exit time (15:29) and only while this page is flat in that strike; SELL only against a position opened from this page (per-symbol tracking, so quick trades on different strikes stay independent).
 3. MARKET orders, whole lots, 1–20 lots per click, qty = lots × contract lot size; strategy tag `castrade` keeps broker-side bookkeeping separable.
 4. Analyzer/sandbox mode is honored end-to-end: with it on, "real" buttons route to the sandbox instead of the broker.

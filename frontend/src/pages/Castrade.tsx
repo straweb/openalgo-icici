@@ -1,18 +1,4 @@
 import {
-  type CandlestickData,
-  CandlestickSeries,
-  ColorType,
-  CrosshairMode,
-  createChart,
-  createSeriesMarkers,
-  type IChartApi,
-  type ISeriesApi,
-  type ISeriesMarkersPluginApi,
-  type SeriesMarker,
-  type Time,
-  type UTCTimestamp,
-} from 'lightweight-charts'
-import {
   BadgeDollarSign,
   Ban,
   ChevronLeft,
@@ -60,38 +46,28 @@ import { useThemeStore } from '@/stores/themeStore'
 /**
  * The /castrade terminal - the cas_prediction expiry-day strategy as a page.
  *
- * Layout (like /trading and /hedging it is a full-width application surface
- * with its own toolbar band instead of the app navbar):
+ * Layout (compact, terminal-style):
  *
- *   LEFT  : the charts - every strike of the 1 ITM + ATM + 6 OTM universe as
- *           a 1m candlestick chart, CE strikes in the left column, PE strikes
- *           in the right column (each column ordered ITM, ATM, then OTMs
- *           walking away from ATM). 15:19/15:20 pattern bars carry a dot
- *           marker on every chart; the winning leg gets BUY/SELL arrows.
- *   RIGHT : the strikes panel (CE rows, a CE/PE divider, PE rows) with each
- *           strike's score, x/20 confidence, pattern dots and projected/actual
- *           return; in live mode every row also carries quick B/S buttons that
- *           fire real MARKET orders for that strike; below it the final-trade
- *           panel - the ONE strike to buy at 15:21 and sell at 15:29 - with
- *           LIVE BUY / SELL buttons, then the funds-% slider (percent of the
- *           available amount -> whole lots, feeds the quick buttons' sizing),
- *           plus the strategy's decision timeline.
+ *   LEFT  : TWO custom canvases - one for the CE side, one for the PE side.
+ *           Each draws its representative leg's candles TICK BY TICK (the
+ *           forming bar repaints in place from the live feed) and overlays
+ *           the window markers (15:19 / 15:20 / entry / exit) plus the
+ *           side's current PREDICTION - the strike the engine projects for a
+ *           positive return. No more per-strike chart grids.
+ *   RIGHT : resizable strikes panel (CE rows, a CE/PE divider, PE rows; each
+ *           row has quick B/S buttons in live mode) + the Final Trade panel
+ *           + the Funds-% slider + the timeline. Drag the divider to resize.
  *
- * Per-side ATM: each side's ladder is built around its OWN ATM - CE ATM = the
- * strike at/below the spot, PE ATM = the strike at/above the spot (one strike
- * apart when the spot sits between two strikes). The cross-side mirror is the
- * opposite side's OWN ATM, so a red 22750 CE (CE's ATM) mirrors to 22800 PE
- * (PE's ATM) - never to the OTM 22750 PE that would decay to zero.
+ * Strike universe: SEVEN strikes on one shared ladder around the 15:15
+ * baseline spot (3 below + ATM + 3 above), each strike with a CE and a PE
+ * leg - 14 legs. Moneyness labels are per-side (CE ATM = strike at/below
+ * spot, PE ATM = strike at/above spot). The cross-side mirror buys the
+ * opposite side's own ATM: red 22750 CE -> buy 22800 PE, never 22750 PE.
  *
- * Two run modes:
- *   - REPLAY  (Analyze): the backend replays the cas_prediction timeline over
- *     one day of 1-minute candles. Read-only.
- *   - LIVE    (Go Live): a tick-by-tick session - broker feed ticks build the
- *     forming 1-minute bars, the engine re-runs on every tick (no waiting for
- *     the minute to close), updates arrive as `castrade_update` socket.io
- *     events (1.5s REST polling as a fallback), and the pick LOCKS the moment
- *     the decision bar closes. Only then are the BUY / SELL buttons armed,
- *     and they trade the locked pick only.
+ * Live mode: broker feed ticks build the forming 1-minute bars, the engine
+ * re-runs on every pass and pushes `castrade_update` socket.io events (5s
+ * REST poll as fallback). The pick LOCKS when the decision bar closes and
+ * the BUY / SELL buttons arm for the real broker.
  */
 
 const IST_OFFSET = 19800 // repo convention: bar times carry the IST shift
@@ -99,8 +75,10 @@ const IST_OFFSET = 19800 // repo convention: bar times carry the IST shift
 const UP = '#26a69a'
 const DOWN = '#ef5350'
 const FLAT = '#8a97a5'
+const GOLD = '#f59e0b'
 
-const STORAGE_KEY = 'openalgo.castrade.v1'
+const STORAGE_KEY = 'openalgo.castrade.v2' // v2: time inputs + panel width
+const PANEL_W_KEY = 'openalgo.castrade.panelw'
 
 interface PersistedConfig {
   underlying: string
@@ -114,8 +92,6 @@ interface PersistedConfig {
 }
 
 function todayIst(): string {
-  // The browser may sit in any timezone; the strategy runs on IST dates.
-  // UTC epoch + 5h30m, read through the UTC fields via toISOString.
   return new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10)
 }
 
@@ -134,7 +110,18 @@ function loadConfig(): PersistedConfig {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return fallback
     const parsed = JSON.parse(raw) as Partial<PersistedConfig>
-    return { ...fallback, ...parsed }
+    // Guard against stale/broken persisted times (e.g. exit before entry).
+    const cfg = { ...fallback, ...parsed }
+    const toMin = (t: string) => {
+      const [h, m] = (t || '').split(':').map((v) => Number.parseInt(v, 10))
+      return Number.isFinite(h) && Number.isFinite(m) ? h * 60 + m : -1
+    }
+    if (toMin(cfg.exitTime) <= toMin(cfg.entryTime)) {
+      cfg.windowStart = fallback.windowStart
+      cfg.entryTime = fallback.entryTime
+      cfg.exitTime = fallback.exitTime
+    }
+    return cfg
   } catch {
     return fallback
   }
@@ -144,15 +131,14 @@ function saveConfig(config: PersistedConfig) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(config))
   } catch {
-    // storage unavailable (private mode) - the page still works, it just
-    // will not remember the setup across reloads.
+    // storage unavailable (private mode) - the page still works
   }
 }
 
 /** Chart time (UTC seconds) of an IST clock time on a trade date. */
-function istChartTime(tradeDate: string, hhmm: string): UTCTimestamp {
+function istChartTime(tradeDate: string, hhmm: string): number {
   const seconds = Math.floor(Date.parse(`${tradeDate}T${hhmm}:00+05:30`) / 1000)
-  return (seconds + IST_OFFSET) as UTCTimestamp
+  return seconds + IST_OFFSET
 }
 
 function fmtStrike(n: number): string {
@@ -187,10 +173,15 @@ const VERDICT_TONE: Record<string, string> = {
   'STRONG DOWN': 'bg-red-500/15 text-red-600 dark:text-red-400',
 }
 
+function confidence20(score: number): number {
+  // The 0..20 confidence read of a normalized score (-1..+1).
+  return Math.max(0, Math.min(20, Math.round(((score + 1) / 2) * 20)))
+}
+
 function moneynessLabel(leg: Pick<CastradeLeg, 'moneyness' | 'otm_steps'>): string {
   if (leg.moneyness === 'ATM') return 'ATM'
   if (leg.moneyness === 'ITM') return 'ITM'
-  return `OTM+${leg.otm_steps || ''}`.replace('+', '+')
+  return `OTM+${leg.otm_steps || ''}`
 }
 
 function offsetLabel(leg: Pick<CastradeLeg, 'offset' | 'moneyness' | 'otm_steps'>): string {
@@ -200,193 +191,6 @@ function offsetLabel(leg: Pick<CastradeLeg, 'offset' | 'moneyness' | 'otm_steps'
   return `ATM+${leg.offset}`
 }
 
-// ---------------------------------------------------------------------------
-// StrikeChart - one leg's 1m candlestick mini chart
-// ---------------------------------------------------------------------------
-
-function StrikeChart({
-  leg,
-  tradeDate,
-  windowStart,
-  patternBar,
-  decisionBar,
-  entryTime,
-  exitTime,
-  isWinner,
-  isDark,
-}: {
-  leg: CastradeLeg
-  tradeDate: string
-  windowStart: string
-  patternBar: string
-  decisionBar: string
-  entryTime: string
-  exitTime: string
-  isWinner: boolean
-  isDark: boolean
-}) {
-  const containerRef = useRef<HTMLDivElement | null>(null)
-  const chartRef = useRef<IChartApi | null>(null)
-  const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
-  const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
-  const candlesRef = useRef<CastradeCandle[]>(leg.candles)
-  const lastAppliedRef = useRef<{ len: number; time: number } | null>(null)
-  const [ready, setReady] = useState(false)
-  candlesRef.current = leg.candles
-
-  // Chart creation: keyed by the leg identity + theme + winner highlight, so
-  // a live delta (new candles, new verdicts) NEVER rebuilds the chart - the
-  // data/markers effects below stream updates into the existing series.
-  useEffect(() => {
-    const container = containerRef.current
-    if (!container) return
-
-    const grid = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'
-    const text = isDark ? '#9aa4b2' : '#5b6470'
-
-    const chart = createChart(container, {
-      autoSize: true,
-      layout: {
-        background: { type: ColorType.Solid, color: 'transparent' },
-        textColor: text,
-        fontSize: 9,
-      },
-      grid: { vertLines: { color: grid }, horzLines: { color: grid } },
-      crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.15, bottom: 0.1 } },
-      timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false },
-    })
-    chartRef.current = chart
-
-    const series = chart.addSeries(CandlestickSeries, {
-      upColor: UP,
-      downColor: DOWN,
-      wickUpColor: UP,
-      wickDownColor: DOWN,
-      borderVisible: false,
-      priceLineColor: isWinner ? '#f59e0b' : grid,
-      priceFormat: { type: 'price', precision: 2, minMove: 0.05 },
-    })
-    seriesRef.current = series
-
-    const sorted = [...candlesRef.current].sort((a, b) => a.time - b.time)
-    series.setData(sorted as unknown as CandlestickData<Time>[])
-    const last = sorted[sorted.length - 1]
-    lastAppliedRef.current = last ? { len: sorted.length, time: Number(last.time) } : null
-
-    markersRef.current = createSeriesMarkers(series, [])
-    applyMarkers()
-
-    // Focus the closing window (a little context before it).
-    try {
-      chart.timeScale().setVisibleRange({
-        from: istChartTime(tradeDate, shiftMinutes(windowStart, -4)),
-        to: istChartTime(tradeDate, '15:30'),
-      })
-    } catch {
-      // empty day for this leg - nothing to range
-    }
-    setReady(true)
-
-    return () => {
-      chart.remove()
-      chartRef.current = null
-      seriesRef.current = null
-      markersRef.current = null
-      lastAppliedRef.current = null
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- candles stream in via the update effect
-  }, [leg.side, leg.strike, tradeDate, windowStart, entryTime, exitTime, isWinner, isDark])
-
-  // Live data: fold the newest candle into the existing series (update()
-  // replaces a bar at the same timestamp, so forming bars repaint in place).
-  useEffect(() => {
-    const series = seriesRef.current
-    if (!series || !ready) return
-    const sorted = [...leg.candles].sort((a, b) => a.time - b.time)
-    const last = sorted[sorted.length - 1]
-    if (!last) return
-    const applied = lastAppliedRef.current
-    const next = { len: sorted.length, time: Number(last.time) }
-    if (applied && applied.len === next.len && applied.time === next.time) return
-    lastAppliedRef.current = next
-    // Time went backwards (a new day/replay) -> full reset; otherwise stream.
-    if (applied && Number(last.time) < applied.time) {
-      series.setData(sorted as unknown as CandlestickData<Time>[])
-    } else {
-      series.update(last as unknown as CandlestickData<Time>)
-    }
-  }, [leg.candles, ready])
-
-  // Pattern dots + winner arrows, refreshed as the live engine reclassifies.
-  useEffect(() => {
-    if (!ready) return
-    applyMarkers()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- rebuild markers from the latest leg fields
-  }, [
-    leg.bar_pattern,
-    leg.bar_decision,
-    isWinner,
-    ready,
-    tradeDate,
-    patternBar,
-    decisionBar,
-    entryTime,
-    exitTime,
-  ])
-
-  function applyMarkers() {
-    const markersApi = markersRef.current
-    const series = seriesRef.current
-    if (!markersApi || !series) return
-    // Pattern dots on every chart: the 15:19 bar and the 15:20 bar, colored
-    // by their own candle direction - this is the cross-side rule made
-    // visible (red at near-ATM + greens on one side -> mirror strike wins).
-    const markers: SeriesMarker<Time>[] = []
-    const dot = (hhmm: string, color: string, text: string) => {
-      markers.push({
-        time: istChartTime(tradeDate, hhmm),
-        position: 'aboveBar',
-        color,
-        shape: 'circle',
-        text,
-        size: 1,
-      })
-    }
-    dot(patternBar, leg.bar_pattern ? colorFor(leg.bar_pattern.color) : FLAT, '19')
-    dot(decisionBar, leg.bar_decision ? colorFor(leg.bar_decision.color) : FLAT, '20')
-
-    if (isWinner) {
-      markers.push({
-        time: istChartTime(tradeDate, entryTime),
-        position: 'belowBar',
-        color: '#f59e0b',
-        shape: 'arrowUp',
-        text: 'BUY',
-        size: 1,
-      })
-      markers.push({
-        time: istChartTime(tradeDate, exitTime),
-        position: 'aboveBar',
-        color: '#64748b',
-        shape: 'arrowDown',
-        text: 'SELL',
-        size: 1,
-      })
-    }
-    markers.sort((a, b) => Number(a.time) - Number(b.time))
-    markersApi.setMarkers(markers as unknown as SeriesMarker<Time>[])
-  }
-
-  return (
-    <div
-      ref={containerRef}
-      className={cn('h-[120px] w-full', !ready && 'opacity-0')}
-      data-testid={`castrade-chart-${leg.side}-${leg.strike}`}
-    />
-  )
-}
-
 function colorFor(color: string): string {
   if (color === 'green') return UP
   if (color === 'red') return DOWN
@@ -394,27 +198,332 @@ function colorFor(color: string): string {
   return FLAT
 }
 
-function shiftMinutes(hhmm: string, delta: number): string {
-  const [h, m] = hhmm.split(':').map((v) => Number.parseInt(v, 10))
-  const total = h * 60 + m + delta
-  const hh = Math.floor(total / 60) % 24
-  const mm = ((total % 60) + 60) % 60
-  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`
+// ---------------------------------------------------------------------------
+// Side prediction - the leg on this side the engine projects for a positive
+// return (locked pick > forming preview > best projected leg > side ATM)
+// ---------------------------------------------------------------------------
+
+function pickRepresentativeLeg(
+  data: CastradeAnalysisData,
+  side: 'CE' | 'PE'
+): CastradeLeg | undefined {
+  const legs = data.legs.filter((l) => l.side === side)
+  if (legs.length === 0) return undefined
+  const byStrike = (s: number) => legs.find((l) => l.strike === s)
+  if (data.final_trade?.side === side) {
+    const l = byStrike(data.final_trade.strike)
+    if (l) return l
+  }
+  if (data.preview_pick?.side === side) {
+    const l = byStrike(data.preview_pick.strike)
+    if (l) return l
+  }
+  const positive = legs
+    .filter((l) => l.tradable && (l.projected_pct ?? 0) > 0 && l.candles.length > 0)
+    .sort((a, b) => (b.projected_pct ?? 0) - (a.projected_pct ?? 0))
+  if (positive[0]) return positive[0]
+  return (
+    legs.find((l) => l.moneyness === 'ATM' && l.candles.length > 0) ??
+    legs.find((l) => l.candles.length > 0)
+  )
 }
 
 // ---------------------------------------------------------------------------
-// Strikes panel - CE rows, divider, PE rows
+// SideCanvas - the custom real-time candlestick canvas (one per side)
 // ---------------------------------------------------------------------------
 
-function confidence20(score: number): number {
-  // The user-facing 0..20 confidence read of a normalized score (-1..+1):
-  // STRONG UP (~+0.9) reads 19/20, MIXED reads ~10/20, STRONG DOWN ~1/20.
-  return Math.max(0, Math.min(20, Math.round(((score + 1) / 2) * 20)))
+interface SideCanvasProps {
+  leg: CastradeLeg | undefined
+  predicted: CastradeLeg | undefined
+  data: CastradeAnalysisData
+  isDark: boolean
+  height?: number
 }
+
+function SideCanvas({ leg, predicted, data, isDark, height = 200 }: SideCanvasProps) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const wrapRef = useRef<HTMLDivElement | null>(null)
+  const candlesRef = useRef<CastradeCandle[]>(leg?.candles ?? [])
+  candlesRef.current = leg?.candles ?? []
+
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current
+    const wrap = wrapRef.current
+    if (!canvas || !wrap) return
+    const w = wrap.clientWidth
+    const h = height
+    if (w <= 0) return
+    const dpr = window.devicePixelRatio || 1
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr)
+      canvas.height = Math.round(h * dpr)
+      canvas.style.width = `${w}px`
+      canvas.style.height = `${h}px`
+    }
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, w, h)
+
+    const grid = isDark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.07)'
+    const text = isDark ? '#9aa4b2' : '#5b6470'
+
+    const padL = 4
+    const padR = 54
+    const padT = 10
+    const padB = 6
+
+    const all = [...candlesRef.current].sort((a, b) => a.time - b.time)
+    const vis = all.slice(-90)
+    const drawNoData = (msg: string) => {
+      ctx.fillStyle = text
+      ctx.font = '11px system-ui, sans-serif'
+      ctx.textAlign = 'center'
+      ctx.fillText(msg, w / 2, h / 2)
+    }
+    if (vis.length === 0) {
+      drawNoData('waiting for candles — press Analyze or Go Live')
+      return
+    }
+
+    let hi = -Infinity
+    let lo = Infinity
+    for (const c of vis) {
+      if (c.high > hi) hi = c.high
+      if (c.low < lo) lo = c.low
+    }
+    if (!Number.isFinite(hi) || !Number.isFinite(lo) || hi <= lo) {
+      hi = (hi || 0) + 1
+      lo = (lo || 0) - 1
+    }
+    const range = hi - lo
+    const top = hi + range * 0.08
+    const bot = lo - range * 0.06
+    const innerW = w - padL - padR
+    const innerH = h - padT - padB
+    const xw = innerW / vis.length
+    const yOf = (p: number) => padT + ((top - p) / (top - bot)) * innerH
+
+    // horizontal grid + price labels
+    ctx.strokeStyle = grid
+    ctx.fillStyle = text
+    ctx.font = '9px system-ui, sans-serif'
+    ctx.textAlign = 'left'
+    ctx.lineWidth = 1
+    const lines = 4
+    for (let i = 0; i <= lines; i++) {
+      const p = top - ((top - bot) * i) / lines
+      const yy = Math.round(yOf(p)) + 0.5
+      ctx.beginPath()
+      ctx.moveTo(padL, yy)
+      ctx.lineTo(w - padR, yy)
+      ctx.stroke()
+      ctx.fillText(fmtPrice(p), w - padR + 4, yy + 3)
+    }
+
+    // window markers: pattern 15:19, decision 15:20, entry, exit
+    const marks: Array<[string, string, string]> = [
+      [data.window.pattern_bar, GOLD, '19'],
+      [data.window.decision_bar, GOLD, '20'],
+      [data.window.entry, isDark ? '#34d399' : '#059669', 'E'],
+      [data.window.exit, isDark ? '#94a3b8' : '#64748b', 'X'],
+    ]
+    const t0 = vis[0].time
+    const t1 = vis[vis.length - 1].time
+    ctx.textAlign = 'center'
+    for (const [hhmm, color, label] of marks) {
+      const tt = istChartTime(data.trade_date, hhmm)
+      if (tt < t0 || tt > t1) continue
+      const idx = vis.findIndex((c) => c.time >= tt)
+      if (idx < 0) continue
+      const x = Math.round(padL + idx * xw + xw / 2) + 0.5
+      ctx.strokeStyle = color
+      ctx.setLineDash([2, 3])
+      ctx.beginPath()
+      ctx.moveTo(x, padT)
+      ctx.lineTo(x, h - padB)
+      ctx.stroke()
+      ctx.setLineDash([])
+      ctx.fillStyle = color
+      ctx.fillText(label, x, h - padB + 0.5 > h ? h - 2 : padT + 7)
+    }
+
+    // candles
+    const bodyW = Math.max(1.5, Math.min(9, xw * 0.62))
+    for (let i = 0; i < vis.length; i++) {
+      const c = vis[i]
+      const cx = padL + i * xw + xw / 2
+      const up = c.close >= c.open
+      ctx.strokeStyle = up ? UP : DOWN
+      ctx.fillStyle = up ? UP : DOWN
+      ctx.lineWidth = 1
+      // wick
+      ctx.beginPath()
+      ctx.moveTo(Math.round(cx) + 0.5, yOf(c.high))
+      ctx.lineTo(Math.round(cx) + 0.5, yOf(c.low))
+      ctx.stroke()
+      // body
+      const yHi = yOf(Math.max(c.open, c.close))
+      const yLo = yOf(Math.min(c.open, c.close))
+      const bh = Math.max(1, yLo - yHi)
+      if (up) {
+        ctx.fillRect(cx - bodyW / 2, yHi, bodyW, bh)
+      } else {
+        ctx.fillRect(cx - bodyW / 2, yHi, bodyW, bh)
+      }
+    }
+
+    // last price line + right chip
+    const last = vis[vis.length - 1]
+    const ly = yOf(last.close)
+    ctx.strokeStyle = GOLD
+    ctx.setLineDash([3, 3])
+    ctx.beginPath()
+    ctx.moveTo(padL, ly)
+    ctx.lineTo(w - padR, ly)
+    ctx.stroke()
+    ctx.setLineDash([])
+    ctx.fillStyle = GOLD
+    ctx.fillRect(w - padR + 2, ly - 7, padR - 4, 14)
+    ctx.fillStyle = '#1a1a1a'
+    ctx.font = 'bold 9px system-ui, sans-serif'
+    ctx.textAlign = 'left'
+    ctx.fillText(fmtPrice(last.close), w - padR + 4, ly + 3)
+  }, [data.trade_date, data.window, height, isDark])
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: candlesRef is read inside draw(); the extra deps are the semantic redraw triggers (candle updates and leg switches)
+  useEffect(() => {
+    draw()
+  }, [draw, leg?.candles, leg?.symbol, predicted?.symbol])
+
+  useEffect(() => {
+    const wrap = wrapRef.current
+    if (!wrap || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => draw())
+    ro.observe(wrap)
+    return () => ro.disconnect()
+  }, [draw])
+
+  return (
+    <div
+      ref={wrapRef}
+      className="w-full"
+      style={{ height }}
+      data-testid={`castrade-canvas-${leg?.side ?? 'na'}`}
+    >
+      <canvas ref={canvasRef} className="block h-full w-full" />
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Side chart card - header (side, vote, PREDICT chip) + SideCanvas
+// ---------------------------------------------------------------------------
+
+function SideChartCard({
+  side,
+  data,
+  repLeg,
+  predicted,
+  isDark,
+}: {
+  side: 'CE' | 'PE'
+  data: CastradeAnalysisData
+  repLeg: CastradeLeg | undefined
+  predicted: CastradeLeg | undefined
+  isDark: boolean
+}) {
+  const isCE = side === 'CE'
+  const vote = isCE ? data.votes.ce : data.votes.pe
+  const condA = isCE ? data.cond_a.CE : data.cond_a.PE
+  const winning = data.votes.winning === side
+  return (
+    <div
+      className={cn('rounded-lg border bg-card', winning && 'ring-1 ring-amber-500/40')}
+      data-testid={`castrade-side-card-${side}`}
+    >
+      <div className="flex items-center justify-between gap-2 px-2 pt-1.5 pb-1">
+        <div className="flex items-center gap-1.5">
+          <span
+            className={cn(
+              'text-[10px] font-bold tracking-wider',
+              isCE ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'
+            )}
+          >
+            {side} · {isCE ? 'CALLS' : 'PUTS'}
+          </span>
+          {winning && (
+            <Badge className="h-4 bg-amber-500 px-1 text-[8px] font-bold text-black">
+              WIN SIDE
+            </Badge>
+          )}
+          {condA.banned && (
+            <Badge variant="destructive" className="h-4 px-1 text-[8px]">
+              COND A −{condA.drop_pct.toFixed(0)}%
+            </Badge>
+          )}
+        </div>
+        <div className="flex items-center gap-2 font-mono text-[10px]">
+          <span className={pctTone(vote)}>
+            vote {vote > 0 ? '+' : ''}
+            {vote.toFixed(2)}
+          </span>
+          {predicted ? (
+            <span
+              className="rounded bg-amber-500/15 px-1.5 py-0.5 font-semibold text-amber-600 dark:text-amber-400"
+              title={`predicted leg ${predicted.symbol} — projected ${fmtPct(predicted.projected_pct)}`}
+              data-testid={`castrade-predict-${side}`}
+            >
+              PREDICT {fmtStrike(predicted.strike)} {fmtPct(predicted.projected_pct)}
+            </span>
+          ) : (
+            <span className="text-muted-foreground">no positive-return strike yet</span>
+          )}
+        </div>
+      </div>
+      {repLeg && (
+        <div className="flex items-center gap-2 px-2 pb-0.5 font-mono text-[9px] text-muted-foreground">
+          <span className="text-foreground/70">
+            {offsetLabel(repLeg)} {fmtStrike(repLeg.strike)}
+          </span>
+          <span
+            className={cn(
+              'rounded px-1 py-px',
+              VERDICT_TONE[repLeg.verdict] ?? 'bg-muted text-muted-foreground'
+            )}
+          >
+            {repLeg.verdict}
+          </span>
+          <span>{confidence20(repLeg.score)}/20</span>
+          <span className={pctTone(repLeg.projected_pct)}>proj {fmtPct(repLeg.projected_pct)}</span>
+          <span>prem {fmtPrice(repLeg.premium_live ?? repLeg.premium_at_decision)}</span>
+          <span className="flex-1" />
+          <span className="text-muted-foreground/70">
+            19/20 dots{' '}
+            <CircleDot
+              className="inline h-2.5 w-2.5 align-baseline"
+              style={{ color: colorFor(repLeg.bar_pattern?.color ?? 'none') }}
+            />{' '}
+            <CircleDot
+              className="inline h-2.5 w-2.5 align-baseline"
+              style={{ color: colorFor(repLeg.bar_decision?.color ?? 'none') }}
+            />
+          </span>
+        </div>
+      )}
+      <SideCanvas leg={repLeg} predicted={predicted} data={data} isDark={isDark} height={196} />
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Strikes panel - CE rows, divider, PE rows (+ quick B/S + PRED badges)
+// ---------------------------------------------------------------------------
 
 function StrikeRow({
   leg,
   isWinner,
+  isPredicted,
   patternBar,
   decisionBar,
   live,
@@ -423,6 +532,7 @@ function StrikeRow({
 }: {
   leg: CastradeLeg
   isWinner: boolean
+  isPredicted: boolean
   patternBar: string
   decisionBar: string
   live: boolean
@@ -432,32 +542,33 @@ function StrikeRow({
   return (
     <div
       className={cn(
-        'flex items-center gap-2 rounded-md px-2 py-1.5 text-xs',
+        'flex items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px]',
         isWinner && 'bg-amber-500/10 ring-1 ring-amber-500/50',
+        !isWinner && isPredicted && 'bg-amber-500/5',
         leg.blocked && 'opacity-55'
       )}
       data-testid={`castrade-row-${leg.side}-${leg.strike}`}
     >
-      <span className="w-11 shrink-0 font-mono text-[10px] text-muted-foreground">
+      <span className="w-10 shrink-0 font-mono text-[9px] text-muted-foreground">
         {offsetLabel(leg)}
       </span>
-      <span className="w-14 shrink-0 font-semibold tabular-nums">{fmtStrike(leg.strike)}</span>
+      <span className="w-13 shrink-0 font-semibold tabular-nums">{fmtStrike(leg.strike)}</span>
       <span
-        className="flex shrink-0 items-center gap-1"
+        className="flex shrink-0 items-center gap-0.5"
         title={`${patternBar} / ${decisionBar} candles`}
       >
         <CircleDot
-          className="h-3 w-3"
+          className="h-2.5 w-2.5"
           style={{ color: colorFor(leg.bar_pattern?.color ?? 'none') }}
         />
         <CircleDot
-          className="h-3 w-3"
+          className="h-2.5 w-2.5"
           style={{ color: colorFor(leg.bar_decision?.color ?? 'none') }}
         />
       </span>
       <span
         className={cn(
-          'w-12 shrink-0 rounded px-1 py-0.5 text-center font-mono text-[10px]',
+          'w-10 shrink-0 rounded px-0.5 py-0.5 text-center font-mono text-[9px]',
           VERDICT_TONE[leg.verdict] ?? 'bg-muted text-muted-foreground'
         )}
         title={`score ${leg.score > 0 ? '+' : ''}${leg.score.toFixed(2)} (${leg.verdict})`}
@@ -467,7 +578,7 @@ function StrikeRow({
       </span>
       <span
         className={cn(
-          'w-9 shrink-0 text-center font-mono text-[10px] tabular-nums',
+          'w-8 shrink-0 text-center font-mono text-[9px] tabular-nums',
           confidence20(leg.score) >= 15
             ? 'text-emerald-600 dark:text-emerald-400'
             : confidence20(leg.score) <= 5
@@ -479,33 +590,42 @@ function StrikeRow({
         {confidence20(leg.score)}/20
       </span>
       <span className="flex-1 truncate text-right tabular-nums">
-        {leg.premium_at_decision !== null ? fmtPrice(leg.premium_at_decision) : '—'}
+        {(leg.premium_live ?? leg.premium_at_decision !== null)
+          ? fmtPrice(leg.premium_live ?? leg.premium_at_decision)
+          : '—'}
       </span>
       <span
         className={cn(
-          'w-14 shrink-0 text-right font-medium tabular-nums',
+          'w-12 shrink-0 text-right font-medium tabular-nums',
           pctTone(leg.projected_pct)
         )}
       >
         {fmtPct(leg.projected_pct)}
       </span>
-      <span className={cn('w-14 shrink-0 text-right tabular-nums', pctTone(leg.actual?.pct))}>
+      <span className={cn('w-12 shrink-0 text-right tabular-nums', pctTone(leg.actual?.pct))}>
         {fmtPct(leg.actual?.pct)}
       </span>
       {isWinner ? (
-        <Badge variant="default" className="h-4 shrink-0 bg-amber-500 px-1 text-[9px] text-black">
+        <Badge variant="default" className="h-4 shrink-0 bg-amber-500 px-1 text-[8px] text-black">
           WIN
         </Badge>
+      ) : isPredicted ? (
+        <Badge
+          variant="outline"
+          className="h-4 shrink-0 border-amber-500/60 px-1 text-[8px] text-amber-600 dark:text-amber-400"
+        >
+          PRED
+        </Badge>
       ) : leg.blocked ? (
-        <Ban className="h-3.5 w-3.5 shrink-0 text-red-500" aria-label="Cond A banned" />
+        <Ban className="h-3 w-3 shrink-0 text-red-500" aria-label="Cond A banned" />
       ) : (
-        <span className="w-[42px] shrink-0" />
+        <span className="w-[34px] shrink-0" />
       )}
       {live ? (
         <span className="flex shrink-0 items-center gap-0.5">
           {positionQty > 0 && (
             <span
-              className="mr-0.5 rounded bg-amber-500/20 px-1 font-mono text-[9px] text-amber-600 dark:text-amber-400"
+              className="mr-0.5 rounded bg-amber-500/20 px-1 font-mono text-[8px] text-amber-600 dark:text-amber-400"
               title="Open qty from this page"
             >
               {positionQty}
@@ -513,7 +633,7 @@ function StrikeRow({
           )}
           <Button
             size="sm"
-            className="h-5 w-6 rounded px-0 text-[9px] font-bold text-white bg-emerald-600 hover:bg-emerald-600/90"
+            className="h-4.5 w-5 rounded px-0 text-[8px] font-bold text-white bg-emerald-600 hover:bg-emerald-600/90"
             disabled={leg.blocked || !leg.tradable}
             onClick={() => onQuickOrder(leg, 'BUY')}
             aria-label={`Quick BUY ${leg.symbol}`}
@@ -524,7 +644,7 @@ function StrikeRow({
           <Button
             size="sm"
             variant="outline"
-            className="h-5 w-6 rounded border-red-500/40 px-0 text-[9px] font-bold text-red-600 hover:bg-red-500/10 dark:text-red-400"
+            className="h-4.5 w-5 rounded border-red-500/40 px-0 text-[8px] font-bold text-red-600 hover:bg-red-500/10 dark:text-red-400"
             disabled={positionQty <= 0}
             onClick={() => onQuickOrder(leg, 'SELL')}
             aria-label={`Quick SELL ${leg.symbol}`}
@@ -534,7 +654,7 @@ function StrikeRow({
           </Button>
         </span>
       ) : (
-        <span className="w-[52px] shrink-0" />
+        <span className="w-[44px] shrink-0" />
       )}
     </div>
   )
@@ -544,11 +664,13 @@ function StrikesPanel({
   data,
   ceLegs,
   peLegs,
+  predictedKeys,
   onQuickOrder,
 }: {
   data: CastradeAnalysisData
   ceLegs: CastradeLeg[]
   peLegs: CastradeLeg[]
+  predictedKeys: Set<string>
   onQuickOrder: (leg: CastradeLeg, action: 'BUY' | 'SELL') => void
 }) {
   const winner = data.final_trade
@@ -560,19 +682,25 @@ function StrikesPanel({
 
   return (
     <div className="rounded-lg border bg-card">
-      <div className="flex items-center justify-between border-b px-3 py-2">
-        <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          <Target className="h-3.5 w-3.5" /> Strikes
+      <div className="flex items-center justify-between border-b px-2 py-1.5">
+        <h3 className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+          <Target className="h-3 w-3" /> Strikes
         </h3>
-        <div className="flex items-center gap-1 font-mono text-[10px]">
-          <span className="text-emerald-600 dark:text-emerald-400">
+        <div className="flex items-center gap-1 font-mono text-[9px]">
+          <span
+            className={cn(
+              data.votes.winning === 'CE'
+                ? 'font-bold text-emerald-600 dark:text-emerald-400'
+                : 'text-emerald-600/70 dark:text-emerald-400/70'
+            )}
+          >
             CE {data.votes.ce > 0 ? '+' : ''}
             {data.votes.ce.toFixed(2)}
           </span>
           <span className="text-muted-foreground">/</span>
           <span
             className={cn(
-              data.votes.pe < 0 ? 'text-red-600 dark:text-red-400' : 'text-muted-foreground'
+              data.votes.winning === 'PE' ? 'font-bold text-amber-600' : 'text-muted-foreground'
             )}
           >
             PE {data.votes.pe > 0 ? '+' : ''}
@@ -580,32 +708,27 @@ function StrikesPanel({
           </span>
         </div>
       </div>
-      <div className="px-1.5 py-1.5">
-        {/* Column captions once, above the CE group */}
-        <div className="flex items-center gap-2 px-2 pb-1 text-[9px] uppercase tracking-wide text-muted-foreground">
-          <span className="w-11">Leg</span>
-          <span className="w-14">Strike</span>
-          <span className="w-8">19/20</span>
-          <span className="w-12">Score</span>
-          <span className="w-9 text-center">Conf</span>
+      <div className="px-1 py-1">
+        <div className="flex items-center gap-1.5 px-1.5 pb-0.5 text-[8px] uppercase tracking-wide text-muted-foreground">
+          <span className="w-10">Leg</span>
+          <span className="w-13">Strike</span>
+          <span className="w-6 text-center">19/20</span>
+          <span className="w-10 text-center">Score</span>
+          <span className="w-8 text-center">Conf</span>
           <span className="flex-1 text-right">Prem</span>
-          <span className="w-14 text-right">Proj</span>
-          <span className="w-14 text-right">Real</span>
-          <span className="w-[42px]" />
-          {live ? (
-            <span className="w-[52px] text-center">B / S</span>
-          ) : (
-            <span className="w-[52px]" />
-          )}
+          <span className="w-12 text-right">Proj</span>
+          <span className="w-12 text-right">Real</span>
+          <span className="w-[34px]" />
+          {live ? <span className="w-[44px] text-center">B/S</span> : <span className="w-[44px]" />}
         </div>
 
         <div className="rounded-md bg-emerald-500/5">
-          <div className="flex items-center justify-between px-2 py-1">
-            <span className="text-[10px] font-bold tracking-wider text-emerald-600 dark:text-emerald-400">
+          <div className="flex items-center justify-between px-1.5 py-0.5">
+            <span className="text-[9px] font-bold tracking-wider text-emerald-600 dark:text-emerald-400">
               CE · CALLS
             </span>
             {data.cond_a.CE.banned && (
-              <Badge variant="destructive" className="h-4 px-1 text-[9px]">
+              <Badge variant="destructive" className="h-3.5 px-1 text-[8px]">
                 COND A −{data.cond_a.CE.drop_pct.toFixed(0)}%
               </Badge>
             )}
@@ -615,6 +738,7 @@ function StrikesPanel({
               key={leg.symbol}
               leg={leg}
               isWinner={isWinner(leg)}
+              isPredicted={predictedKeys.has(`${leg.side}-${leg.strike}`)}
               patternBar={data.window.pattern_bar}
               decisionBar={data.window.decision_bar}
               live={live}
@@ -624,22 +748,21 @@ function StrikesPanel({
           ))}
         </div>
 
-        {/* The CE | PE divider */}
-        <div className="my-1.5 flex items-center gap-2 px-2">
+        <div className="my-1 flex items-center gap-2 px-1.5">
           <span className="h-px flex-1 bg-border" />
-          <span className="text-[9px] font-bold tracking-widest text-muted-foreground">
+          <span className="text-[8px] font-bold tracking-widest text-muted-foreground">
             CE ▲ | PE ▼
           </span>
           <span className="h-px flex-1 bg-border" />
         </div>
 
         <div className="rounded-md bg-red-500/5">
-          <div className="flex items-center justify-between px-2 py-1">
-            <span className="text-[10px] font-bold tracking-wider text-red-600 dark:text-red-400">
+          <div className="flex items-center justify-between px-1.5 py-0.5">
+            <span className="text-[9px] font-bold tracking-wider text-red-600 dark:text-red-400">
               PE · PUTS
             </span>
             {data.cond_a.PE.banned && (
-              <Badge variant="destructive" className="h-4 px-1 text-[9px]">
+              <Badge variant="destructive" className="h-3.5 px-1 text-[8px]">
                 COND A −{data.cond_a.PE.drop_pct.toFixed(0)}%
               </Badge>
             )}
@@ -649,6 +772,7 @@ function StrikesPanel({
               key={leg.symbol}
               leg={leg}
               isWinner={isWinner(leg)}
+              isPredicted={predictedKeys.has(`${leg.side}-${leg.strike}`)}
               patternBar={data.window.pattern_bar}
               decisionBar={data.window.decision_bar}
               live={live}
@@ -663,7 +787,7 @@ function StrikesPanel({
 }
 
 // ---------------------------------------------------------------------------
-// Final trade panel - the ONE strike to buy and sell (+ live order buttons)
+// Final trade panel + funds slider (compact)
 // ---------------------------------------------------------------------------
 
 function FinalTradePanel({
@@ -686,15 +810,13 @@ function FinalTradePanel({
   const lastOrder = data.orders?.[data.orders.length - 1]
 
   if (!trade && data.preview_pick) {
-    // The engine is running on forming bars but the decision bar has not
-    // closed yet - show the forming pick without arming any buttons.
     return (
       <div className="rounded-lg border bg-card ring-1 ring-amber-500/30">
         <PanelHeader />
-        <div className="space-y-2 px-3 py-2.5">
+        <div className="space-y-1.5 px-2.5 py-2">
           <div className="flex items-center justify-between gap-2">
-            <div className="flex items-baseline gap-2">
-              <span className="text-lg font-bold tabular-nums">
+            <div className="flex items-baseline gap-1.5">
+              <span className="text-base font-bold tabular-nums">
                 {fmtStrike(data.preview_pick.strike)}
               </span>
               <Badge
@@ -708,22 +830,16 @@ function FinalTradePanel({
                 {data.preview_pick.side}
               </Badge>
             </div>
-            <Badge className="bg-amber-500/15 px-1.5 text-[10px] text-amber-600 dark:text-amber-400">
+            <Badge className="bg-amber-500/15 px-1.5 text-[9px] text-amber-600 dark:text-amber-400">
               <Flame className="mr-0.5 h-3 w-3" />
               FORMING
             </Badge>
           </div>
-          <div className="truncate font-mono text-[10px] text-muted-foreground">
-            <Link2 className="mr-1 inline h-3 w-3" />
+          <div className="truncate font-mono text-[9px] text-muted-foreground">
+            <Link2 className="mr-1 inline h-2.5 w-2.5" />
             {data.preview_pick.symbol}
           </div>
-          <p className="text-[10px] leading-snug text-muted-foreground">
-            Tick-by-tick preview of the{' '}
-            {data.preview_pick.source === 'pattern' ? 'cross-side pattern' : 'scoring'} pick — it
-            LOCKS when the {data.window.decision_bar} bar closes and the BUY button arms for{' '}
-            {data.window.entry}.
-          </p>
-          <p className="line-clamp-2 text-[10px] leading-snug text-muted-foreground/80">
+          <p className="line-clamp-2 text-[9px] leading-snug text-muted-foreground/80">
             {data.preview_reason}
           </p>
         </div>
@@ -735,8 +851,8 @@ function FinalTradePanel({
     return (
       <div className="rounded-lg border bg-card">
         <PanelHeader />
-        <div className="flex items-center gap-2 px-3 py-4 text-xs text-muted-foreground">
-          <Ban className="h-4 w-4 shrink-0 text-red-500" />
+        <div className="flex items-center gap-2 px-2.5 py-2.5 text-[11px] text-muted-foreground">
+          <Ban className="h-3.5 w-3.5 shrink-0 text-red-500" />
           <span>
             <span className="font-semibold text-foreground">NO TRADE</span>
             {data.no_trade_reason ? ` — ${data.no_trade_reason}` : ''}
@@ -760,10 +876,10 @@ function FinalTradePanel({
       data-testid="castrade-final-trade"
     >
       <PanelHeader />
-      <div className="space-y-2.5 px-3 py-2.5">
+      <div className="space-y-1.5 px-2.5 py-2">
         <div className="flex items-center justify-between gap-2">
-          <div className="flex items-baseline gap-2">
-            <span className="text-lg font-bold tabular-nums">{fmtStrike(trade.strike)}</span>
+          <div className="flex items-baseline gap-1.5">
+            <span className="text-base font-bold tabular-nums">{fmtStrike(trade.strike)}</span>
             <Badge
               className={cn(
                 'px-1.5 font-bold',
@@ -777,72 +893,54 @@ function FinalTradePanel({
           </div>
           <div className="flex items-center gap-1">
             {trade.source === 'pattern' && (
-              <Badge className="bg-amber-500/15 px-1.5 text-[10px] text-amber-600 dark:text-amber-400">
+              <Badge className="bg-amber-500/15 px-1.5 text-[9px] text-amber-600 dark:text-amber-400">
                 <Flame className="mr-0.5 h-3 w-3" /> PATTERN
               </Badge>
             )}
             {trade.source === 'scoring' && (
-              <Badge variant="secondary" className="px-1.5 text-[10px]">
+              <Badge variant="secondary" className="px-1.5 text-[9px]">
                 SCORING
               </Badge>
             )}
             {trade.pending && (
-              <Badge variant="outline" className="px-1.5 text-[10px]">
+              <Badge variant="outline" className="px-1.5 text-[9px]">
                 PENDING
               </Badge>
             )}
           </div>
         </div>
 
-        <div className="truncate font-mono text-[10px] text-muted-foreground" title={trade.symbol}>
-          <Link2 className="mr-1 inline h-3 w-3" />
+        <div className="truncate font-mono text-[9px] text-muted-foreground" title={trade.symbol}>
+          <Link2 className="mr-1 inline h-2.5 w-2.5" />
           {trade.symbol}
         </div>
 
-        <div className="grid grid-cols-2 gap-2 text-xs">
-          <div className="rounded-md border bg-emerald-500/5 px-2 py-1.5">
-            <div className="text-[9px] uppercase tracking-wide text-muted-foreground">
-              BUY @ {trade.entry_time}
-            </div>
+        <div className="grid grid-cols-3 gap-1.5 text-[10px]">
+          <div className="rounded border bg-emerald-500/5 px-1.5 py-1">
+            <div className="text-[8px] uppercase text-muted-foreground">BUY {trade.entry_time}</div>
             <div className="font-semibold tabular-nums">{fmtPrice(trade.entry_price)}</div>
           </div>
-          <div className="rounded-md border bg-slate-500/5 px-2 py-1.5">
-            <div className="text-[9px] uppercase tracking-wide text-muted-foreground">
-              SELL @ {trade.exit_time}
-            </div>
+          <div className="rounded border bg-slate-500/5 px-1.5 py-1">
+            <div className="text-[8px] uppercase text-muted-foreground">SELL {trade.exit_time}</div>
             <div className="font-semibold tabular-nums">{fmtPrice(trade.exit_price)}</div>
           </div>
-        </div>
-
-        <div className="grid grid-cols-3 gap-2 text-xs">
-          <div className="px-1">
-            <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Return</div>
-            <div className={cn('font-semibold tabular-nums', pctTone(trade.pct))}>
-              {fmtPct(trade.pct)}
-            </div>
-          </div>
-          <div className="px-1">
-            <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Qty</div>
+          <div className="rounded border px-1.5 py-1">
+            <div className="text-[8px] uppercase text-muted-foreground">Qty / P&L</div>
             <div className="font-semibold tabular-nums">
-              {qty}{' '}
-              <span className="text-[9px] text-muted-foreground">
-                ({trade.lot_size}×{lots})
+              {qty} ·{' '}
+              <span className={pctTone(trade.pnl_per_unit)}>
+                {pnl !== null
+                  ? `₹${pnl.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`
+                  : '—'}
               </span>
             </div>
           </div>
-          <div className="px-1">
-            <div className="text-[9px] uppercase tracking-wide text-muted-foreground">P&L</div>
-            <div className={cn('font-semibold tabular-nums', pctTone(trade.pnl_per_unit))}>
-              {pnl !== null ? `₹${pnl.toLocaleString('en-IN', { maximumFractionDigits: 0 })}` : '—'}
-            </div>
-          </div>
         </div>
 
-        {/* LIVE order buttons - the final strike's BUY (15:21) and SELL (15:29) */}
-        <div className="grid grid-cols-2 gap-2 border-t pt-2">
+        <div className="grid grid-cols-2 gap-1.5 border-t pt-1.5">
           <Button
             size="sm"
-            className="h-9 gap-1 bg-emerald-600 text-xs font-bold text-white hover:bg-emerald-600/90"
+            className="h-8 gap-1 bg-emerald-600 text-[11px] font-bold text-white hover:bg-emerald-600/90"
             disabled={!canBuy || orderBusy}
             onClick={() => onOrder('BUY')}
             data-testid="castrade-buy-btn"
@@ -851,7 +949,7 @@ function FinalTradePanel({
           </Button>
           <Button
             size="sm"
-            className="h-9 gap-1 bg-red-600 text-xs font-bold text-white hover:bg-red-600/90"
+            className="h-8 gap-1 bg-red-600 text-[11px] font-bold text-white hover:bg-red-600/90"
             disabled={!canSell || orderBusy}
             onClick={() => onOrder('SELL')}
             data-testid="castrade-sell-btn"
@@ -860,25 +958,25 @@ function FinalTradePanel({
           </Button>
         </div>
         {!isLive && (
-          <p className="text-[9px] leading-snug text-muted-foreground">
-            Replay mode - orders are disabled. Press <span className="font-semibold">Go Live</span>{' '}
-            to arm the BUY / SELL buttons for the real broker.
+          <p className="text-[8px] leading-snug text-muted-foreground">
+            Replay mode - orders disabled. Press <span className="font-semibold">Go Live</span> to
+            arm the BUY / SELL buttons for the real broker.
           </p>
         )}
         {isLive && !locked && (
-          <p className="text-[9px] leading-snug text-muted-foreground">
-            Buttons arm the moment the {data.window.decision_bar} bar closes and the pick locks.
+          <p className="text-[8px] leading-snug text-muted-foreground">
+            Buttons arm when the {data.window.decision_bar} bar closes and the pick locks.
           </p>
         )}
         {positionQty > 0 && (
-          <p className="text-[10px] font-medium text-amber-600 dark:text-amber-400">
+          <p className="text-[9px] font-medium text-amber-600 dark:text-amber-400">
             Open position: {positionQty} qty — press SELL to exit.
           </p>
         )}
         {lastOrder && (
           <p
             className={cn(
-              'truncate text-[9px]',
+              'truncate text-[8px]',
               lastOrder.status === 'success'
                 ? 'text-emerald-600 dark:text-emerald-400'
                 : 'text-red-600 dark:text-red-400'
@@ -892,31 +990,31 @@ function FinalTradePanel({
           </p>
         )}
 
-        <div className="flex items-center justify-between gap-2 border-t pt-2">
-          <p className="line-clamp-2 flex-1 text-[10px] leading-snug text-muted-foreground">
+        <div className="flex items-center justify-between gap-2 border-t pt-1.5">
+          <p className="line-clamp-2 flex-1 text-[9px] leading-snug text-muted-foreground">
             {trade.reason}
           </p>
           <div className="flex shrink-0 items-center gap-1">
             <Button
               variant="outline"
               size="sm"
-              className="h-6 w-6 px-0"
+              className="h-5 w-5 px-0"
               onClick={() => onLotsChange(Math.max(1, lots - 1))}
               aria-label="Decrease lots"
             >
               −
             </Button>
-            <span className="w-6 text-center font-mono text-xs tabular-nums">{lots}</span>
+            <span className="w-5 text-center font-mono text-[11px] tabular-nums">{lots}</span>
             <Button
               variant="outline"
               size="sm"
-              className="h-6 w-6 px-0"
+              className="h-5 w-5 px-0"
               onClick={() => onLotsChange(Math.min(20, lots + 1))}
               aria-label="Increase lots"
             >
               +
             </Button>
-            <span className="text-[9px] text-muted-foreground">lots</span>
+            <span className="text-[8px] text-muted-foreground">lots</span>
           </div>
         </div>
       </div>
@@ -926,19 +1024,14 @@ function FinalTradePanel({
 
 function PanelHeader() {
   return (
-    <div className="flex items-center justify-between border-b px-3 py-2">
-      <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        <BadgeDollarSign className="h-3.5 w-3.5" /> Final Trade
+    <div className="flex items-center justify-between border-b px-2.5 py-1.5">
+      <h3 className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+        <BadgeDollarSign className="h-3 w-3" /> Final Trade
       </h3>
-      <span className="font-mono text-[9px] text-muted-foreground">cas_prediction</span>
+      <span className="font-mono text-[8px] text-muted-foreground">cas_prediction</span>
     </div>
   )
 }
-
-// ---------------------------------------------------------------------------
-// Funds slider - "% of available amount" quick-order sizing, just below the
-// final trade panel (also feeds the strike rows' quick B/S buttons)
-// ---------------------------------------------------------------------------
 
 function FundsSlider({
   data,
@@ -973,7 +1066,7 @@ function FundsSlider({
     }
   }, [])
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: re-fetch when a new live session starts (session_id change), matching the page's other session-scoped effects
+  // biome-ignore lint/correctness/useExhaustiveDependencies: re-fetch when a new live session starts (session_id change)
   useEffect(() => {
     if (isLive) refresh()
   }, [isLive, data.session_id, refresh])
@@ -993,29 +1086,29 @@ function FundsSlider({
 
   return (
     <div className="rounded-lg border bg-card" data-testid="castrade-funds-slider">
-      <div className="flex items-center justify-between border-b px-3 py-2">
-        <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          <Wallet className="h-3.5 w-3.5" /> Funds %
+      <div className="flex items-center justify-between border-b px-2.5 py-1.5">
+        <h3 className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+          <Wallet className="h-3 w-3" /> Funds %
         </h3>
         <div className="flex items-center gap-1.5">
           {available !== null && (
-            <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+            <span className="font-mono text-[9px] tabular-nums text-muted-foreground">
               avail ₹{available.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
             </span>
           )}
           <Button
             variant="ghost"
             size="sm"
-            className="h-5 w-5 px-0"
+            className="h-4 w-4 px-0"
             onClick={refresh}
             disabled={fetching || !isLive}
             aria-label="Refresh funds"
           >
-            <RefreshCw className={cn('h-3 w-3', fetching && 'animate-spin')} />
+            <RefreshCw className={cn('h-2.5 w-2.5', fetching && 'animate-spin')} />
           </Button>
         </div>
       </div>
-      <div className="space-y-1.5 px-3 py-2">
+      <div className="space-y-1 px-2.5 py-1.5">
         <div className="flex items-center gap-2">
           <input
             type="range"
@@ -1024,15 +1117,15 @@ function FundsSlider({
             step={1}
             value={pct}
             onChange={(e) => setPct(Number.parseInt(e.target.value, 10))}
-            className="h-1.5 flex-1 cursor-pointer accent-amber-500"
+            className="h-1 flex-1 cursor-pointer accent-amber-500"
             aria-label="Percent of available funds"
             data-testid="castrade-funds-range"
           />
-          <span className="w-10 text-right font-mono text-xs font-semibold tabular-nums">
+          <span className="w-9 text-right font-mono text-[11px] font-semibold tabular-nums">
             {pct}%
           </span>
         </div>
-        <div className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+        <div className="flex items-center justify-between gap-2 text-[9px] text-muted-foreground">
           <span className="tabular-nums">
             {deployable !== null
               ? `≈ ₹${deployable.toLocaleString('en-IN', { maximumFractionDigits: 0 })} deployed`
@@ -1049,14 +1142,13 @@ function FundsSlider({
           </span>
         </div>
         <div className="flex items-center justify-between gap-2">
-          <p className="text-[9px] leading-snug text-muted-foreground">
-            Quick orders use the Lots stepper below ({lots} now) — Apply syncs it to the slider
-            sizing (1–20 lots cap).
+          <p className="text-[8px] leading-snug text-muted-foreground">
+            Sizes the Lots stepper ({lots} now) for BUY/SELL + quick B/S.
           </p>
           <Button
             size="sm"
             variant="outline"
-            className="h-6 shrink-0 px-2 text-[10px]"
+            className="h-5 shrink-0 px-1.5 text-[9px]"
             disabled={appliedLots === null || appliedLots === lots}
             onClick={() => appliedLots !== null && onApplyLots(appliedLots)}
             data-testid="castrade-funds-apply"
@@ -1064,109 +1156,29 @@ function FundsSlider({
             Apply
           </Button>
         </div>
-        {err && <p className="text-[9px] text-red-600 dark:text-red-400">{err}</p>}
+        {err && <p className="text-[8px] text-red-600 dark:text-red-400">{err}</p>}
       </div>
     </div>
   )
 }
-
-// ---------------------------------------------------------------------------
-// Timeline events
-// ---------------------------------------------------------------------------
 
 function EventsList({ events }: { events: CastradeEvent[] }) {
   return (
     <div className="rounded-lg border bg-card">
-      <div className="flex items-center gap-1.5 border-b px-3 py-2">
-        <Clock className="h-3.5 w-3.5 text-muted-foreground" />
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+      <div className="flex items-center gap-1 border-b px-2.5 py-1.5">
+        <Clock className="h-3 w-3 text-muted-foreground" />
+        <h3 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
           Timeline
         </h3>
       </div>
-      <ol className="space-y-1.5 px-3 py-2">
+      <ol className="space-y-0.5 px-2.5 py-1.5">
         {events.map((ev, i) => (
-          <li key={`${ev.time}-${i}`} className="flex gap-2 text-[11px] leading-snug">
-            <span className="w-10 shrink-0 font-mono text-muted-foreground">{ev.time}</span>
+          <li key={`${ev.time}-${i}`} className="flex gap-1.5 text-[10px] leading-snug">
+            <span className="w-9 shrink-0 font-mono text-muted-foreground">{ev.time}</span>
             <span className="flex-1 text-foreground/90">{ev.text}</span>
           </li>
         ))}
       </ol>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Chart card - header + StrikeChart
-// ---------------------------------------------------------------------------
-
-function LegChartCard({
-  leg,
-  data,
-  isWinner,
-  isDark,
-}: {
-  leg: CastradeLeg
-  data: CastradeAnalysisData
-  isWinner: boolean
-  isDark: boolean
-}) {
-  return (
-    <div
-      className={cn(
-        'rounded-lg border bg-card',
-        isWinner && 'border-amber-500/60 shadow-[0_0_0_1px_rgba(245,158,11,0.4)]'
-      )}
-    >
-      <div className="flex items-center justify-between gap-1 px-2.5 pb-1 pt-1.5">
-        <div className="flex items-baseline gap-1.5">
-          <span className="text-xs font-semibold tabular-nums">{fmtStrike(leg.strike)}</span>
-          <span
-            className={cn(
-              'text-[9px] font-bold',
-              leg.side === 'CE'
-                ? 'text-emerald-600 dark:text-emerald-400'
-                : 'text-red-600 dark:text-red-400'
-            )}
-          >
-            {leg.side}
-          </span>
-          <span className="text-[9px] text-muted-foreground">{offsetLabel(leg)}</span>
-        </div>
-        <div className="flex items-center gap-1">
-          {leg.flip && (
-            <Badge variant="outline" className="h-4 px-1 text-[8px] uppercase">
-              Flip
-            </Badge>
-          )}
-          {leg.blocked && (
-            <Badge variant="destructive" className="h-4 px-1 text-[8px]">
-              Cond A
-            </Badge>
-          )}
-          <span
-            className={cn(
-              'rounded px-1 py-0.5 font-mono text-[9px]',
-              VERDICT_TONE[leg.verdict] ?? 'bg-muted text-muted-foreground'
-            )}
-          >
-            {leg.verdict}
-          </span>
-          <span className={cn('w-11 text-right font-mono text-[9px]', pctTone(leg.actual?.pct))}>
-            {fmtPct(leg.actual?.pct)}
-          </span>
-        </div>
-      </div>
-      <StrikeChart
-        leg={leg}
-        tradeDate={data.trade_date}
-        windowStart={data.window.start}
-        patternBar={data.window.pattern_bar}
-        decisionBar={data.window.decision_bar}
-        entryTime={data.window.entry}
-        exitTime={data.window.exit}
-        isWinner={isWinner}
-        isDark={isDark}
-      />
     </div>
   )
 }
@@ -1180,7 +1192,6 @@ function mergeLiveDelta(
   delta: CastradeAnalysisData
 ): CastradeAnalysisData {
   if (delta.type !== 'delta' || delta.legs[0]?.candles) {
-    // Full snapshot (or an unexpected full payload) - replace wholesale.
     return { ...delta, type: undefined }
   }
   const byKey = new Map(prev.legs.map((l) => [`${l.side}|${l.strike}`, l]))
@@ -1200,7 +1211,6 @@ function mergeLiveDelta(
     }
     return { ...leg, ...d, candles }
   })
-  // Legs that became tradable after the snapshot (rare) get appended.
   for (const d of delta.legs) {
     if (!byKey.has(`${d.side}|${d.strike}`))
       merged.push({ ...d, candles: d.last_candle ? [d.last_candle] : [] })
@@ -1226,12 +1236,47 @@ export default function Castrade() {
   const [orderBusy, setOrderBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [bootstrapped, setBootstrapped] = useState(false)
+  const [panelW, setPanelW] = useState<number>(() => {
+    const v = Number.parseInt(localStorage.getItem(PANEL_W_KEY) || '', 10)
+    return Number.isFinite(v) && v >= 280 ? v : 340
+  })
   const analyzingRef = useRef(false)
   const sessionIdRef = useRef<string | null>(null)
+  const draggingRef = useRef(false)
 
   useEffect(() => {
     saveConfig(config)
   }, [config])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PANEL_W_KEY, String(panelW))
+    } catch {
+      // ignore
+    }
+  }, [panelW])
+
+  // Resizable right panel: drag the divider between the charts and the aside.
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!draggingRef.current) return
+      e.preventDefault()
+      const w = Math.min(720, Math.max(280, window.innerWidth - e.clientX - 4))
+      setPanelW(w)
+    }
+    const onUp = () => {
+      if (!draggingRef.current) return
+      draggingRef.current = false
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    return () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+  }, [])
 
   // One-time bootstrap: underlyings -> expiries -> (user presses Analyze).
   useEffect(() => {
@@ -1242,8 +1287,7 @@ export default function Castrade() {
         if (!alive) return
         if (res.status === 'success' && res.data) setUnderlyings(res.data)
       } catch {
-        // The dropdown falls back to the persisted underlying; analyze will
-        // surface a proper error if the session really is not usable.
+        // dropdown falls back to the persisted underlying
       } finally {
         if (alive) setBootstrapped(true)
       }
@@ -1254,7 +1298,7 @@ export default function Castrade() {
   }, [])
 
   // Refresh the expiry list whenever the underlying changes.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: reload expiries only when the underlying changes; underlyings is a one-time boot list
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reload expiries only when the underlying changes
   useEffect(() => {
     if (!config.underlying) return
     let alive = true
@@ -1279,9 +1323,21 @@ export default function Castrade() {
     }
   }, [config.underlying])
 
+  const timesValid = useMemo(() => {
+    const toMin = (t: string) => {
+      const [h, m] = (t || '').split(':').map((v) => Number.parseInt(v, 10))
+      return Number.isFinite(h) && Number.isFinite(m) ? h * 60 + m : -1
+    }
+    return toMin(config.exitTime) > toMin(config.entryTime)
+  }, [config.entryTime, config.exitTime])
+
   const analyze = useCallback(async () => {
     if (analyzingRef.current) return
     if (!config.underlying || !config.expiry) return
+    if (!timesValid) {
+      setError('Exit time must be after entry time — fix the times in the toolbar.')
+      return
+    }
     analyzingRef.current = true
     setLoading(true)
     setError(null)
@@ -1307,12 +1363,16 @@ export default function Castrade() {
       analyzingRef.current = false
       setLoading(false)
     }
-  }, [config, underlyings])
+  }, [config, underlyings, timesValid])
 
   // ---------------- LIVE tick-by-tick session ----------------
 
   const goLive = useCallback(async () => {
     if (!config.underlying || !config.expiry) return
+    if (!timesValid) {
+      setError('Exit time must be after entry time — fix the times in the toolbar.')
+      return
+    }
     setLiveBusy(true)
     setError(null)
     const fo = underlyings.find((u) => u.underlying === config.underlying)?.fo_exchange || 'NFO'
@@ -1330,7 +1390,7 @@ export default function Castrade() {
         sessionIdRef.current = res.data.session_id ?? null
         setData(res.data)
         toast.success('Live session started', {
-          description: `${config.underlying} ${config.expiry} - ${res.data.feed?.symbols ?? 0} symbols subscribed for ticks`,
+          description: `${config.underlying} ${config.expiry} - ${res.data.feed?.symbols ?? 0} symbols subscribed; updates stream on every tick`,
         })
       } else {
         setError(res.message || 'Live session failed to start')
@@ -1340,7 +1400,7 @@ export default function Castrade() {
     } finally {
       setLiveBusy(false)
     }
-  }, [config, underlyings])
+  }, [config, underlyings, timesValid])
 
   const stopLive = useCallback(async () => {
     setLiveBusy(true)
@@ -1350,7 +1410,6 @@ export default function Castrade() {
       setData((d) => (d ? { ...d, live: false, phase: 'done' } : d))
       toast.info('Live session stopped')
     } catch {
-      // the session may already be gone - treat as stopped
       sessionIdRef.current = null
       setData((d) => (d ? { ...d, live: false } : d))
     } finally {
@@ -1372,7 +1431,7 @@ export default function Castrade() {
     }
   }, [socket])
 
-  // REST fallback (also a keep-alive while the tab is hidden to socket.io):
+  // REST fallback (also a keep-alive while the tab is hidden from socket.io):
   // a slow 5s poll reconciles the page with the engine state.
   useEffect(() => {
     if (!data?.live || !sessionIdRef.current) return
@@ -1385,7 +1444,6 @@ export default function Castrade() {
           setData((prev) => (prev ? mergeLiveDelta(prev, res.data as CastradeAnalysisData) : prev))
         }
       } catch {
-        // session may have expired server-side - stop polling
         sessionIdRef.current = null
       }
     }, 5000)
@@ -1428,7 +1486,6 @@ export default function Castrade() {
         toast.error(`${action} failed`, { description: msg })
       } finally {
         setOrderBusy(false)
-        // Refresh position/orders from the engine right away.
         try {
           const st = await castradeApi.liveState(false)
           if (st.status === 'success' && st.data) {
@@ -1459,7 +1516,7 @@ export default function Castrade() {
   )
 
   // Live auto-refresh: only when the day is today's and the toggle is on.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: rearm only when the toggle or the analyzed day changes; analyze() identity is irrelevant to the interval
+  // biome-ignore lint/correctness/useExhaustiveDependencies: rearm only when the toggle or the analyzed day changes
   useEffect(() => {
     if (config.autoRefresh && data && data.mode === 'live' && !data.live) {
       const id = setInterval(() => {
@@ -1473,14 +1530,23 @@ export default function Castrade() {
     () => (data?.legs ?? []).filter((l) => l.side === 'CE').sort((a, b) => a.offset - b.offset),
     [data]
   )
-  // PE column mirrors the CE column: 1 ITM on top, then ATM, then the OTMs
-  // walking away from the spot (descending strike = descending offset).
   const peLegs = useMemo(
     () => (data?.legs ?? []).filter((l) => l.side === 'PE').sort((a, b) => b.offset - a.offset),
     [data]
   )
 
+  const ceRep = useMemo(() => (data ? pickRepresentativeLeg(data, 'CE') : undefined), [data])
+  const peRep = useMemo(() => (data ? pickRepresentativeLeg(data, 'PE') : undefined), [data])
+  const predictedKeys = useMemo(() => {
+    const keys = new Set<string>()
+    for (const l of [ceRep, peRep]) {
+      if (l) keys.add(`${l.side}-${l.strike}`)
+    }
+    return keys
+  }, [ceRep, peRep])
+
   const winnerKey = data?.final_trade ? `${data.final_trade.side}-${data.final_trade.strike}` : ''
+  void winnerKey
 
   if (!bootstrapped) {
     return (
@@ -1492,26 +1558,26 @@ export default function Castrade() {
 
   return (
     <div className="flex h-screen flex-col overflow-hidden">
-      {/* Toolbar band (the terminal's chrome, like /trading and /hedging) */}
-      <div className="oa-terminal-band flex h-10 shrink-0 items-center gap-1.5 border-b px-2">
+      {/* Toolbar band (compact) */}
+      <div className="oa-terminal-band flex h-9 shrink-0 items-center gap-1 border-b px-1.5">
         <Link
           to="/dashboard"
           aria-label="Dashboard"
-          className="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+          className="flex items-center gap-1 rounded-md px-1 py-0.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
         >
           <ChevronLeft /> <span className="hidden md:inline">Dashboard</span>
         </Link>
-        <span className="mx-1 h-5 w-px bg-border" />
-        <h1 className="hidden items-center gap-1.5 text-sm font-semibold sm:flex">
-          <Crosshair className="h-4 w-4 text-amber-500" /> CAS Trade
+        <span className="mx-0.5 h-4 w-px bg-border" />
+        <h1 className="hidden items-center gap-1 text-xs font-semibold sm:flex">
+          <Crosshair className="h-3.5 w-3.5 text-amber-500" /> CAS Trade
         </h1>
-        <span className="mx-1 hidden h-5 w-px bg-border sm:block" />
+        <span className="mx-0.5 hidden h-4 w-px bg-border sm:block" />
 
         <Select
           value={config.underlying}
           onValueChange={(v) => setConfig((c) => ({ ...c, underlying: v, expiry: '' }))}
         >
-          <SelectTrigger size="sm" className="h-7 w-[130px] text-xs" aria-label="Underlying">
+          <SelectTrigger size="sm" className="h-6 w-[110px] text-[11px]" aria-label="Underlying">
             <SelectValue placeholder="Underlying" />
           </SelectTrigger>
           <SelectContent>
@@ -1530,7 +1596,7 @@ export default function Castrade() {
           value={config.expiry}
           onValueChange={(v) => setConfig((c) => ({ ...c, expiry: v }))}
         >
-          <SelectTrigger size="sm" className="h-7 w-[110px] text-xs" aria-label="Expiry">
+          <SelectTrigger size="sm" className="h-6 w-[96px] text-[11px]" aria-label="Expiry">
             <SelectValue placeholder="Expiry" />
           </SelectTrigger>
           <SelectContent>
@@ -1546,53 +1612,86 @@ export default function Castrade() {
           type="date"
           value={config.tradeDate}
           onChange={(e) => setConfig((c) => ({ ...c, tradeDate: e.target.value }))}
-          className="h-7 w-[140px] text-xs"
+          className="h-6 w-[124px] text-[11px]"
           aria-label="Trade date"
         />
 
+        {/* Window / entry / exit times - editable (exit before entry is rejected) */}
+        <div
+          className="flex items-center gap-0.5"
+          title="Window start / entry (lock) / exit times (IST)"
+        >
+          <Input
+            type="time"
+            value={config.windowStart}
+            onChange={(e) => setConfig((c) => ({ ...c, windowStart: e.target.value }))}
+            className={cn('h-6 w-[84px] px-1 font-mono text-[10px]')}
+            aria-label="Window start time"
+          />
+          <span className="text-[9px] text-muted-foreground">→</span>
+          <Input
+            type="time"
+            value={config.entryTime}
+            onChange={(e) => setConfig((c) => ({ ...c, entryTime: e.target.value }))}
+            className="h-6 w-[84px] px-1 font-mono text-[10px]"
+            aria-label="Entry time"
+          />
+          <span className="text-[9px] text-muted-foreground">→</span>
+          <Input
+            type="time"
+            value={config.exitTime}
+            onChange={(e) => setConfig((c) => ({ ...c, exitTime: e.target.value }))}
+            className={cn(
+              'h-6 w-[84px] px-1 font-mono text-[10px]',
+              !timesValid && 'border-red-500/60 text-red-600'
+            )}
+            aria-label="Exit time"
+          />
+        </div>
+        {!timesValid && (
+          <Badge variant="destructive" className="h-4 px-1 text-[8px]">
+            EXIT &lt;= ENTRY
+          </Badge>
+        )}
+
         <Button
           size="sm"
-          className="h-7 gap-1.5 px-3 text-xs"
+          className="h-6 gap-1 px-2.5 text-[11px]"
           onClick={analyze}
-          disabled={loading || !config.expiry}
+          disabled={loading || !config.expiry || !timesValid}
         >
-          {loading ? (
-            <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Play className="h-3.5 w-3.5" />
-          )}
+          {loading ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
           Analyze
         </Button>
 
-        {/* LIVE tick-by-tick session: subscribe the broker feed and stream. */}
         {data?.live ? (
           <Button
             size="sm"
             variant="outline"
-            className="h-7 gap-1.5 border-red-500/50 px-3 text-xs text-red-600 hover:bg-red-500/10 dark:text-red-400"
+            className="h-6 gap-1 border-red-500/50 px-2.5 text-[11px] text-red-600 hover:bg-red-500/10 dark:text-red-400"
             onClick={stopLive}
             disabled={liveBusy}
           >
-            <Square className="h-3.5 w-3.5" /> Stop Live
+            <Square className="h-3 w-3" /> Stop Live
           </Button>
         ) : (
           <Button
             size="sm"
-            className="h-7 gap-1.5 bg-amber-500 px-3 text-xs font-semibold text-black hover:bg-amber-500/90"
+            className="h-6 gap-1 bg-amber-500 px-2.5 text-[11px] font-semibold text-black hover:bg-amber-500/90"
             onClick={goLive}
-            disabled={liveBusy || !config.expiry}
-            title="Start the tick-by-tick live feed session (engine runs on every tick; the pick locks at the decision bar and the BUY/SELL buttons arm)"
+            disabled={liveBusy || !config.expiry || !timesValid}
+            title="Start the tick-by-tick live feed session (engine runs on every tick; updates stream as socket events; the pick locks at the decision bar)"
           >
             {liveBusy ? (
-              <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+              <RefreshCw className="h-3 w-3 animate-spin" />
             ) : (
-              <Zap className="h-3.5 w-3.5" />
+              <Zap className="h-3 w-3" />
             )}
             Go Live
           </Button>
         )}
 
-        <div className="flex items-center gap-1.5 pl-1">
+        <div className="flex items-center gap-1 pl-0.5">
           <Switch
             id="castrade-auto"
             checked={config.autoRefresh}
@@ -1601,7 +1700,7 @@ export default function Castrade() {
           />
           <label
             htmlFor="castrade-auto"
-            className="hidden text-[10px] text-muted-foreground lg:inline"
+            className="hidden text-[9px] text-muted-foreground lg:inline"
           >
             Auto 60s
           </label>
@@ -1610,7 +1709,7 @@ export default function Castrade() {
         {data && (
           <Badge
             variant={data.mode === 'live' ? 'default' : 'secondary'}
-            className={cn('ml-1 h-5 px-1.5 text-[9px]', data.mode === 'live' && 'bg-emerald-600')}
+            className={cn('ml-0.5 h-4 px-1 text-[8px]', data.mode === 'live' && 'bg-emerald-600')}
           >
             {data.live ? 'LIVE TICKS' : data.mode === 'live' ? 'LIVE' : 'REPLAY'}
           </Badge>
@@ -1620,7 +1719,7 @@ export default function Castrade() {
           <Badge
             variant={data.feed.connected ? 'default' : 'destructive'}
             className={cn(
-              'h-5 px-1.5 font-mono text-[9px]',
+              'h-4 px-1 font-mono text-[8px]',
               data.feed.connected ? 'bg-emerald-600' : ''
             )}
             title={
@@ -1637,7 +1736,7 @@ export default function Castrade() {
 
         <div className="flex-1" />
         {data && (
-          <div className="mr-2 hidden items-center gap-3 font-mono text-[10px] text-muted-foreground xl:flex">
+          <div className="mr-1 hidden items-center gap-2 font-mono text-[9px] text-muted-foreground xl:flex">
             <span>
               Spot {fmtPrice(data.spot.at_window_start)} → {fmtPrice(data.spot.at_decision)}
               {data.spot.projected_exit ? ` → ${fmtPrice(data.spot.projected_exit)}*` : ''}
@@ -1648,7 +1747,7 @@ export default function Castrade() {
             <span>Step {data.strike_step}</span>
             <span>Lot {data.lot_size}</span>
             {!data.is_expiry_day && (
-              <Badge variant="outline" className="h-4 px-1 text-[8px] text-amber-600">
+              <Badge variant="outline" className="h-3.5 px-1 text-[8px] text-amber-600">
                 NOT EXPIRY DAY
               </Badge>
             )}
@@ -1659,40 +1758,37 @@ export default function Castrade() {
 
       {/* Body */}
       <div className="flex min-h-0 flex-1">
-        {/* LEFT - charts: CE column, PE column */}
-        <main className="min-w-0 flex-1 overflow-y-auto p-2.5">
+        {/* LEFT - two side canvases */}
+        <main className="min-w-0 flex-1 overflow-y-auto p-1.5">
           {error && (
             <div
               role="alert"
-              className="mb-2.5 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400"
+              className="mb-1.5 rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-600 dark:text-red-400"
             >
               {error}
             </div>
           )}
 
           {!data ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-muted-foreground">
-              <Crosshair className="h-8 w-8 opacity-40" />
+            <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-sm text-muted-foreground">
+              <Crosshair className="h-7 w-7 opacity-40" />
               <p>
                 Pick an underlying, an expiry and a trade date, then press{' '}
                 <span className="font-semibold text-foreground">Analyze</span> (replay) or{' '}
                 <span className="font-semibold text-foreground">Go Live</span> (tick-by-tick).
               </p>
               <p className="max-w-md text-xs">
-                The terminal runs the cas_prediction timeline — OHLC scoring over{' '}
-                {config.windowStart}–{config.entryTime}, the {config.entryTime} buy /{' '}
-                {config.exitTime} sell window, the 15:19/15:20 cross-side confirmation and the Cond
-                A crash filter — on 1-minute candles of the 1 ITM + ATM + 6 OTM strikes per side
-                (each side built around its OWN ATM: CE = strike at/below spot, PE = strike at/above
-                spot — one strike apart). Live mode re-runs the engine on every broker tick, locks
-                the single final strike at {config.entryTime} and arms the real BUY / SELL buttons —
-                plus quick B/S on every strike row and a funds-% slider for sizing.
+                SEVEN strikes on one ladder around the 15:15 baseline spot (3 below + ATM + 3
+                above), each with a CE and a PE leg — 14 total. Two real-time canvases (CE left
+                chart, PE chart below) draw the candles tick by tick and show the predicted
+                positive-return strike per side. The engine locks ONE strike at {config.entryTime},
+                exit {config.exitTime}.
               </p>
             </div>
           ) : (
             <>
-              {/* Spot strip */}
-              <div className="mb-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border bg-card px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
+              {/* Spot strip (compact) */}
+              <div className="mb-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 rounded-lg border bg-card px-2.5 py-1 font-mono text-[9px] text-muted-foreground">
                 <span>
                   {data.underlying} <span className="text-foreground/70">{data.expiry}</span>
                 </span>
@@ -1713,17 +1809,26 @@ export default function Castrade() {
                   vote{' '}
                   <span
                     className={
-                      data.votes.winning === 'CE' ? 'text-emerald-600 dark:text-emerald-400' : ''
+                      data.votes.winning === 'CE'
+                        ? 'font-bold text-emerald-600 dark:text-emerald-400'
+                        : ''
                     }
                   >
                     CE {data.votes.ce > 0 ? '+' : ''}
                     {data.votes.ce.toFixed(2)}
                   </span>{' '}
                   /{' '}
-                  <span className={data.votes.winning === 'PE' ? 'text-amber-600' : ''}>
+                  <span className={data.votes.winning === 'PE' ? 'font-bold text-amber-600' : ''}>
                     PE {data.votes.pe > 0 ? '+' : ''}
                     {data.votes.pe.toFixed(2)}
                   </span>
+                  {typeof data.votes.margin === 'number' && (
+                    <span className="text-muted-foreground/70">
+                      {' '}
+                      (m {data.votes.margin >= 0 ? '+' : ''}
+                      {data.votes.margin.toFixed(2)})
+                    </span>
+                  )}
                 </span>
                 <span>
                   pattern{' '}
@@ -1756,64 +1861,71 @@ export default function Castrade() {
                 )}
                 <span className="flex-1" />
                 <span>
-                  <TrendingUp className="mr-0.5 inline h-3 w-3 text-emerald-500" />
+                  <TrendingUp className="mr-0.5 inline h-2.5 w-2.5 text-emerald-500" />
                   CE basket {data.cond_a.CE.banned ? 'BANNED' : 'ok'}
                   {' · '}
-                  <TrendingDown className="mr-0.5 inline h-3 w-3 text-red-500" />
+                  <TrendingDown className="mr-0.5 inline h-2.5 w-2.5 text-red-500" />
                   PE basket {data.cond_a.PE.banned ? 'BANNED' : 'ok'}
                 </span>
               </div>
 
-              {/* CE charts column | PE charts column */}
-              <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2 md:gap-x-2.5">
-                <section aria-label="CE strike charts">
-                  <div className="mb-1.5 flex items-center gap-2 px-0.5">
-                    <span className="text-[10px] font-bold tracking-wider text-emerald-600 dark:text-emerald-400">
-                      CE · CALLS
-                    </span>
-                    <span className="h-px flex-1 bg-border" />
-                  </div>
-                  <div className="flex flex-col gap-2.5">
-                    {ceLegs.map((leg) => (
-                      <LegChartCard
-                        key={leg.symbol}
-                        leg={leg}
-                        data={data}
-                        isWinner={`${leg.side}-${leg.strike}` === winnerKey}
-                        isDark={isDark}
-                      />
-                    ))}
-                  </div>
-                </section>
-                <section aria-label="PE strike charts">
-                  <div className="mb-1.5 flex items-center gap-2 px-0.5">
-                    <span className="text-[10px] font-bold tracking-wider text-red-600 dark:text-red-400">
-                      PE · PUTS
-                    </span>
-                    <span className="h-px flex-1 bg-border" />
-                  </div>
-                  <div className="flex flex-col gap-2.5">
-                    {peLegs.map((leg) => (
-                      <LegChartCard
-                        key={leg.symbol}
-                        leg={leg}
-                        data={data}
-                        isWinner={`${leg.side}-${leg.strike}` === winnerKey}
-                        isDark={isDark}
-                      />
-                    ))}
-                  </div>
-                </section>
+              {/* The two side canvases */}
+              <div className="flex flex-col gap-1.5">
+                <SideChartCard
+                  side="CE"
+                  data={data}
+                  repLeg={ceRep}
+                  predicted={ceRep}
+                  isDark={isDark}
+                />
+                <SideChartCard
+                  side="PE"
+                  data={data}
+                  repLeg={peRep}
+                  predicted={peRep}
+                  isDark={isDark}
+                />
               </div>
             </>
           )}
         </main>
 
-        {/* RIGHT - strikes panel + final trade + timeline */}
-        <aside className="flex w-[380px] shrink-0 flex-col gap-2.5 overflow-y-auto border-l p-2.5">
+        {/* Drag handle + RIGHT resizable panel */}
+        <div
+          role="slider"
+          aria-orientation="vertical"
+          aria-label="Resize panel (drag or use arrow keys)"
+          aria-valuenow={panelW}
+          aria-valuemin={280}
+          aria-valuemax={720}
+          tabIndex={0}
+          className="w-1 shrink-0 cursor-col-resize bg-border transition-colors hover:bg-amber-500/50 focus-visible:bg-amber-500/70 focus-visible:outline-none"
+          onMouseDown={(e) => {
+            e.preventDefault()
+            draggingRef.current = true
+            document.body.style.cursor = 'col-resize'
+            document.body.style.userSelect = 'none'
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowLeft') setPanelW((w) => Math.min(720, w + 24))
+            if (e.key === 'ArrowRight') setPanelW((w) => Math.max(280, w - 24))
+          }}
+          data-testid="castrade-panel-resizer"
+        />
+        <aside
+          className="flex shrink-0 flex-col gap-1.5 overflow-y-auto border-l p-1.5"
+          style={{ width: panelW }}
+          data-testid="castrade-side-panel"
+        >
           {data ? (
             <>
-              <StrikesPanel data={data} ceLegs={ceLegs} peLegs={peLegs} onQuickOrder={quickOrder} />
+              <StrikesPanel
+                data={data}
+                ceLegs={ceLegs}
+                peLegs={peLegs}
+                predictedKeys={predictedKeys}
+                onQuickOrder={quickOrder}
+              />
               <FinalTradePanel
                 data={data}
                 lots={config.lots}
@@ -1829,7 +1941,7 @@ export default function Castrade() {
               <EventsList events={data.events} />
             </>
           ) : (
-            <div className="rounded-lg border bg-card px-3 py-6 text-center text-xs text-muted-foreground">
+            <div className="rounded-lg border bg-card px-2.5 py-5 text-center text-[11px] text-muted-foreground">
               Run an analysis to see the strikes board and the final trade.
             </div>
           )}

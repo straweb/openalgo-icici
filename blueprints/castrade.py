@@ -33,6 +33,9 @@ from services.castrade_service import (
     DEFAULT_ENTRY_TIME,
     DEFAULT_EXIT_TIME,
     DEFAULT_WINDOW_START,
+    _fmt_hhmm,
+    _minutes,
+    _parse_hhmm,
     _to_float,
     get_castrade_expiries,
     get_castrade_underlyings,
@@ -134,6 +137,13 @@ def analyze():
                 }
             ), 400
 
+        ws_in = str(data.get("window_start") or DEFAULT_WINDOW_START)
+        en_in = str(data.get("entry_time") or DEFAULT_ENTRY_TIME)
+        ex_in = str(data.get("exit_time") or DEFAULT_EXIT_TIME)
+        err = _validate_window_times(ws_in, en_in, ex_in)
+        if err:
+            return jsonify({"status": "error", "message": err}), 400
+
         if not trade_date:
             try:
                 from datetime import datetime as _dt
@@ -186,6 +196,25 @@ def _live_common_guard():
     return username, broker, api_key, None
 
 
+def _validate_window_times(
+    window_start: str, entry_time: str, exit_time: str
+) -> tuple[str, str, str] | None:
+    """Return an error message when the exit time does not follow the entry.
+
+    A persisted exit earlier than the entry (e.g. entry 15:21 with exit 15:20)
+    used to silently kill the whole session - BUY was always 'past the exit
+    time' and the page looked dead. It is now rejected up front.
+    """
+    entry = _parse_hhmm(entry_time, (15, 21))
+    exit_ = _parse_hhmm(exit_time, (15, 29))
+    if _minutes(exit_) <= _minutes(entry):
+        return (
+            f"exit_time {_fmt_hhmm(exit_)} must be after "
+            f"entry_time {_fmt_hhmm(entry)} - fix the times above the charts"
+        )
+    return None
+
+
 def _today_ist() -> str:
     try:
         import pytz
@@ -215,6 +244,12 @@ def live_start():
 
         data = request.get_json(silent=True) or {}
         manager = get_castrade_live_manager()
+        ws_in = str(data.get("window_start") or DEFAULT_WINDOW_START)
+        en_in = str(data.get("entry_time") or DEFAULT_ENTRY_TIME)
+        ex_in = str(data.get("exit_time") or DEFAULT_EXIT_TIME)
+        err = _validate_window_times(ws_in, en_in, ex_in)
+        if err:
+            return jsonify({"status": "error", "message": err}), 400
         payload, status_code = manager.start(
             username=username,
             broker=broker,

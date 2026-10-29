@@ -15,7 +15,10 @@ Scenarios:
                 validated phase-1 algorithm.
   5. FIELDS   - payload is JSON-serializable and carries the chart data.
   6. SIDE ATMS - the user's one-strike-difference example: spot 22760.75 ->
-                CE ATM 22750 / PE ATM 22800, each side 1 ITM + ATM + 6 OTM.
+                CE ATM 22750 / PE ATM 22800, ONE shared ladder of 7 strikes
+                (3 below + ATM + 3 above) x CE/PE = 14 legs.
+  7. VOTE     - the stronger side wins: CE + decisive vs a flat-positive PE
+                must pick CE (the old rule demanded the loser be negative).
 
 Run:  python3 scripts/test_castrade_engine.py
 """
@@ -377,28 +380,82 @@ def test_side_atms():
     uni = cs._resolve_universe("NIFTY", "NFO", EXPIRY, 22760.75)
     assert uni["ce_atm"] == 22750.0, uni.get("ce_atm")
     assert uni["pe_atm"] == 22800.0, uni.get("pe_atm")
+    # ONE shared ladder: 3 strikes below + baseline ATM + 3 above = 7 strikes
+    assert uni["ladder"] == [22600.0, 22650.0, 22700.0, 22750.0, 22800.0, 22850.0, 22900.0], uni.get("ladder")
     legs = {(lg["side"], lg["strike"]): lg for lg in uni["legs"]}
-    # CE side: everything above CE's ATM is OTM, everything below is ITM.
-    assert legs[("CE", 22700.0)]["moneyness"] == "ITM"
+    assert len(uni["legs"]) == 14, f"7 strikes x CE/PE expected, got {len(uni['legs'])}"
+    # CE rows labeled vs the CE ATM: above = OTM, below = ITM.
     assert legs[("CE", 22750.0)]["moneyness"] == "ATM"
-    for i in range(1, 7):
+    for i in range(1, 4):
         lg = legs[("CE", 22750.0 + 50.0 * i)]
         assert lg["moneyness"] == "OTM" and lg["otm_steps"] == i, lg
-    # PE side: everything below PE's ATM is OTM, everything above is ITM.
-    assert legs[("PE", 22850.0)]["moneyness"] == "ITM"
+        lg = legs[("CE", 22750.0 - 50.0 * i)]
+        assert lg["moneyness"] == "ITM", lg
+    # PE rows labeled vs the PE ATM (22800, the +1 rung): below = OTM, above = ITM.
     assert legs[("PE", 22800.0)]["moneyness"] == "ATM"
-    for i in range(1, 7):
+    assert legs[("PE", 22850.0)]["moneyness"] == "ITM"
+    assert legs[("PE", 22900.0)]["moneyness"] == "ITM"
+    for i in range(1, 5):  # PE OTM+1..+4 = 22750..22600
         lg = legs[("PE", 22800.0 - 50.0 * i)]
         assert lg["moneyness"] == "OTM" and lg["otm_steps"] == i, lg
-    # exactly 16 legs, one ITM each, six OTM each
-    assert len(uni["legs"]) == 16
-    assert sum(1 for lg in uni["legs"] if lg["moneyness"] == "ITM") == 2
-    assert sum(1 for lg in uni["legs"] if lg["moneyness"] == "ATM") == 2
-    assert sum(1 for lg in uni["legs"] if lg["moneyness"] == "OTM") == 12
     print(
-        "  [6] SIDE ATMS -> spot 22760.75: CE ATM 22750 / PE ATM 22800, "
-        "per side 1 ITM + ATM + 6 OTM  OK"
+        "  [6] SIDE ATMS -> spot 22760.75: ladder 22600..22900 (7 strikes x CE/PE = 14 legs), "
+        "CE ATM 22750 / PE ATM 22800  OK"
     )
+
+
+def test_vote_margin():
+    """The stronger side wins: a decisive CE beats a flat-positive PE."""
+
+    def series(closes):
+        bars = []
+        for i, c in enumerate(closes):
+            o = closes[i - 1] if i else c - 0.2
+            bars.append(
+                {"ts": (15 * 60 + 15 + i) * 60, "o": o,
+                 "h": max(o, c) + 0.3, "l": min(o, c) - 0.3, "c": c}
+            )
+        return bars
+
+    rising = series([50.0, 51.0, 52.0, 53.0, 54.0])  # UP chain -> norm ~ +1.0
+    # Manually flat-positive: every bar INSIDE the previous one (h shrinks,
+    # l grows) with green closes -> +2 per transition -> norm = +0.4.
+    flat = [
+        {"ts": (15 * 60 + 15 + i) * 60, "o": 50.0 + 0.1 * i,
+         "h": 50.6 - 0.05 * i, "l": 49.6 + 0.05 * i, "c": 50.1 + 0.1 * i}
+        for i in range(5)
+    ]
+
+    def votes_for(ce_bars, pe_bars, ce_banned=False, pe_banned=False):
+        legs = {
+            (22600.0, "CE"): {"side": "CE", "strike": 22600.0},
+            (22650.0, "PE"): {"side": "PE", "strike": 22650.0},
+        }
+        wmap = {
+            (22600.0, "CE"): ce_bars,
+            (22650.0, "PE"): pe_bars,
+        }
+        cond_a = {
+            "CE": {"base": 10.0, "low": 9.0, "banned": ce_banned, "drop_pct": 0.0},
+            "PE": {"base": 10.0, "low": 9.0, "banned": pe_banned, "drop_pct": 0.0},
+        }
+        return cs._side_votes(wmap, legs, cond_a)
+
+    # The screenshot's case: CE decisively up, PE flat-positive -> CE must win
+    # (the old double-negative rule answered NO TRADE here).
+    v = votes_for(rising, flat)
+    assert v["ce"] > cs.WIN_THRESHOLD, v
+    assert v["winning"] == "CE", v
+    assert v["margin"] >= cs.VOTE_MARGIN, v
+
+    # Tie guard: both sides read the same -> margin too small -> no vote.
+    v = votes_for(flat, flat)
+    assert v["winning"] is None and v["margin"] < cs.VOTE_MARGIN, v
+
+    # A banned side can never win even with the top score.
+    v = votes_for(rising, flat, ce_banned=True)
+    assert v["winning"] is None, v
+    print("  [7] VOTE -> decisive CE beats flat-positive PE (margin rule)  OK")
 
 
 def test_parity():
@@ -462,9 +519,9 @@ def test_payload(d):
         assert {"time", "open", "high", "low", "close"} == set(leg["candles"][0].keys())
         # IST-shifted minute alignment
         assert leg["candles"][0]["time"] % 60 == 0
-    assert len(d["legs"]) >= 14, f"expected the full 1-ITM/ATM/6-OTM matrix, got {len(d['legs'])}"
+    assert len(d["legs"]) == 14, f"expected the 7-strike x CE/PE ladder, got {len(d['legs'])}"
     assert len(d["underlying_candles"]) > 300
-    print("  [5] PAYLOAD -> 16 legs (1 ITM + ATM + 6 OTM x2), JSON-serializable, candles aligned  OK")
+    print("  [5] PAYLOAD -> 14 legs (7 strikes x CE/PE), JSON-serializable, candles aligned  OK")
 
 
 if __name__ == "__main__":
@@ -475,4 +532,5 @@ if __name__ == "__main__":
     test_parity()
     test_payload(d1)
     test_side_atms()
+    test_vote_margin()
     print("ALL PASSED")

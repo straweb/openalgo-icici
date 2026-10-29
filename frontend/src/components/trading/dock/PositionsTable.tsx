@@ -45,10 +45,19 @@ interface Props {
   onPick(row: SearchRow): void
   /** Confirmed by the user; the caller places the square-off. */
   onClose(position: DockPosition): void
+  /** Re-enter the position's side and quantity as a fresh market order. */
+  onRepeat(position: DockPosition): void
   isLoading?: boolean
 }
 
-export function PositionsTable({ positions, activeSymbol, onPick, onClose, isLoading }: Props) {
+export function PositionsTable({
+  positions,
+  activeSymbol,
+  onPick,
+  onClose,
+  onRepeat,
+  isLoading,
+}: Props) {
   const [pending, setPending] = useState<DockPosition | null>(null)
 
   return (
@@ -112,17 +121,30 @@ export function PositionsTable({ positions, activeSymbol, onPick, onClose, isLoa
                 <td className={TD_NUM}>{p.ltp ? fmt2(p.ltp) : '-'}</td>
                 <td className={cn(TD_NUM, 'font-medium', toneClass(p.pnl))}>{signed(p.pnl)}</td>
                 <td className={cn(TD, 'text-right')}>
-                  {open && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 px-2 text-[11px] text-rose-600 hover:text-rose-600 dark:text-rose-400"
-                      onClick={() => setPending(p)}
-                      aria-label={`Close ${p.product} position in ${p.symbol}`}
-                    >
-                      Close
-                    </Button>
-                  )}
+                  <span className="inline-flex gap-1">
+                    {open && (
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-2 text-[11px]"
+                          onClick={() => onRepeat(p)}
+                          aria-label={`Repeat ${p.product} position in ${p.symbol}`}
+                        >
+                          Repeat
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-2 text-[11px] text-rose-600 hover:text-rose-600 dark:text-rose-400"
+                          onClick={() => setPending(p)}
+                          aria-label={`Close ${p.product} position in ${p.symbol}`}
+                        >
+                          Close
+                        </Button>
+                      </>
+                    )}
+                  </span>
                 </td>
               </tr>
             )

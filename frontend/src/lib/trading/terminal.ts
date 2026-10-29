@@ -1228,8 +1228,9 @@ export class TradingTerminal {
    */
   private instantPanel: HTMLDivElement | null = null
   /**
-   * The open position's box, docked top-right: side, size, average, live
-   * P&L, an instant CLOSE, and the SL/TP levels the drag handles set.
+   * The open position's box, docked top-left under the Buy/Sell strip: side,
+   * size, average, live P&L, an instant CLOSE, and the SL/TP levels the drag
+   * handles set.
    */
   private posBox: HTMLDivElement | null = null
   /** This symbol's stop/target levels the drag handles move (persisted). */
@@ -2532,6 +2533,9 @@ export class TradingTerminal {
     if (!this.instantPanel) return
     const show = this.armed && !this.workspaceReplayLocked
     this.instantPanel.style.display = show ? 'flex' : 'none'
+    // The position box stacks under the strip, so its top follows the
+    // strip's visibility.
+    this.refreshPosBoxTop()
   }
 
   /** Keep the panel's prices and size readout in step with the quote. */
@@ -2672,7 +2676,24 @@ export class TradingTerminal {
     }
   }
 
-  /** Build (once) and refresh the open-position box docked top-right. */
+  /**
+   * The left edge both docked boxes share. The position box stacks under the
+   * Buy/Sell strip when the strip is on the chart, and takes the strip's own
+   * top when it is not, so an armed chart reads one column: strip, then
+   * position, then nothing.
+   */
+  private posBoxTop(): number {
+    const strip = this.instantPanel
+    if (strip && strip.style.display !== 'none') return TRADE_PANEL.y + strip.offsetHeight + 6
+    return TRADE_PANEL.y
+  }
+
+  /** Re-read the position box's top after the strip's visibility moves. */
+  private refreshPosBoxTop(): void {
+    if (this.posBox) this.posBox.style.top = `${this.posBoxTop()}px`
+  }
+
+  /** Build (once) and refresh the open-position box docked top-left. */
   private renderPosBox(): void {
     if (!this.sym || this.sym.quoteOnly) {
       this.posBox?.remove()
@@ -2684,7 +2705,7 @@ export class TradingTerminal {
       box.setAttribute('data-pos-box', '1')
       box.style.cssText = [
         'position:absolute',
-        'right:14px',
+        `left:${TRADE_PANEL.x}px`,
         `top:${TRADE_PANEL.y}px`,
         'display:none',
         'z-index:38',
@@ -2717,6 +2738,7 @@ export class TradingTerminal {
       this.posBox = box
     }
     const box = this.posBox
+    box.style.top = `${this.posBoxTop()}px`
     if (!this.position || this.position.net === 0) {
       box.style.display = 'none'
       return
@@ -2791,8 +2813,8 @@ export class TradingTerminal {
 
   /**
    * The SL/TP drag handles: two price lines riding beside the entry line,
-   * draggable like the order lines. The box at top-right carries the same
-   * numbers, an instant CLOSE, and the level ✕s.
+   * draggable like the order lines. The box at the chart's top-left carries
+   * the same numbers, an instant CLOSE, and the level ✕s.
    */
   private renderPosLevelLines(): void {
     if (!this.chart) return
@@ -6546,6 +6568,35 @@ export class TradingTerminal {
 
   gridState(): { vertical: boolean; horizontal: boolean } {
     return { vertical: this.gridV, horizontal: this.gridH }
+  }
+
+  /**
+   * The primary series' visible price band, or null before the chart has
+   * measured anything. The price-sync coordinator reads it to notice which
+   * pane's axis a drag moved, and writes it to carry the others along.
+   */
+  priceRange(): { min: number; max: number } | null {
+    const series = this.chart?.primarySeries()
+    if (!series) return null
+    const range = series.priceScale().priceRange()
+    if (!range || !Number.isFinite(range.min) || !Number.isFinite(range.max)) return null
+    return { min: range.min, max: range.max }
+  }
+
+  /**
+   * Hold every pane in the price group to one band. The write goes manual —
+   * `setAutoScale(false)` first — because an autoscaling axis re-measures on
+   * the next tick and would throw the band straight back. The drag that made
+   * the leader's range was itself a manual move, so its followers match it
+   * in kind; a pane returns to its own fitting through its axis menu, the
+   * way an unsynced chart does.
+   */
+  applyPriceRange(range: { min: number; max: number }): void {
+    const series = this.chart?.primarySeries()
+    if (!series) return
+    const scale = series.priceScale()
+    scale.setAutoScale(false)
+    scale.setPriceRange({ min: range.min, max: range.max })
   }
 
   /**

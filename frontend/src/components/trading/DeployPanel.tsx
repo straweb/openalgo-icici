@@ -120,6 +120,7 @@ import {
 import { currentOrderMode, resolveOrderPricing } from '@/lib/trading/orderMode'
 import { armLadderBatch, armPastMiss } from '@/lib/trading/scheduleArm'
 import type { SearchRow } from '@/lib/trading/terminal'
+import { tickHub } from '@/lib/trading/tickHub'
 import { type FireOrder, planCrosses, swapFireOrders } from '@/lib/trading/tradingFire'
 import { cn } from '@/lib/utils'
 import { FNO_UNDERLYING_EXCHANGES, fnoExchangeFor, type ScheduledOrder } from '@/types/hedging'
@@ -130,7 +131,10 @@ import { PANEL_HEADER, PanelShell } from './panelShell'
 
 /** Polling cadences: chain, quotes, funds and the position/order books. */
 const CHAIN_POLL_MS = 5000
-const QUOTE_POLL_MS = 4000
+/** The ticks own the price; the REST poll only reconciles a quiet socket. */
+const QUOTE_RECONCILE_MS = 20000
+/** One state flush per 200ms, however many rows ticked inside the window. */
+const QUOTE_FLUSH_MS = 200
 const FUNDS_POLL_MS = 15000
 const BOOK_POLL_MS = 6000
 
@@ -254,6 +258,9 @@ export function DeployPanel({
   const [expiryFailed, setExpiryFailed] = useState(false)
   const [underlyingLtp, setUnderlyingLtp] = useState<number | undefined>(undefined)
   const [quotes, setQuotes] = useState<Record<string, number>>({})
+  /** The flush and the reconcile write through this ref so a beat never
+   *  resurrects a price a newer tick already replaced. */
+  const quotesRef = useRef<Record<string, number>>({})
   const [funds, setFunds] = useState(0)
   const [positions, setPositions] = useState<Map<string, Position>>(new Map())
   /**
@@ -484,12 +491,31 @@ export function DeployPanel({
     })
   }, [chain, optionsExchange, underlying])
 
-  /* ── the underlying's own quote: the ATM without the chain ───────────── */
+  /* ── the underlying's own quote: tick-by-tick off the hub, a slow REST
+     reconcile to catch a socket that went quiet ───────────────────── */
   const quoteExchangeRef = useRef<string | null>(null)
   useEffect(() => {
     quoteExchangeRef.current = null
-  }, [underlying])
+  }, [])
 
+  // The hub's socket: one per page, acquired for the panel's lifetime and
+  // shared with the strategy tab. Everything below watches through it.
+  useEffect(() => {
+    tickHub.acquire({ apiKey, wsUrl })
+    return () => tickHub.release()
+  }, [apiKey, wsUrl])
+
+  useEffect(() => {
+    if (!underlying) return
+    const exchange = workspace?.exchange ?? 'NSE_INDEX'
+    const stop = tickHub.watch(underlying, exchange, (_symbol, _exchange, quote) => {
+      setUnderlyingLtp(quote.ltp)
+    })
+    return stop
+  }, [underlying, workspace?.exchange])
+
+  // First paint and the quiet-socket safety net: a single REST ask, then a
+  // slow reconcile. The ticks own the price between the beats.
   useEffect(() => {
     if (!underlying) return
     let alive = true
@@ -514,7 +540,7 @@ export function DeployPanel({
       }
     }
     void poll()
-    const timer = window.setInterval(() => void poll(), QUOTE_POLL_MS)
+    const timer = window.setInterval(() => void poll(), QUOTE_RECONCILE_MS)
     return () => {
       alive = false
       window.clearInterval(timer)
@@ -532,22 +558,50 @@ export function DeployPanel({
 
   useEffect(() => {
     if (rowSymbols.length === 0) return
+    // Tick-by-tick through the hub, batched: a tick storm across forty rows
+    // must not render forty times, so the writes land in a ref and one
+    // 200ms flush moves them into state together.
+    const pending = new Map<string, number>()
+    const stops = rowSymbols.map(({ symbol, exchange }) =>
+      tickHub.watch(symbol, exchange, (_symbol, _exchange, quote) => {
+        pending.set(symbol, quote.ltp)
+      })
+    )
+    const flush = window.setInterval(() => {
+      if (pending.size === 0) return
+      const next: Record<string, number> = { ...quotesRef.current }
+      for (const [symbol, ltp] of pending) next[symbol] = ltp
+      pending.clear()
+      quotesRef.current = next
+      setQuotes(next)
+    }, QUOTE_FLUSH_MS)
+    return () => {
+      for (const stop of stops) stop()
+      window.clearInterval(flush)
+    }
+  }, [rowSymbols])
+
+  // First paint and the quiet-socket safety net: one REST beat, then a slow
+  // reconcile. Between beats the hub's ticks own the price.
+  useEffect(() => {
+    if (rowSymbols.length === 0) return
     let alive = true
     const poll = async () => {
       try {
         const res = await tradingApi.getMultiQuotes(apiKey, rowSymbols)
         if (!alive) return
-        const next: Record<string, number> = {}
+        const next: Record<string, number> = { ...quotesRef.current }
         for (const item of res.results ?? []) {
           if (item.data && Number.isFinite(item.data.ltp)) next[item.symbol] = item.data.ltp
         }
+        quotesRef.current = next
         setQuotes(next)
       } catch {
         // the chain poll and the next pass keep the feed alive
       }
     }
     void poll()
-    const timer = window.setInterval(() => void poll(), QUOTE_POLL_MS)
+    const timer = window.setInterval(() => void poll(), QUOTE_RECONCILE_MS)
     return () => {
       alive = false
       window.clearInterval(timer)
@@ -653,6 +707,7 @@ export function DeployPanel({
       state.capitalBasis,
       funds,
       sessionPnl,
+      state,
     ]
   )
   const sizing = useMemo(() => ({ capital: usable, ltpOf }), [usable, ltpOf])
@@ -914,12 +969,12 @@ export function DeployPanel({
     [apiKey, state.product, armBracket]
   )
 
-  const report = (label: string, placed: number, failed: number) => {
+  const report = useCallback((label: string, placed: number, failed: number) => {
     if (failed === 0)
       showToast.success(`${label}: ${placed} order${placed === 1 ? '' : 's'} placed`)
     else if (placed === 0) showToast.error(`${label}: every order failed`)
     else showToast.warning(`${label}: ${placed} placed, ${failed} failed`)
-  }
+  }, [])
 
   /**
    * The panel's order for one row. The global order mode prices the wire
@@ -975,7 +1030,7 @@ export function DeployPanel({
       setBusy((previous) => ({ ...previous, [busyKey]: false }))
       report(label, placed, failed)
     },
-    [ladder, state.lots, sizing, placeOrders, toPanelOrder]
+    [ladder, sizing, placeOrders, toPanelOrder, report]
   )
 
   const fireStocks = useCallback(
@@ -992,7 +1047,7 @@ export function DeployPanel({
       setBusy((previous) => ({ ...previous, [busyKey]: false }))
       report(label, placed, failed)
     },
-    [state.stocks, sizing, placeOrders, toPanelOrder]
+    [state.stocks, sizing, placeOrders, toPanelOrder, report]
   )
 
   const runSwap = useCallback(
@@ -1013,7 +1068,7 @@ export function DeployPanel({
       setBusy((previous) => ({ ...previous, [busyKey]: false }))
       report(`Swap ${from}→${from === 'CE' ? 'PE' : 'CE'}`, placed, failed)
     },
-    [ladder, state.lots, sizing, placeOrders, toPanelOrders]
+    [ladder, sizing, placeOrders, toPanelOrders, report]
   )
 
   const exitAll = useCallback(async () => {
@@ -1032,7 +1087,7 @@ export function DeployPanel({
     } else {
       await fireStocks('SELL', 'exitAll', 'Exit All')
     }
-  }, [optionsMode, ladder, state.lots, sizing, placeOrders, fireStocks, toPanelOrder])
+  }, [optionsMode, ladder, sizing, placeOrders, fireStocks, toPanelOrder, report])
 
   /* ── Schedule: the dock's dialog, pointed at this panel's ladder ──────── */
   const spot = useMemo(() => {

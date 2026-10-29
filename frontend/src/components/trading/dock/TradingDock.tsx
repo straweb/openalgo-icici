@@ -18,6 +18,7 @@ import { showToast } from '@/utils/toast'
 import {
   type DockOrder,
   type DockPosition,
+  type DockTrade,
   isWorking,
   parsePosition,
   realisedFromTrades,
@@ -35,6 +36,7 @@ import {
   closeAllDockPositions,
   closeDockPosition,
   type OrderActionContext,
+  repeatDockOrder,
 } from './orderActions'
 import { PnlStrip } from './PnlStrip'
 import { PositionsTable } from './PositionsTable'
@@ -52,6 +54,7 @@ import { IndexTab } from './IndexTab'
 // this tab saying "Loading" forever — a placeholder the trader could not
 // click past. The code arrives with the dock now, and the tab renders.
 import { ScheduledTab } from './ScheduledTab'
+import { StrategyTab } from './StrategyTab'
 import { useBracketEngine } from './useBracketEngine'
 import { useTradingScheduler } from './useTradingScheduler'
 
@@ -62,6 +65,8 @@ interface Props {
   tab: DockTab | null
   onTabChange(tab: DockTab | null): void
   apiKey: string
+  /** The WebSocket proxy URL, the tick hub's wire (the strategy tab). */
+  wsUrl: string
   /** Charts a row in the focused pane, the way a watchlist row does. */
   onPick(row: SearchRow): void
   activeSymbol: string | null
@@ -77,6 +82,7 @@ export function TradingDock({
   tab,
   onTabChange,
   apiKey,
+  wsUrl,
   onPick,
   activeSymbol,
   paneSymbols,
@@ -128,8 +134,8 @@ export function TradingDock({
 
   /** The context every dock action runs in; the chart's menu builds the same. */
   const actions = useMemo<OrderActionContext>(
-    () => ({ appMode, refuse, refresh }),
-    [appMode, refuse, refresh]
+    () => ({ appMode, apiKey, refuse, refresh }),
+    [appMode, apiKey, refuse, refresh]
   )
   /** Analyzer mode toasts outcomes globally; see orderActions.ts. */
   const handledGlobally = useCallback(
@@ -190,6 +196,35 @@ export function TradingDock({
   )
 
   const closePosition = useCallback((p: DockPosition) => closeDockPosition(p, actions), [actions])
+  const repeatOrder = useCallback((o: DockOrder) => void repeatDockOrder(o, actions), [actions])
+  const repeatPosition = useCallback(
+    (p: DockPosition) =>
+      void repeatDockOrder(
+        {
+          symbol: p.symbol,
+          exchange: p.exchange,
+          action: p.quantity >= 0 ? 'BUY' : 'SELL',
+          quantity: Math.abs(p.quantity),
+          product: p.product,
+        },
+        actions
+      ),
+    [actions]
+  )
+  const repeatTrade = useCallback(
+    (t: DockTrade) =>
+      void repeatDockOrder(
+        {
+          symbol: t.symbol,
+          exchange: t.exchange,
+          action: t.action,
+          quantity: t.quantity,
+          product: t.product,
+        },
+        actions
+      ),
+    [actions]
+  )
   const cancelAll = useCallback(() => cancelAllDockOrders(actions), [actions])
   const closeAll = useCallback(() => closeAllDockPositions(actions), [actions])
 
@@ -234,6 +269,7 @@ export function TradingDock({
           onPick={onPick}
           onCancel={(o) => void cancelOrder(o)}
           onModify={openModify}
+          onRepeat={repeatOrder}
           isLoading={isLoading}
         />
       )}
@@ -243,6 +279,7 @@ export function TradingDock({
           activeSymbol={activeSymbol}
           onPick={onPick}
           onClose={(p) => void closePosition(p)}
+          onRepeat={repeatPosition}
           isLoading={isLoading}
         />
       )}
@@ -251,6 +288,7 @@ export function TradingDock({
           trades={trades}
           activeSymbol={activeSymbol}
           onPick={onPick}
+          onRepeat={repeatTrade}
           isLoading={isLoading}
         />
       )}
@@ -278,6 +316,15 @@ export function TradingDock({
         />
       )}
       {tab === 'depth' && <DepthTab apiKey={apiKey} onPick={onPick} />}
+      {tab === 'strategy' && (
+        <StrategyTab
+          apiKey={apiKey}
+          wsUrl={wsUrl}
+          activeSymbol={activeSymbol}
+          refuse={refuse}
+          refresh={refresh}
+        />
+      )}
       <ModifyOrderDialog
         order={modifying}
         onOpenChange={(open) => !open && setModifying(null)}

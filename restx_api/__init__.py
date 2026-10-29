@@ -32,6 +32,7 @@ from .market_timings import api as market_timings_ns
 from .modify_gtt_order import api as modify_gtt_order_ns
 from .modify_order import api as modify_order_ns
 from .multi_option_greeks import api as multi_option_greeks_ns
+from .multileg import api as multileg_ns
 from .multiquotes import api as multiquotes_ns
 from .openposition import api as openposition_ns
 from .option_chain import api as option_chain_ns
@@ -109,3 +110,4 @@ api.add_namespace(modify_gtt_order_ns, path="/modifygttorder")
 api.add_namespace(cancel_gtt_order_ns, path="/cancelgttorder")
 api.add_namespace(gtt_orderbook_ns, path="/gttorderbook")
 api.add_namespace(strategy_ns, path="/strategy")
+api.add_namespace(multileg_ns, path="/multileg")

@@ -21,6 +21,8 @@ import type { DockOrder, DockPosition } from './blotter'
 
 export interface OrderActionContext {
   appMode: AppMode
+  /** The user's apikey, for the session routes that carry it in the payload. */
+  apiKey: string
   /**
    * True when trading is locked (a replay on screen, a workspace switching),
    * having already told the trader why. Asked first, every time.
@@ -80,6 +82,47 @@ export async function closeDockPosition(
     ok = res.status === 'success'
     if (!ok && ctx.appMode === 'live') {
       showToast.error(res.message || 'Close failed', 'orders')
+    }
+  } catch (e) {
+    if (!handledGlobally(ctx, e)) showToast.error(apiErrorMessage(e), 'orders')
+  }
+  ctx.refresh()
+  return ok
+}
+
+/**
+ * Place the same order again — the Repeat button on the orders and trades
+ * rows, and the re-entry on a positions row. A MARKET order at the market's
+ * mercy is the honest repeat: the original's limit price belongs to a market
+ * that has moved on. The broker's own fills decide what actually happens,
+ * and the books refresh after, so the repeat shows up as its own row.
+ */
+export async function repeatDockOrder(
+  order: Pick<DockOrder, 'symbol' | 'exchange' | 'action' | 'quantity' | 'product'>,
+  ctx: OrderActionContext
+): Promise<boolean> {
+  if (ctx.refuse()) return false
+  let ok = false
+  try {
+    const res = await tradingApi.placeOrder({
+      apikey: ctx.apiKey,
+      strategy: 'REPEAT',
+      exchange: order.exchange,
+      symbol: order.symbol,
+      action: order.action as 'BUY' | 'SELL',
+      quantity: order.quantity,
+      pricetype: 'MARKET',
+      product: order.product as 'MIS' | 'NRML' | 'CNC',
+    })
+    ok = res.status === 'success'
+    if (ok) {
+      if (ctx.appMode === 'live')
+        showToast.success(
+          `Repeat sent: ${order.action} ${order.quantity} ${order.symbol}`,
+          'orders'
+        )
+    } else if (ctx.appMode === 'live') {
+      showToast.error(res.message || 'Repeat failed', 'orders')
     }
   } catch (e) {
     if (!handledGlobally(ctx, e)) showToast.error(apiErrorMessage(e), 'orders')

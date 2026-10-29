@@ -29,6 +29,8 @@ interface Props {
   onPick(row: SearchRow): void
   onCancel(order: DockOrder): void
   onModify(order: DockOrder): void
+  /** Place the same order again — every row's, whatever its state. */
+  onRepeat(order: DockOrder): void
   isLoading?: boolean
 }
 
@@ -50,6 +52,7 @@ export function OrdersTable({
   onPick,
   onCancel,
   onModify,
+  onRepeat,
   isLoading,
 }: Props) {
   return (
@@ -136,19 +139,28 @@ export function OrdersTable({
                 )}
               </td>
               <td className={cn(TD, 'text-right')}>
-                {working && (
-                  <span className="inline-flex gap-1">
-                    {order.pricetype !== 'MARKET' && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-6 px-2 text-[11px]"
-                        onClick={() => onModify(order)}
-                        aria-label={`Modify order ${order.orderid} for ${order.symbol}`}
-                      >
-                        Modify
-                      </Button>
-                    )}
+                <span className="inline-flex gap-1">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 text-[11px]"
+                    onClick={() => onRepeat(order)}
+                    aria-label={`Repeat order ${order.orderid} for ${order.symbol}`}
+                  >
+                    Repeat
+                  </Button>
+                  {working && order.pricetype !== 'MARKET' && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-2 text-[11px]"
+                      onClick={() => onModify(order)}
+                      aria-label={`Modify order ${order.orderid} for ${order.symbol}`}
+                    >
+                      Modify
+                    </Button>
+                  )}
+                  {working && (
                     <Button
                       variant="ghost"
                       size="sm"
@@ -158,8 +170,8 @@ export function OrdersTable({
                     >
                       Cancel
                     </Button>
-                  </span>
-                )}
+                  )}
+                </span>
               </td>
             </tr>
           )

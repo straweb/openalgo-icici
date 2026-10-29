@@ -28,12 +28,14 @@ describe('DockShell', () => {
       'false',
       'false',
       'false',
+      'false',
     ])
     // The badge is a separate text node, so the accessible name has no space.
     expect(screen.getByRole('tab', { name: /^Orders\s*2$/ })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: /^Trades\s*7$/ })).toBeInTheDocument()
     // No count was given for GTT, so it carries no badge, not a zero.
     expect(screen.getByRole('tab', { name: 'GTT' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Strategy' })).toBeInTheDocument()
     // The hedging terminal's shared book, the constituents breakdown (the
     // tab the charting terminal once called Index) and the depth board sit
     // at the end of the strip.

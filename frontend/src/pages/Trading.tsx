@@ -228,8 +228,21 @@ interface SyncState {
   viewport: boolean
   symbol: boolean
   interval: boolean
+  /**
+   * The price band, not the time window: every pane's axis holds the same
+   * min..max, and dragging any pane's axis moves them all. Host-level, not
+   * the link group's — the engine links the time viewport, this links the
+   * vertical one.
+   */
+  price: boolean
 }
-const SYNC_DEFAULT: SyncState = { crosshair: true, viewport: true, symbol: false, interval: false }
+const SYNC_DEFAULT: SyncState = {
+  crosshair: true,
+  viewport: true,
+  symbol: false,
+  interval: false,
+  price: false,
+}
 
 /** A preset's own split, which a layout opens with until somebody drags it. */
 function presetWeights(preset: LayoutPreset): GridWeights {
@@ -246,6 +259,7 @@ function readSync(): SyncState {
       viewport: p.viewport ?? SYNC_DEFAULT.viewport,
       symbol: p.symbol ?? SYNC_DEFAULT.symbol,
       interval: p.interval ?? SYNC_DEFAULT.interval,
+      price: p.price ?? SYNC_DEFAULT.price,
     }
   } catch {
     return SYNC_DEFAULT
@@ -917,6 +931,52 @@ function TradingWorkspace({ account }: { account: string | null }) {
     visibleGrid.current?.linkGroup.setOptions(sync)
   }, [sync, linkGroup])
 
+  /* ── price-range sync: one band across the grid, dragged from any axis ── */
+  useEffect(() => {
+    if (!sync.price) return
+    const collect = (): Array<[string, TradingTerminal]> =>
+      Object.entries(terminalsRef.current).filter(
+        (entry): entry is [string, TradingTerminal] => entry[1] != null
+      )
+    // The last band each pane was seen holding. A pane whose current band
+    // differs from its last-seen one moved under the user's hand — that pane
+    // leads this beat, and the write it triggers is what the others get.
+    const seen = new Map<string, string>()
+    const keyOf = (r: { min: number; max: number }) => `${r.min.toFixed(4)}|${r.max.toFixed(4)}`
+    const beat = () => {
+      const panes = collect()
+      if (panes.length < 2) return
+      const ranges = panes.map(([id, t]) => ({ id, range: t.priceRange() }))
+      const measured = ranges.filter(
+        (r): r is { id: string; range: { min: number; max: number } } => r.range !== null
+      )
+      if (measured.length < 2) return
+      let leader: { id: string; range: { min: number; max: number } } | null = null
+      for (const item of measured) {
+        const previous = seen.get(item.id)
+        if (previous !== undefined && previous !== keyOf(item.range)) {
+          leader = item
+          break
+        }
+      }
+      // The first beat only records: nothing has moved yet, and pushing a
+      // band the group never agreed on would yank every axis at once.
+      if (!leader) {
+        for (const item of measured) seen.set(item.id, keyOf(item.range))
+        return
+      }
+      seen.set(leader.id, keyOf(leader.range))
+      for (const item of measured) {
+        if (item.id === leader.id) continue
+        seen.set(item.id, keyOf(leader.range))
+        const terminal = terminalsRef.current[item.id]
+        terminal?.applyPriceRange(leader.range)
+      }
+    }
+    const timer = window.setInterval(beat, 150)
+    return () => window.clearInterval(timer)
+  }, [sync.price])
+
   useEffect(() => {
     // Setup owns the group so an effect restart cannot reuse a destroyed one.
     const group = createLinkGroup()
@@ -994,7 +1054,10 @@ function TradingWorkspace({ account }: { account: string | null }) {
       const focused = grid.terminals.get(grid.payload.activePaneId) ?? null
       activeRef.current = focused
       setFocusedPane(grid.payload.activePaneId)
-      setSync(grid.payload.sync)
+      // The workspace doc speaks the widget's four channels; `price` is the
+      // page's own toggle and keeps whatever the trader last chose.
+      const { crosshair, viewport, symbol, interval } = grid.payload.sync
+      setSync((previous) => ({ ...previous, crosshair, viewport, symbol, interval }))
       setArmed(false)
       setTool(null)
       setLatched(false)
@@ -1411,7 +1474,7 @@ function TradingWorkspace({ account }: { account: string | null }) {
    * sync with, so an inviting control there would promise something it cannot
    * do; disabled with its state still readable is the honest version.
    */
-  const syncOn = sync.crosshair || sync.viewport || sync.symbol || sync.interval
+  const syncOn = sync.crosshair || sync.viewport || sync.symbol || sync.interval || sync.price
   const syncPicker = (
     <DropdownMenu>
       <Tip
@@ -1449,6 +1512,7 @@ function TradingWorkspace({ account }: { account: string | null }) {
             ['viewport', 'Time range', 'Mirror pan and zoom'],
             ['symbol', 'Symbol', 'Load the same instrument everywhere'],
             ['interval', 'Interval', 'Use the same interval where supported'],
+            ['price', 'Price range', 'Hold every axis to one band; drag any axis to move them all'],
           ] as const
         ).map(([key, label, hint]) => (
           // A label, not a button, and the row carries no click handler of its
@@ -1988,6 +2052,7 @@ function TradingWorkspace({ account }: { account: string | null }) {
             tab={dock}
             onTabChange={setDock}
             apiKey={apiKey}
+            wsUrl={wsUrl}
             onPick={sendToFocusedPane}
             activeSymbol={paneSymbols[focusedPane] ?? null}
             paneSymbols={paneSymbols}

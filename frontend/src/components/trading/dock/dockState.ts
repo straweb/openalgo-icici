@@ -18,6 +18,11 @@ export const DOCK_TABS = [
   // the underlying's index members, and Depth lists the instruments whose
   // order books the trader is watching.
   { id: 'scheduled', label: 'Scheduled' },
+  // The strategy bots: condition-driven entry/exit (index level, strike
+  // premium, clock time — AND/OR joined) armed onto a list of strikes. A
+  // placement surface like the books above it, so it joins them; the two
+  // hedging-terminal books and the depth board still close the strip.
+  { id: 'strategy', label: 'Strategy' },
   // The id stays 'index' so a remembered tab survives the rename; the label
   // is what the trader reads, and "constituents" is what the table shows.
   { id: 'index', label: 'Constituents' },

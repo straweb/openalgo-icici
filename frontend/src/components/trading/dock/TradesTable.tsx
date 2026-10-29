@@ -3,6 +3,7 @@
  * Read-only; a fill is a fact.
  */
 
+import { Button } from '@/components/ui/button'
 import type { SearchRow } from '@/lib/trading/terminal'
 import { cn } from '@/lib/utils'
 import type { DockTrade } from './blotter'
@@ -25,10 +26,12 @@ interface Props {
   trades: DockTrade[]
   activeSymbol?: string | null
   onPick(row: SearchRow): void
+  /** Place the fill's side and quantity again as a market order. */
+  onRepeat(trade: DockTrade): void
   isLoading?: boolean
 }
 
-export function TradesTable({ trades, activeSymbol, onPick, isLoading }: Props) {
+export function TradesTable({ trades, activeSymbol, onPick, onRepeat, isLoading }: Props) {
   return (
     <table className="w-full border-collapse text-sm">
       <thead>
@@ -57,11 +60,14 @@ export function TradesTable({ trades, activeSymbol, onPick, isLoading }: Props) 
           <th scope="col" className={TH_NUM}>
             Value
           </th>
+          <th scope="col" className={cn(TH, 'text-right')}>
+            <span className="sr-only">Actions</span>
+          </th>
         </tr>
       </thead>
       <tbody>
         {trades.length === 0 && (
-          <EmptyRows colSpan={8}>{isLoading ? 'Loading trades' : 'No trades today.'}</EmptyRows>
+          <EmptyRows colSpan={9}>{isLoading ? 'Loading trades' : 'No trades today.'}</EmptyRows>
         )}
         {trades.map((t, i) => {
           const active = isActiveRow(activeSymbol, t)
@@ -85,6 +91,17 @@ export function TradesTable({ trades, activeSymbol, onPick, isLoading }: Props) 
               <td className={TD_NUM}>{t.quantity}</td>
               <td className={TD_NUM}>{fmt2(t.average_price)}</td>
               <td className={TD_NUM}>{fmt2(t.trade_value)}</td>
+              <td className={cn(TD, 'text-right')}>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-[11px]"
+                  onClick={() => onRepeat(t)}
+                  aria-label={`Repeat trade ${t.orderid} for ${t.symbol}`}
+                >
+                  Repeat
+                </Button>
+              </td>
             </tr>
           )
         })}

@@ -25,7 +25,15 @@ const LS_KEY = 'oa-deploy-indexchart'
 interface Saved {
   interval?: string
   folded?: boolean
+  /** The strip's own height, dragged from its bottom edge. */
+  height?: number
 }
+
+/** Narrower than this and the candles read as a sparkline. */
+const MIN_HEIGHT = 120
+/** Taller than this and the ladder below — the panel's point — gets squeezed. */
+const MAX_HEIGHT = 480
+const DEFAULT_HEIGHT = 170
 
 function readSaved(): Saved {
   try {
@@ -56,6 +64,13 @@ export function DeployIndexChart({ apiKey, wsUrl, symbol, exchange, name }: Prop
   const initial = useRef(readSaved())
   const [interval, setInterval] = useState(initial.current.interval ?? '5m')
   const [folded, setFolded] = useState(initial.current.folded ?? false)
+  const [height, setHeight] = useState(() =>
+    initial.current.height &&
+    initial.current.height >= MIN_HEIGHT &&
+    initial.current.height <= MAX_HEIGHT
+      ? initial.current.height
+      : DEFAULT_HEIGHT
+  )
   /** One feed per mount; the instrument change is a setSymbol, not a rebuild. */
   const feed = useMemo(() => createSpotFeed({ apiKey, wsUrl }), [apiKey, wsUrl])
 
@@ -66,6 +81,39 @@ export function DeployIndexChart({ apiKey, wsUrl, symbol, exchange, name }: Prop
   const setFoldedAndSave = (v: boolean) => {
     setFolded(v)
     writeSaved({ ...readSaved(), folded: v })
+  }
+  const setHeightAndSave = (v: number) => {
+    setHeight(v)
+    writeSaved({ ...readSaved(), height: v })
+  }
+  const heightRef = useRef(height)
+  heightRef.current = height
+
+  /**
+   * The strip's bottom edge is a drag handle: up gives the candles room and
+   * takes it from the strike rows (flex-1 below), down gives it back. The
+   * write waits for the pointerup, like the panel width's drag does.
+   */
+  const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    const startY = event.clientY
+    const startHeight = height
+    const onMove = (e: PointerEvent) => {
+      const next = Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, startHeight + (e.clientY - startY)))
+      setHeight(next)
+    }
+    const onUp = () => {
+      document.body.classList.remove('select-none', 'cursor-row-resize')
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+      setHeightAndSave(heightRef.current)
+    }
+    document.body.classList.add('select-none', 'cursor-row-resize')
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
   }
 
   return (
@@ -105,10 +153,10 @@ export function DeployIndexChart({ apiKey, wsUrl, symbol, exchange, name }: Prop
       </div>
       {!folded && (
         // The strip is a positioned flex column of its own: the chart root's
-        // `relative` resolves against it, so the candles stay in the 170px
-        // band and cannot paint over the header, the ladder or the deploy
-        // buttons the way an absolute fill of the panel's aside did.
-        <div className="flex h-[170px] flex-col overflow-hidden">
+        // `relative` resolves against it, so the candles stay in the band and
+        // cannot paint over the header, the ladder or the deploy buttons the
+        // way an absolute fill of the panel's aside did.
+        <div className="flex flex-col overflow-hidden" style={{ height }}>
           <OpenAlgoChart
             feed={feed}
             symbol={symbol}
@@ -119,6 +167,29 @@ export function DeployIndexChart({ apiKey, wsUrl, symbol, exchange, name }: Prop
             statusline={false}
             indicators={false}
             volume
+          />
+          {/* The resize handle: a hairline that only announces itself on
+              approach, the panel width's drag in miniature. Keyboard users
+              get the arrow keys rather than a pointer gesture. */}
+          {/* biome-ignore lint/a11y/useSemanticElements: the rule points at <hr>,
+              which cannot be focusable or carry pointer handlers. role=separator
+              with tabindex and aria-valuenow IS the ARIA window-splitter pattern. */}
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label={`Resize the index chart`}
+            aria-valuenow={Math.round(height)}
+            aria-valuemin={MIN_HEIGHT}
+            aria-valuemax={MAX_HEIGHT}
+            tabIndex={0}
+            onPointerDown={startResize}
+            onKeyDown={(e) => {
+              const step = e.key === 'ArrowUp' ? 16 : e.key === 'ArrowDown' ? -16 : 0
+              if (!step) return
+              setHeightAndSave(Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, height + step)))
+              e.preventDefault()
+            }}
+            className="h-1 w-full shrink-0 cursor-row-resize bg-border/60 transition-colors hover:bg-primary/40 focus-visible:bg-primary/60 focus-visible:outline-none"
           />
         </div>
       )}

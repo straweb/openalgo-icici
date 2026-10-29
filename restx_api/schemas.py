@@ -176,6 +176,42 @@ class BasketOrderSchema(Schema):
     )  # List of order details
 
 
+class MultilegLegSchema(Schema):
+    """One leg of a /multileg batch: an exact symbol carrying its own action,
+    quantity and pricing. Deliberately type-level only — exchange/action/
+    pricetype/product validity is reported per leg by the service (see
+    validate_leg), because partial success across the batch is this
+    endpoint's contract and a schema-level OneOf would 400 the whole batch
+    for one bad leg. legid is optional and echoed back on the result row so
+    the caller can map each outcome to its own rows."""
+    legid = fields.Str(required=False, allow_none=True)
+    exchange = fields.Str(required=True)
+    symbol = fields.Str(required=True)
+    action = fields.Str(required=True)
+    quantity = fields.Float(required=True)
+    pricetype = fields.Str(missing="MARKET")
+    product = fields.Str(missing="MIS")
+    price = fields.Float(missing=0.0)
+    trigger_price = fields.Float(missing=0.0)
+
+    @post_load
+    def coerce_quantity(self, data, **kwargs):
+        return _coerce_quantity_to_int(data)
+
+
+class MultilegSchema(Schema):
+    apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
+    strategy = fields.Str(missing="HEDGING")
+    # min=1 for the same reason as the basket's orders list: an empty list
+    # validated, the service iterated nothing and reported success, so a
+    # caller whose legs came out empty was told the batch had been placed.
+    legs = fields.List(
+        fields.Nested(MultilegLegSchema),
+        required=True,
+        validate=validate.Length(min=1, error="Legs must contain at least 1 item."),
+    )
+
+
 class SplitOrderSchema(Schema):
     apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
     strategy = fields.Str(required=True)

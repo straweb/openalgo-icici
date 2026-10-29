@@ -918,46 +918,68 @@ function TradingWorkspace({ account }: { account: string | null }) {
     visibleGrid.current?.linkGroup.setOptions(sync)
   }, [sync, linkGroup])
 
-  /* ── price-range sync: one band across the grid, dragged from any axis ── */
+  /* ── price-scale sync: the zoom crosses the grid, the prices stay home ── */
   useEffect(() => {
     if (!sync.price) return
     const collect = (): Array<[string, TradingTerminal]> =>
       Object.entries(terminalsRef.current).filter(
         (entry): entry is [string, TradingTerminal] => entry[1] != null
       )
-    // The last band each pane was seen holding. A pane whose current band
-    // differs from its last-seen one moved under the user's hand — that pane
-    // leads this beat, and the write it triggers is what the others get.
-    const seen = new Map<string, string>()
+    // The last band each pane was seen holding, in the pane's own prices. A
+    // pane whose band moved under the user's hand leads the beat; the others
+    // follow the ZOOM — how far the leader's span grew or shrank, as a ratio —
+    // and rebuild their bands from their own midpoints. The leader's price
+    // levels never travel: a SENSEX pane zoomed to a thousand-point span must
+    // not write its tens of thousands onto an option pane quoting two digits.
+    // It only lends how much to spread or squeeze, so every axis stays a
+    // ruler over its own instrument while the magnification stays shared.
+    const seen = new Map<string, { min: number; max: number }>()
     const keyOf = (r: { min: number; max: number }) => `${r.min.toFixed(4)}|${r.max.toFixed(4)}`
     const beat = () => {
       const panes = collect()
       if (panes.length < 2) return
-      const ranges = panes.map(([id, t]) => ({ id, range: t.priceRange() }))
-      const measured = ranges.filter(
-        (r): r is { id: string; range: { min: number; max: number } } => r.range !== null
-      )
+      const measured = panes
+        .map(([id, t]) => ({ id, range: t.priceRange() }))
+        .filter((r): r is { id: string; range: { min: number; max: number } } => r.range !== null)
       if (measured.length < 2) return
       let leader: { id: string; range: { min: number; max: number } } | null = null
       for (const item of measured) {
         const previous = seen.get(item.id)
-        if (previous !== undefined && previous !== keyOf(item.range)) {
+        if (previous !== undefined && keyOf(previous) !== keyOf(item.range)) {
           leader = item
           break
         }
       }
-      // The first beat only records: nothing has moved yet, and pushing a
-      // band the group never agreed on would yank every axis at once.
+      // The first beat only records: nothing has moved yet, and a zoom born
+      // of nothing would squeeze every axis at once.
       if (!leader) {
-        for (const item of measured) seen.set(item.id, keyOf(item.range))
+        for (const item of measured) seen.set(item.id, item.range)
         return
       }
-      seen.set(leader.id, keyOf(leader.range))
+      const previous = seen.get(leader.id)!
+      seen.set(leader.id, leader.range)
+      const prevSpan = previous.max - previous.min
+      const nextSpan = leader.range.max - leader.range.min
+      // A flat or unmeasurable band carries no zoom to share: leave the
+      // others where they are and re-record them against this beat.
+      if (!(prevSpan > 1e-9) || !(nextSpan > 1e-9)) {
+        for (const item of measured) if (item.id !== leader.id) seen.set(item.id, item.range)
+        return
+      }
+      const zoom = nextSpan / prevSpan
       for (const item of measured) {
         if (item.id === leader.id) continue
-        seen.set(item.id, keyOf(leader.range))
-        const terminal = terminalsRef.current[item.id]
-        terminal?.applyPriceRange(leader.range)
+        // The follower's own band — its own instrument's prices — scaled
+        // about its own midpoint by the leader's ratio. A pure pan on the
+        // leader is a ratio of 1, so the followers hold still; only a real
+        // zoom moves them.
+        const own = seen.get(item.id) ?? item.range
+        const span = own.max - own.min
+        const mid = (own.max + own.min) / 2
+        const next =
+          span > 1e-9 ? { min: mid - (span * zoom) / 2, max: mid + (span * zoom) / 2 } : item.range
+        seen.set(item.id, next)
+        if (keyOf(next) !== keyOf(item.range)) terminalsRef.current[item.id]?.applyPriceRange(next)
       }
     }
     const timer = window.setInterval(beat, 150)

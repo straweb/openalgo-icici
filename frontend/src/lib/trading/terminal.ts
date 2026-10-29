@@ -2236,6 +2236,19 @@ export class TradingTerminal {
     )
   }
 
+  /**
+   * The marker's readout: the average the position rests at, and its P&L
+   * marked against the live price — the last tick, or the average before
+   * the first one lands. The box top-right shows the same two numbers; the
+   * line repeats them where the trader's eye meets the entry level.
+   */
+  private posLabel(): string {
+    if (!this.position) return ''
+    const mark = this.lastLtp != null ? this.lastLtp : this.position.avg
+    const pnl = (mark - this.position.avg) * this.position.net
+    return `@ ${this.fmt(this.position.avg)}  ${pnl >= 0 ? '+' : '-'}₹${money(Math.abs(pnl))}`
+  }
+
   private renderPosition(pos: Record<string, unknown> | undefined) {
     if (this.posLine && this.chart) {
       this.chart.removePrimitive(this.posLine)
@@ -2255,9 +2268,11 @@ export class TradingTerminal {
       this.renderPosBox()
       return
     }
-    // The line carries the marker (badge + qty + inline ✕) at its end; the
-    // "@ price, P&L" readout lives in the box docked top-right, where the
-    // trader reads a position's numbers — not painted over the plot.
+    // The marker — badge, "@ price + P&L", inline ✕ — sits at the line's
+    // left end: the live price owns the right edge, where the axis tag is,
+    // and the two must not share a side. Full width keeps the pill hugging
+    // the plot's left edge at every zoom; the box top-right still carries
+    // the same numbers for the trader reading the axis side.
     this.posLine = this.chart.addPriceLine(
       {
         price: this.position.avg,
@@ -2265,10 +2280,11 @@ export class TradingTerminal {
         lineWidth: 2,
         dashed: false,
         id: 'position',
-        extentFromRight: 0.3,
+        extentFromRight: 1,
         closeButton: true,
         badge: this.position.net > 0 ? 'LONG' : 'SHORT',
         qty: Math.abs(this.position.net),
+        leftLabel: this.posLabel(),
       },
       0
     )
@@ -7433,7 +7449,9 @@ export class TradingTerminal {
     if (!this.sym || (e.symbol && e.symbol !== this.sym.symbol)) return
     this.lastLtp = e.ltp
     this.cb.onLtp(e.ltp)
-    // The box's P&L row follows the tick; the line carries only the marker.
+    // The box's P&L row follows the tick, and the marker's left label
+    // re-reads the same mark against the same average.
+    if (this.position && this.posLine) this.posLine.setLeftLabel(this.posLabel())
     this.renderPosBoxPnl()
     // No depth? The panel still gets a price to show: the LTP marks both
     // sides rather than leaving the strip blank on a quote-only feed.

@@ -85,10 +85,10 @@ describe('resolveOrderPricing', () => {
 })
 
 describe('useOrderModeStore', () => {
-  it('defaults to limit mode with a 3% MPP buffer', () => {
+  it('defaults to limit mode with no MPP buffer — the limit rests at the live price', () => {
     const s = useOrderModeStore.getState()
     expect(s.mode).toBe('limit')
-    expect(s.mppPercent).toBe(3)
+    expect(s.mppPercent).toBe(0)
   })
 
   it('clamps the percent on write', () => {

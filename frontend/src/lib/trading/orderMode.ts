@@ -67,7 +67,10 @@ export function protectedPrice(base: number, action: 'BUY' | 'SELL', percent: nu
 
 interface OrderModeStore {
   mode: OrderMode
-  /** The MPP buffer percent, applied on the live price (default 3, the option slab's own). */
+  /** The MPP buffer percent, applied on the live price. Default 0: the
+   *  limit rests at the live price itself and the trader adds a buffer
+   *  only when they want one — 3, the option slab's old default, paid up
+   *  on every fill whether the market needed it or not. */
   mppPercent: number
   setMode(mode: OrderMode): void
   setMppPercent(percent: number): void
@@ -77,12 +80,27 @@ export const useOrderModeStore = create<OrderModeStore>()(
   persist(
     (set) => ({
       mode: 'limit',
-      mppPercent: 3,
+      mppPercent: 0,
       setMode: (mode) => set({ mode }),
       setMppPercent: (mppPercent) =>
         set({ mppPercent: Math.min(100, Math.max(0, Number(mppPercent) || 0)) }),
     }),
-    { name: 'openalgo-order-mode' }
+    {
+      name: 'openalgo-order-mode',
+      // v0 shipped the option slab's 3% as the MPP buffer; v1 defaults to 0.
+      // A stored 3 was the shipped number far more often than a choice, so
+      // the migration resets it once and keeps the mode the trader picked.
+      version: 1,
+      migrate: (persisted) => {
+        const saved = (persisted ?? {}) as Partial<OrderModeStore>
+        const mode: OrderMode =
+          saved.mode === 'mpp' || saved.mode === 'market' || saved.mode === 'live'
+            ? saved.mode
+            : 'limit'
+        // The actions come from the store itself; persist merges this over them.
+        return { mode, mppPercent: 0 } as OrderModeStore
+      },
+    }
   )
 )
 

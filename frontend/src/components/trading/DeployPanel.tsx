@@ -117,7 +117,7 @@ import {
   placeLevelOrders,
   resolveLevelPick,
 } from '@/lib/trading/levelDeploy'
-import { currentOrderMode, resolveOrderPricing } from '@/lib/trading/orderMode'
+import { currentOrderMode, resolveOrderPricing, useOrderModeStore } from '@/lib/trading/orderMode'
 import { armLadderBatch, armPastMiss } from '@/lib/trading/scheduleArm'
 import type { SearchRow } from '@/lib/trading/terminal'
 import { tickHub } from '@/lib/trading/tickHub'
@@ -2288,6 +2288,10 @@ function CapitalChip(props: {
   onBasis(basis: DeployCapitalBasis): void
 }) {
   const overCash = props.source === 'fixed' && props.cash > 0 && props.fixed > props.cash
+  // The MPP buffer is global state, not chip state: the mode select edits the
+  // same number, and every surface that fires reads it back on the next order.
+  const mppPercent = useOrderModeStore((s) => s.mppPercent)
+  const setMppPercent = useOrderModeStore((s) => s.setMppPercent)
   return (
     <Popover>
       <PopoverTrigger asChild>
@@ -2398,6 +2402,31 @@ function CapitalChip(props: {
           Each side's enabled rows split the usable capital by their % weights — the sliders keep
           every side summing to 100.
         </p>
+        {/* The MPP buffer lives beside the capital it spends: MPP mode prices
+            every order off the live price plus this percent, and the trader
+            tuning their sizing tunes the buffer in the same breath. Bound to
+            the global store, so this row and the mode select edit one value. */}
+        <label className="mt-2 flex items-center justify-between gap-2 border-t pt-2">
+          <span
+            className="text-[10px] text-muted-foreground"
+            title="Market protection percent — MPP mode prices a BUY above the live price, a SELL below it. 0 rests the limit at the live price itself."
+          >
+            MPP buffer
+          </span>
+          <span className="flex items-center gap-1">
+            <input
+              type="number"
+              min={0}
+              max={100}
+              step={0.5}
+              value={mppPercent}
+              onChange={(e) => setMppPercent(Number(e.target.value))}
+              className="h-6 w-14 rounded border bg-background px-1 text-right font-mono text-[11px] tabular-nums"
+              aria-label="MPP buffer percent"
+            />
+            <span className="text-[10px] text-muted-foreground">%</span>
+          </span>
+        </label>
       </PopoverContent>
     </Popover>
   )

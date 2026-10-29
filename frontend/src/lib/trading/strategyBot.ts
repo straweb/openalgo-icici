@@ -61,9 +61,11 @@ export interface StrategyBot {
   pricetype: 'MARKET' | 'LIMIT'
   entry: StrategyCondition[]
   exit: StrategyCondition[]
-  /** Premium points from the entry reference; both optional, both per leg. */
+  /** Exit levels; both optional. The unit says how each number reads. */
   target?: number
+  targetUnit?: StrategyLevelUnit
   stoploss?: number
+  stoplossUnit?: StrategyLevelUnit
   status: StrategyStatus
   openedAt?: number
   closedAt?: number
@@ -71,6 +73,18 @@ export interface StrategyBot {
   legEntryRef?: Record<string, number>
   note?: string
 }
+
+/**
+ * How a target/stop number reads, against the premium the leg entered at:
+ *
+ * - **pts** — premium points away from the entry reference (the default, so
+ *   bots saved before units existed read exactly as they always did).
+ * - **pct** — a percent of the entry reference itself: 2 exits at +2% on
+ *   the entry premium, in the bot's own direction.
+ * - **price** — the premium level itself: 420 exits when the leg trades
+ *   through 420, whatever the entry paid.
+ */
+export type StrategyLevelUnit = 'pts' | 'pct' | 'price'
 
 /** One evaluation beat's facts: the hub's snapshots and the clock. */
 export interface StrategyTickContext {
@@ -177,12 +191,43 @@ export function exitReason(
   for (const leg of bot.legs) {
     const ref = refs[leg.id]
     const ltp = ctx.legLtp.get(leg.id)
-    if (ref == null || ltp == null) continue
-    const points = (ltp - ref) * dir
-    if (bot.target != null && bot.target > 0 && points >= bot.target) return 'target'
-    if (bot.stoploss != null && bot.stoploss > 0 && points <= -bot.stoploss) return 'stoploss'
+    if (ltp == null) continue
+    if (bot.target != null && levelHit(bot.target, bot.targetUnit, 'target', ref, ltp, dir))
+      return 'target'
+    if (bot.stoploss != null && levelHit(bot.stoploss, bot.stoplossUnit, 'stoploss', ref, ltp, dir))
+      return 'stoploss'
   }
   return null
+}
+
+/**
+ * Whether one level is reached for one leg. Direction comes from the bot's
+ * side: a BUY profits upward, so its target sits above and its stop below;
+ * a SELL mirrors both. A level that needs the entry reference but has none —
+ * the leg never quoted at the fire — is simply never reached.
+ */
+function levelHit(
+  level: number,
+  unit: StrategyLevelUnit | undefined,
+  kind: 'target' | 'stoploss',
+  ref: number | undefined,
+  ltp: number,
+  dir: 1 | -1
+): boolean {
+  if (!(level > 0)) return false
+  if (unit === 'price') {
+    // The level is the premium itself: no reference, only the quote.
+    if (kind === 'target') return dir === 1 ? ltp >= level : ltp <= level
+    return dir === 1 ? ltp <= level : ltp >= level
+  }
+  if (ref == null || !Number.isFinite(ref)) return false
+  if (unit === 'pct') {
+    if (!(ref > 0)) return false
+    const pct = ((ltp - ref) / ref) * 100 * dir
+    return kind === 'target' ? pct >= level : pct <= -level
+  }
+  const points = (ltp - ref) * dir
+  return kind === 'target' ? points >= level : points <= -level
 }
 
 /**
@@ -228,7 +273,9 @@ function sanitize(raw: unknown): StrategyBot | null {
       : 'idle',
   }
   if (typeof b.target === 'number') bot.target = b.target
+  if (b.targetUnit === 'pct' || b.targetUnit === 'price') bot.targetUnit = b.targetUnit
   if (typeof b.stoploss === 'number') bot.stoploss = b.stoploss
+  if (b.stoplossUnit === 'pct' || b.stoplossUnit === 'price') bot.stoplossUnit = b.stoplossUnit
   if (typeof b.openedAt === 'number') bot.openedAt = b.openedAt
   if (typeof b.closedAt === 'number') bot.closedAt = b.closedAt
   if (b.legEntryRef != null && typeof b.legEntryRef === 'object') bot.legEntryRef = b.legEntryRef
@@ -293,6 +340,21 @@ export function describeCondition(
         : 'strike'
       : 'index'
   return `${noun} ${cond.op} ${cond.value}`
+}
+
+/**
+ * A target/stop as the trader wrote it — `120 pts` off the entry, `2%` of
+ * it, or the premium itself at `@ 420` — for the query line and the toasts.
+ * A level that is not set says so rather than showing a bare zero.
+ */
+export function describeLevel(
+  unit: StrategyLevelUnit | undefined,
+  value: number | undefined
+): string {
+  if (value == null || !(value > 0)) return 'not set'
+  if (unit === 'pct') return `${value}%`
+  if (unit === 'price') return `@ ${value}`
+  return `${value} pts`
 }
 
 /**

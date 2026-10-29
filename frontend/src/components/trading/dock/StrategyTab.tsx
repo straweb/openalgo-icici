@@ -27,6 +27,7 @@ import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import {
   describeConditions,
+  describeLevel,
   evalConditions,
   exitReason,
   istSecondsNow,
@@ -39,6 +40,7 @@ import {
   type StrategyCondition,
   type StrategyField,
   type StrategyLeg,
+  type StrategyLevelUnit,
   type StrategyTickContext,
   saveBots,
   secToClock,
@@ -300,6 +302,35 @@ function ConditionRow({
         </button>
       </span>
     </div>
+  )
+}
+
+/**
+ * The unit a target/stop number reads in — points off the entry, a percent
+ * of it, or the premium itself. The choice rides the bot, so a saved bot
+ * keeps meaning what it meant when it was written.
+ */
+function LevelUnitSelect({
+  value,
+  onChange,
+  label,
+}: {
+  value: StrategyLevelUnit | undefined
+  onChange(unit: StrategyLevelUnit): void
+  label: string
+}) {
+  return (
+    <select
+      value={value ?? 'pts'}
+      onChange={(e) => onChange(e.target.value as StrategyLevelUnit)}
+      aria-label={label}
+      title="pts — premium points from the entry · % — percent of the entry premium · ₹ — the premium level itself"
+      className="h-6 rounded bg-muted px-0.5 text-[10px]"
+    >
+      <option value="pts">pts</option>
+      <option value="pct">%</option>
+      <option value="price">₹</option>
+    </select>
   )
 }
 
@@ -785,12 +816,15 @@ export function StrategyTab({ apiKey, wsUrl, activeSymbol, refuse, refresh }: Pr
           >
             <span className="font-semibold text-foreground">QUERY</span> {draft.side} when{' '}
             {describeConditions(draft.entry, legNameOf(draft))} · exit when{' '}
-            {describeConditions(draft.exit, legNameOf(draft))} · {draft.product} · {draft.pricetype}
+            {describeConditions(draft.exit, legNameOf(draft))} · target{' '}
+            {describeLevel(draft.targetUnit, draft.target)} · stop{' '}
+            {describeLevel(draft.stoplossUnit, draft.stoploss)} · {draft.product} ·{' '}
+            {draft.pricetype}
           </div>
 
           <div className="mt-2 flex flex-wrap items-center gap-1.5">
             <label className="flex items-center gap-1 text-[11px] text-muted-foreground">
-              Target (pts)
+              Target
               <Input
                 type="number"
                 value={draft.target ?? ''}
@@ -800,12 +834,17 @@ export function StrategyTab({ apiKey, wsUrl, activeSymbol, refuse, refresh }: Pr
                     target: Number(e.target.value) > 0 ? Number(e.target.value) : undefined,
                   })
                 }
-                aria-label="Target points"
-                className="h-6 w-[70px] px-1 text-[11px] tabular-nums"
+                aria-label="Target value"
+                className="h-6 w-[64px] px-1 text-[11px] tabular-nums"
+              />
+              <LevelUnitSelect
+                value={draft.targetUnit}
+                onChange={(unit) => setDraft({ ...draft, targetUnit: unit })}
+                label="Target unit"
               />
             </label>
             <label className="flex items-center gap-1 text-[11px] text-muted-foreground">
-              Stop (pts)
+              Stop
               <Input
                 type="number"
                 value={draft.stoploss ?? ''}
@@ -815,8 +854,13 @@ export function StrategyTab({ apiKey, wsUrl, activeSymbol, refuse, refresh }: Pr
                     stoploss: Number(e.target.value) > 0 ? Number(e.target.value) : undefined,
                   })
                 }
-                aria-label="Stoploss points"
-                className="h-6 w-[70px] px-1 text-[11px] tabular-nums"
+                aria-label="Stoploss value"
+                className="h-6 w-[64px] px-1 text-[11px] tabular-nums"
+              />
+              <LevelUnitSelect
+                value={draft.stoplossUnit}
+                onChange={(unit) => setDraft({ ...draft, stoplossUnit: unit })}
+                label="Stoploss unit"
               />
             </label>
             <span className="ml-auto flex items-center gap-1">
@@ -931,7 +975,9 @@ export function StrategyTab({ apiKey, wsUrl, activeSymbol, refuse, refresh }: Pr
                 className="mt-0.5 font-mono text-[9.5px] leading-relaxed text-muted-foreground"
               >
                 {bot.side} when {describeConditions(bot.entry, legNameOf(bot))} · exit when{' '}
-                {describeConditions(bot.exit, legNameOf(bot))}
+                {describeConditions(bot.exit, legNameOf(bot))} · target{' '}
+                {describeLevel(bot.targetUnit, bot.target)} · stop{' '}
+                {describeLevel(bot.stoplossUnit, bot.stoploss)}
               </div>
               {running && (
                 <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[10px] tabular-nums text-muted-foreground">

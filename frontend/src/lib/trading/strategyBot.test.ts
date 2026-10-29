@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   describeConditions,
+  describeLevel,
   entryEdge,
   evalConditions,
   exitReason,
@@ -162,9 +163,64 @@ describe('exitReason', () => {
     expect(exitReason(short, ctx({ legLtp: new Map([['leg-ce', 360]]) }))).toBe('target') // +20 short
   })
 
+  it('reads a percent level off the entry premium, on the side ridden', () => {
+    const bot = {
+      ...base,
+      legEntryRef: { 'leg-ce': 380 },
+      target: 5,
+      targetUnit: 'pct' as const,
+      stoploss: 2,
+      stoplossUnit: 'pct' as const,
+    }
+    // 400 is +5.26% long: past a 5% target.
+    expect(exitReason(bot, ctx())).toBe('target')
+    // 388 is +2.1% long: under the target, clear of the stop.
+    expect(exitReason(bot, ctx({ legLtp: new Map([['leg-ce', 388]]) }))).toBeNull()
+    // 372 is -2.1% long: past a 2% stop.
+    expect(exitReason(bot, ctx({ legLtp: new Map([['leg-ce', 372]]) }))).toBe('stoploss')
+    // A short's percent reads the same fall the other way: 361 is -5% long,
+    // which is +5% to the short — the target.
+    const short = { ...bot, side: 'SELL' as const }
+    expect(exitReason(short, ctx({ legLtp: new Map([['leg-ce', 361]]) }))).toBe('target')
+  })
+
+  it('reads a price level as the premium itself, needing no entry reference', () => {
+    // No legEntryRef at all: a price level is the only unit that can exit
+    // without one, and that is the reason it exists.
+    const bot = {
+      ...base,
+      target: 410,
+      targetUnit: 'price' as const,
+      stoploss: 370,
+      stoplossUnit: 'price' as const,
+    }
+    expect(exitReason(bot, ctx())).toBeNull() // 400 sits between the levels
+    expect(exitReason(bot, ctx({ legLtp: new Map([['leg-ce', 411]]) }))).toBe('target')
+    expect(exitReason(bot, ctx({ legLtp: new Map([['leg-ce', 369]]) }))).toBe('stoploss')
+    // The short's levels mirror: the target sits below (buy back under it),
+    // the stop above — 430 ends the trade if the premium climbs back there.
+    const short = { ...bot, side: 'SELL' as const, stoploss: 430 }
+    expect(exitReason(short, ctx())).toBe('target') // 400 <= 410
+    expect(exitReason(short, ctx({ legLtp: new Map([['leg-ce', 411]]) }))).toBeNull()
+    expect(exitReason(short, ctx({ legLtp: new Map([['leg-ce', 431]]) }))).toBe('stoploss')
+  })
+
   it('answers null while nothing is met and no levels are set', () => {
     expect(exitReason(base, ctx())).toBeNull()
     expect(exitReason({ ...base, target: 100 }, ctx())).toBeNull()
+  })
+})
+
+describe('describeLevel', () => {
+  it('renders each unit the way the trader wrote it', () => {
+    expect(describeLevel(undefined, 120)).toBe('120 pts')
+    expect(describeLevel('pct', 2)).toBe('2%')
+    expect(describeLevel('price', 420)).toBe('@ 420')
+  })
+
+  it('says not set for an absent or non-positive level', () => {
+    expect(describeLevel('pts', undefined)).toBe('not set')
+    expect(describeLevel('pts', 0)).toBe('not set')
   })
 })
 

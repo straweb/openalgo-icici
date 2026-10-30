@@ -1,49 +1,83 @@
 /**
- * The Deploy panel's quick buttons, parked above the bottom dock.
+ * The Deploy panel's two action rows, parked above the bottom dock.
  *
  * The panel is a working surface — its ladder, its chain poll, its strike
- * picker — and the buttons used to live at its bottom edge, reachable only
- * while the panel stood open. This bar carries the same buttons the rest of
- * the time: a stable strip the whole page width, always above the dock, so
- * Deploy CE / Close CE / Exit All are one press at any moment without
- * opening anything.
+ * picker — and its buttons used to live at its bottom edge, reachable only
+ * while the panel stood open. This bar carries the same two rows the rest
+ * of the time: a stable strip the whole page width, always above the dock,
+ * so Deploy CE / Close CE / Exit All are one press at any moment without
+ * opening anything — and the panel's second row rides along: the two swaps
+ * (leave one side, enter the other), a batch Schedule on the ladder, Deploy
+ * by level, and the product and order-mode the presses fire under.
  *
  * It owns no polls. Every figure it fires on — positions, funds, the rows'
  * live quotes — is fetched at press time, in one parallel breath, the way a
  * trader's own click wants fresh numbers rather than a cached set; between
  * presses the bar costs the feed nothing, which is also why it can sit
- * beside the panel without doubling a single standing request. Both read and
- * write the same persisted deploy book (oa-trading-deploy-v1), so a ladder
- * built in the panel fires here, and a close fired here shows in the panel
- * the next time the trader opens it.
+ * beside the panel without doubling a single standing request. The one
+ * exception is Deploy by level, which reads the chain the moment its dialog
+ * opens: two one-shot asks (the expiry list, then the snapshot), and a
+ * missed one says so instead of polling forever. Both read and write the
+ * same persisted deploy book (oa-trading-deploy-v1), so a ladder built in
+ * the panel fires here, and a close or a schedule fired here shows in the
+ * panel the next time the trader opens it.
  *
  * The Strategy bots button on the right opens the rail's Strategy panel —
  * the bar is the two quick surfaces' shared front door.
  */
 
-import { Bot, Loader2 } from 'lucide-react'
+import { Bot, CalendarClock, Layers, Loader2 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { optionChainApi } from '@/api/option-chain'
+import { scalpingApi } from '@/api/scalping'
 import { tradingApi } from '@/api/trading'
+import { IndexDeployDialog, type IndexDeploySubmit } from '@/components/hedging/IndexDeployDialog'
+import { SchedulerDialog, type SchedulerSubmit } from '@/components/hedging/SchedulerDialog'
+import { OrderModeSelect } from '@/components/trading/OrderModeSelect'
 import { Button } from '@/components/ui/button'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { constituentsFor } from '@/lib/hedging/indexConstituents'
+import { newScheduleId, scheduleActionLabel } from '@/lib/hedging/scheduler'
+import { loadHedgingState, saveHedgingState } from '@/lib/hedging/storage'
 import { planBracket } from '@/lib/trading/bracket'
 import {
   bookKey,
+  type DeployBook,
   type DeployRow,
+  defaultStrikeStep,
   firingRows,
   fnoBaseSymbol,
   readDeployState,
   usableSessionCapital,
   writeDeployState,
 } from '@/lib/trading/deployPlan'
+import {
+  armCloseRows,
+  buildDeployPlan,
+  levelEntryMet,
+  placeLevelOrders,
+  resolveLevelPick,
+} from '@/lib/trading/levelDeploy'
 import { currentOrderMode, resolveOrderPricing } from '@/lib/trading/orderMode'
+import { armLadderBatch, armPastMiss } from '@/lib/trading/scheduleArm'
+import { planCrosses, swapFireOrders } from '@/lib/trading/tradingFire'
 import { cn } from '@/lib/utils'
-import { FNO_UNDERLYING_EXCHANGES, fnoExchangeFor } from '@/types/hedging'
+import { FNO_UNDERLYING_EXCHANGES, fnoExchangeFor, type ScheduledOrder } from '@/types/hedging'
+import type { OptionChainResponse } from '@/types/option-chain'
 import type { Position } from '@/types/trading'
 import { showToast } from '@/utils/toast'
 
 /** How often the persisted book is re-read: the ladder may have moved. */
 const BOOK_POLL_MS = 2000
+
+/** How far the chain ask reaches for Deploy by level: strikes around the ATM. */
+const LEVEL_CHAIN_DEPTH = 50
 
 /** One order the bar places — the panel's PanelOrder, minus the levels a bar never adds. */
 interface BarOrder {
@@ -57,7 +91,16 @@ interface BarOrder {
   stoploss?: number | null
 }
 
-type BusyKey = 'deployCE' | 'deployPE' | 'closeCE' | 'closePE' | 'exitAll' | 'buyAll' | 'sellAll'
+type BusyKey =
+  | 'deployCE'
+  | 'deployPE'
+  | 'closeCE'
+  | 'closePE'
+  | 'exitAll'
+  | 'buyAll'
+  | 'sellAll'
+  | 'swapCE'
+  | 'swapPE'
 
 const NO_BUSY: Record<BusyKey, boolean> = {
   deployCE: false,
@@ -67,6 +110,8 @@ const NO_BUSY: Record<BusyKey, boolean> = {
   exitAll: false,
   buyAll: false,
   sellAll: false,
+  swapCE: false,
+  swapPE: false,
 }
 
 interface Props {
@@ -84,6 +129,12 @@ export function DeployQuickBar({ apiKey, refuse, onOpenStrategy }: Props) {
   const [busy, setBusy] = useState<Record<BusyKey, boolean>>(NO_BUSY)
   /** The persisted deploy book, re-read on a slow stride like IndexTab's binding. */
   const [state, setState] = useState(() => readDeployState())
+  /** The panel's Schedule dialog, pointed at this bar's ladder. */
+  const [scheduleOpen, setScheduleOpen] = useState(false)
+  /** Deploy by level: its dialog, and the one-shot chain snapshot behind it. */
+  const [levelOpen, setLevelOpen] = useState(false)
+  const [levelChain, setLevelChain] = useState<OptionChainResponse | null>(null)
+  const [levelLoading, setLevelLoading] = useState(false)
 
   useEffect(() => {
     const read = () => setState(readDeployState())
@@ -106,6 +157,34 @@ export function DeployQuickBar({ apiKey, refuse, onOpenStrategy }: Props) {
     constituentsFor(fnoBaseSymbol(underlying)) != null
   const optionsMode = indexUnderlying || ladder.ce.length > 0 || ladder.pe.length > 0
   const stockRows = state.stocks
+
+  /**
+   * The underlying's own quote address — the trigger symbol the Schedule and
+   * level dialogs read, the same derivation the panel makes when its chain
+   * snapshot is quiet (the binding's exchange, NSE_INDEX for NIFTY, BSE_INDEX
+   * for SENSEX).
+   */
+  const spot = workspace ? { symbol: underlying, exchange: workspace.exchange } : null
+
+  /**
+   * The chain's own strike step for the level dialog — the smallest gap the
+   * snapshot lists, the underlying's default grid before it lands.
+   */
+  const levelInterval = useMemo(() => {
+    const strikes = levelChain?.chain.map((row) => row.strike) ?? []
+    if (strikes.length >= 2) {
+      const sorted = [...new Set(strikes)].sort((a, b) => a - b)
+      const gaps = sorted.slice(1).map((s, i) => s - sorted[i])
+      const chainInterval = Math.min(...gaps.filter((g) => g > 0))
+      if (chainInterval > 0) return chainInterval
+    }
+    return defaultStrikeStep(underlying)
+  }, [levelChain, underlying])
+  const levelAtm =
+    levelChain?.atm_strike ||
+    (levelChain?.underlying_ltp && levelInterval
+      ? Math.round(levelChain.underlying_ltp / levelInterval) * levelInterval
+      : undefined)
 
   /**
    * The fresh figures a press needs, in one breath: the book's symbols'
@@ -342,6 +421,30 @@ export function DeployQuickBar({ apiKey, refuse, onOpenStrategy }: Props) {
     [fire, optionsMode, ladder, stockRows]
   )
 
+  /**
+   * A swap: leave the side the trader is exiting first, then enter the
+   * opposite side — the panel's own order, exits leading so the proceeds
+   * are the entry's room. Sizing runs the same weight-share arithmetic the
+   * deploys run, at press-time figures like every other press here.
+   */
+  const runSwap = useCallback(
+    (from: 'CE' | 'PE', key: BusyKey) =>
+      void fire(key, `Swap ${from}→${from === 'CE' ? 'PE' : 'CE'}`, ({ quotes, capital }) => {
+        const ltpOf = (row: DeployRow) => quotes[row.symbol]
+        return swapFireOrders(ladder, from, { capital, ltpOf }).map((order) => ({
+          symbol: order.symbol,
+          exchange: order.exchange,
+          action: order.action,
+          quantity: order.quantity,
+          entry: order.entry ?? order.price ?? null,
+          target: order.target ?? null,
+          stoploss: order.stoploss ?? null,
+          ltp: quotes[order.symbol],
+        }))
+      }),
+    [fire, ladder]
+  )
+
   /** The equity book's Buy/Sell All — funds-sized, the panel's fireStocks. */
   const fireStocks = useCallback(
     (action: 'BUY' | 'SELL', key: BusyKey, label: string) =>
@@ -361,6 +464,157 @@ export function DeployQuickBar({ apiKey, refuse, onOpenStrategy }: Props) {
     [fire, stockRows]
   )
 
+  /* ── Schedule: the panel's dialog, pointed at this bar's ladder ────────── */
+
+  const submitSchedule = useCallback(
+    (submission: SchedulerSubmit) => {
+      if (!underlying || !spot) return
+      const fresh = readDeployState()
+      const ladderNow = fresh.books[bookKey(optionsExchange, underlying)] ?? { ce: [], pe: [] }
+      const row = armLadderBatch(submission, { underlying, spot, ladder: ladderNow })
+      const miss = armPastMiss(row)
+      const hedging = loadHedgingState()
+      saveHedgingState({ ...hedging, scheduled: [...hedging.scheduled, row] })
+      if (miss === 'missed') {
+        showToast.warning(
+          `${row.trigger.kind === 'time' ? row.trigger.at : 'That level'} has already passed — nothing scheduled.`
+        )
+      } else if (miss === 'daily') {
+        showToast.info(
+          `${row.trigger.kind === 'time' ? row.trigger.at : 'The level'} runs at the next trading day's pass.`
+        )
+      } else {
+        showToast.success(
+          `${scheduleActionLabel(row.action, row.modeAtCreation, row.target)} scheduled — it fires the deploy ladder for ${underlying}.`
+        )
+      }
+    },
+    [underlying, spot, optionsExchange]
+  )
+
+  /* ── Deploy by level: the panel's dialog, one-shot chain at open ───────── */
+
+  const openLevel = useCallback(async () => {
+    if (refuse()) return
+    if (!underlying || levelLoading) return
+    setLevelLoading(true)
+    try {
+      const expiries = await scalpingApi.getExpiry(underlying, optionsExchange, 'options')
+      const expiry = expiries.data?.[0]
+      if (!expiry) {
+        showToast.warning(`Deploy by level: ${underlying} has no option expiries listed`)
+        return
+      }
+      const res = await optionChainApi.getOptionChain(
+        apiKey,
+        underlying,
+        optionsExchange,
+        expiry,
+        LEVEL_CHAIN_DEPTH
+      )
+      if (res.status !== 'success') {
+        showToast.warning(
+          'Deploy by level could not read the chain snapshot — try the Deploy panel'
+        )
+        return
+      }
+      setLevelChain(res)
+      setLevelOpen(true)
+    } catch {
+      showToast.warning('Deploy by level could not reach the chain — try the Deploy panel')
+    } finally {
+      setLevelLoading(false)
+    }
+  }, [refuse, underlying, optionsExchange, apiKey, levelLoading])
+
+  const submitLevel = useCallback(
+    async (plan: IndexDeploySubmit) => {
+      if (!underlying || !levelChain) {
+        showToast.warning('Deploy by level needs the chain snapshot — it has not landed yet.')
+        return
+      }
+      const fresh = readDeployState()
+      const keyStr = bookKey(optionsExchange, underlying)
+      const ladderNow = fresh.books[keyStr] ?? { ce: [], pe: [] }
+      const side = plan.side === 'CE' ? ('ce' as const) : ('pe' as const)
+      const resolved = resolveLevelPick({
+        chain: levelChain,
+        interval: levelInterval,
+        plan,
+        existing: ladderNow[side],
+        optionsExchange,
+      })
+      if (!resolved || resolved.picked.length === 0) {
+        showToast.warning('No strikes resolved for that pick.')
+        return
+      }
+      // Into the ladder first: the trader sees exactly what is set, in the
+      // panel and here, both reading the same book.
+      writeDeployState({
+        ...fresh,
+        books: { ...fresh.books, [keyStr]: { ...ladderNow, [side]: resolved.rows } },
+      })
+      if (resolved.skipped.length > 0) {
+        showToast.warning(
+          `${plan.side}: ${resolved.skipped.length} of ${resolved.planned.length} strikes are not on the chain — the rest set.`
+        )
+      }
+      const deploy = buildDeployPlan({ plan, picked: resolved.picked, spot, optionsExchange })
+      if (levelEntryMet(plan, levelChain.underlying_ltp)) {
+        const { placed, failed } = await placeLevelOrders({
+          apiKey,
+          picked: resolved.picked,
+          batchLots: fresh.lots,
+          optionAction: plan.optionAction,
+          product: fresh.product,
+        })
+        if (placed === 0) {
+          showToast.error('Index deploy: every order failed')
+          return
+        }
+        showToast.success(
+          `Index deploy: ${placed} order${placed === 1 ? '' : 's'} placed${failed > 0 ? `, ${failed} failed` : ''}`
+        )
+        armCloseRows(deploy, spot)
+        return
+      }
+      if (!spot) {
+        showToast.error('The spot symbol is not known yet — cannot set an index trigger.')
+        return
+      }
+      const crosses = planCrosses({ side: plan.side, optionAction: plan.optionAction })
+      const row: ScheduledOrder = {
+        id: newScheduleId(),
+        action: plan.side === 'CE' ? 'deployA' : 'deployB',
+        trigger: {
+          kind: 'price',
+          symbol: spot.symbol,
+          exchange: spot.exchange,
+          condition: crosses.target,
+          price: plan.entry as number,
+        },
+        status: 'pending',
+        createdAt: Date.now(),
+        modeAtCreation: 'fno',
+        target: 'options',
+        origin: 'trading',
+        deploy,
+      }
+      const hedging = loadHedgingState()
+      saveHedgingState({ ...hedging, scheduled: [...hedging.scheduled, row] })
+      showToast.info(
+        `Set: ${plan.optionAction} ${plan.side} ×${deploy.strikes.length} when ${spot.symbol} ${crosses.target === 'above' ? '≥' : '≤'} ${(plan.entry as number).toLocaleString('en-IN')}. It fires the ladder it was set on.`
+      )
+    },
+    [underlying, levelChain, levelInterval, optionsExchange, spot, apiKey]
+  )
+
+  /** The product the presses fire under, written into the shared book. */
+  const saveProduct = useCallback((product: DeployBook['product']) => {
+    const fresh = readDeployState()
+    writeDeployState({ ...fresh, product })
+  }, [])
+
   const btn = (key: BusyKey, label: string, tone: string, onPress: () => void, title?: string) => (
     <Button
       type="button"
@@ -378,62 +632,169 @@ export function DeployQuickBar({ apiKey, refuse, onOpenStrategy }: Props) {
   const hasBook = optionsMode ? ladder.ce.length > 0 || ladder.pe.length > 0 : stockRows.length > 0
 
   return (
-    <div className="flex shrink-0 items-center gap-1.5 border-t bg-muted/30 px-2 py-1">
-      <span className="shrink-0 text-[10px] text-muted-foreground">
-        Quick deploy
-        {workspace && (
-          <>
-            {' · '}
-            <span className="font-mono font-semibold text-foreground">{underlying}</span>
-          </>
-        )}
-      </span>
-      {hasBook ? (
-        <div className="flex min-w-0 flex-1 items-center gap-1">
-          {optionsMode ? (
+    <div className="flex shrink-0 flex-col border-t bg-muted/30 px-2 py-1">
+      {/* Row one — the firing row: deploys, closes, the swaps, Exit All. */}
+      <div className="flex items-center gap-1.5">
+        <span className="shrink-0 text-[10px] text-muted-foreground">
+          Quick deploy
+          {workspace && (
             <>
-              {btn('deployCE', 'Deploy CE', 'bg-emerald-600 hover:bg-emerald-700', () =>
-                fireSide('BUY', 'CE', 'deployCE', 'Deploy CE')
-              )}
-              {btn('deployPE', 'Deploy PE', 'bg-emerald-600 hover:bg-emerald-700', () =>
-                fireSide('BUY', 'PE', 'deployPE', 'Deploy PE')
-              )}
-              {btn('closeCE', 'Close CE', 'bg-red-600 hover:bg-red-700', () =>
-                fireSide('SELL', 'CE', 'closeCE', 'Close CE')
-              )}
-              {btn('closePE', 'Close PE', 'bg-red-600 hover:bg-red-700', () =>
-                fireSide('SELL', 'PE', 'closePE', 'Close PE')
-              )}
-            </>
-          ) : (
-            <>
-              {btn('buyAll', 'Buy All', 'bg-emerald-600 hover:bg-emerald-700', () =>
-                fireStocks('BUY', 'buyAll', 'Buy All')
-              )}
-              {btn('sellAll', 'Sell All', 'bg-red-600 hover:bg-red-700', () =>
-                fireStocks('SELL', 'sellAll', 'Sell All')
-              )}
+              {' · '}
+              <span className="font-mono font-semibold text-foreground">{underlying}</span>
             </>
           )}
-          {btn('exitAll', 'Exit All', 'bg-amber-500 hover:bg-amber-600', () => exitAll())}
-        </div>
-      ) : (
-        <span className="min-w-0 flex-1 truncate text-[10px] text-muted-foreground">
-          Bind an underlying in the Deploy panel and build its ladder — its quick buttons stand
-          here.
         </span>
+        {hasBook ? (
+          <div className="flex min-w-0 flex-1 items-center gap-1">
+            {optionsMode ? (
+              <>
+                {btn('deployCE', 'Deploy CE', 'bg-emerald-600 hover:bg-emerald-700', () =>
+                  fireSide('BUY', 'CE', 'deployCE', 'Deploy CE')
+                )}
+                {btn('deployPE', 'Deploy PE', 'bg-emerald-600 hover:bg-emerald-700', () =>
+                  fireSide('BUY', 'PE', 'deployPE', 'Deploy PE')
+                )}
+                {btn('closeCE', 'Close CE', 'bg-red-600 hover:bg-red-700', () =>
+                  fireSide('SELL', 'CE', 'closeCE', 'Close CE')
+                )}
+                {btn('closePE', 'Close PE', 'bg-red-600 hover:bg-red-700', () =>
+                  fireSide('SELL', 'PE', 'closePE', 'Close PE')
+                )}
+                {btn(
+                  'swapCE',
+                  'CE→PE',
+                  'bg-sky-600 hover:bg-sky-700',
+                  () => runSwap('CE', 'swapCE'),
+                  'Swap: close the CE rows, buy the PE rows'
+                )}
+                {btn(
+                  'swapPE',
+                  'PE→CE',
+                  'bg-sky-600 hover:bg-sky-700',
+                  () => runSwap('PE', 'swapPE'),
+                  'Swap: close the PE rows, buy the CE rows'
+                )}
+              </>
+            ) : (
+              <>
+                {btn('buyAll', 'Buy All', 'bg-emerald-600 hover:bg-emerald-700', () =>
+                  fireStocks('BUY', 'buyAll', 'Buy All')
+                )}
+                {btn('sellAll', 'Sell All', 'bg-red-600 hover:bg-red-700', () =>
+                  fireStocks('SELL', 'sellAll', 'Sell All')
+                )}
+              </>
+            )}
+            {btn('exitAll', 'Exit All', 'bg-amber-500 hover:bg-amber-600', () => exitAll())}
+          </div>
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-[10px] text-muted-foreground">
+            Bind an underlying in the Deploy panel and build its ladder — its quick buttons stand
+            here.
+          </span>
+        )}
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="h-6 shrink-0 gap-1 px-2 text-[10px]"
+          onClick={onOpenStrategy}
+          title="Open the Strategy bots panel"
+        >
+          <Bot className="h-3 w-3" />
+          Strategy bots
+        </Button>
+      </div>
+      {/* Row two — the setup row: Schedule, Deploy by level, and the product
+          and order-mode every press above fires under. The two dialogs are
+          the ladder's, so they stand only when a ladder does; the selects
+          stand whenever the bar has anything to fire. */}
+      {hasBook && (
+        <div className="mt-1 flex items-center gap-1">
+          {optionsMode && (
+            <>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-5 gap-1 px-1.5 text-[10px]"
+                disabled={!underlying}
+                title="Set a batch on this underlying's ladder"
+                onClick={() => setScheduleOpen(true)}
+              >
+                <CalendarClock className="h-2.5 w-2.5" />
+                Schedule
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-5 gap-1 px-1.5 text-[10px]"
+                disabled={!underlying || levelLoading}
+                title="Deploy strikes by index level (entry, target, stop)"
+                onClick={() => void openLevel()}
+              >
+                {levelLoading ? (
+                  <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                ) : (
+                  <Layers className="h-2.5 w-2.5" />
+                )}
+                Deploy by level
+              </Button>
+            </>
+          )}
+          <span className="ml-auto flex items-center gap-1">
+            <Select
+              value={state.product}
+              onValueChange={(product) => saveProduct(product as DeployBook['product'])}
+            >
+              <SelectTrigger
+                className="h-5 w-[58px] px-1 text-[10px]"
+                title="Product every press here fires under"
+                aria-label="Product"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="text-[11px]">
+                {(['MIS', 'NRML', 'CNC'] as const).map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {p}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <OrderModeSelect compact />
+          </span>
+        </div>
       )}
-      <Button
-        type="button"
-        size="sm"
-        variant="outline"
-        className="h-6 shrink-0 gap-1 px-2 text-[10px]"
-        onClick={onOpenStrategy}
-        title="Open the Strategy bots panel"
-      >
-        <Bot className="h-3 w-3" />
-        Strategy bots
-      </Button>
+
+      <SchedulerDialog
+        open={scheduleOpen}
+        mode="fno"
+        initial={null}
+        triggerSymbols={
+          spot ? [spot, ...(underlying ? [{ symbol: underlying, exchange: 'NSE' }] : [])] : []
+        }
+        defaultSymbol={spot ?? undefined}
+        spotSymbol={spot}
+        actsOn={
+          underlying ? { options: `${underlying} deploy ladder`, stock: underlying } : undefined
+        }
+        allowStockTarget={false}
+        onOpenChange={setScheduleOpen}
+        onSubmit={submitSchedule}
+      />
+      <IndexDeployDialog
+        open={levelOpen}
+        onOpenChange={setLevelOpen}
+        spot={spot}
+        spotLtp={levelChain?.underlying_ltp ?? undefined}
+        atmStrike={levelAtm}
+        strikeInterval={levelInterval || undefined}
+        ceShare={loadHedgingState().ceShare}
+        capitalNote="Quantity: each strike's weight share of the funds (or its manual lots). The picked strikes land in the ladder, where they stay adjustable. Triggers run while this page stays open."
+        onSubmit={(plan) => void submitLevel(plan)}
+      />
     </div>
   )
 }

@@ -2684,24 +2684,26 @@ export class TradingTerminal {
   /* ── price-scale quick trade buttons ─────────────────────────────────── */
 
   /**
-   * The pair of order buttons that ride the price scale: a B and an S beside
-   * the axis ladder, parked in one fixed vertical line at the price pane's
-   * centre — the quick-trade affordance TradingView puts on the scale and
-   * Dhan's chart copies, wired to this chart's right-click "Buy/Sell @ price".
+   * The pair of order buttons that ride the crosshair's own line: a B and an
+   * S side by side, immediately before the axis value that shows the
+   * crosshair's price — the quick-trade affordance TradingView puts on the
+   * scale and Dhan's chart copies, wired to this chart's right-click
+   * "Buy/Sell @ price".
    *
    * They exist while the pointer is over the chart and hide the moment it
-   * leaves, so the plot is clean the rest of the time; they sit just LEFT of
-   * the axis column (never on it), so the ladder's price values stay readable
-   * while the buttons are up, and the current bar's right margin keeps them
-   * off the candles. The line does NOT follow the pointer — an earlier cut
-   * tracked the cursor's price and the pair never stayed still long enough
-   * to press — so the hand can travel to a still target. The price they act
-   * on is the crosshair's: the price under the pointer as it moves over the
-   * plot, frozen the moment it lands on the buttons themselves. A press
-   * places there exactly the context menu's rows do: a valid-side price
-   * orders as a LIMIT there (One-Click off, the ticket opens prefilled at
-   * it), a wrong-side price — the broker would refuse the limit — goes as
-   * the order mode's market.
+   * leaves, so the plot is clean the rest of the time. The pair tracks the
+   * crosshair vertically only: its column never leaves the spot just left of
+   * the axis, so a hand travelling to it chases at most a few pixels of
+   * height — and the moment the pointer crosses onto the strip, the strip
+   * stops the chart's move events, the crosshair freezes and the buttons
+   * stand still for the press. A park on a fixed line was tried and cut: a
+   * pair parked at the pane's centre is a second deploy bar, not a quick
+   * trade — the price it acted on was never the one under the crosshair.
+   *
+   * A press places at the price the strip froze on, exactly the context
+   * menu's rows do: a valid-side price orders as a LIMIT there (One-Click
+   * off, the ticket opens prefilled at it), a wrong-side price — the broker
+   * would refuse the limit — goes as the order mode's market.
    */
   private scaleBtns: HTMLDivElement | null = null
   private offScaleBtns: (() => void) | null = null
@@ -2719,12 +2721,15 @@ export class TradingTerminal {
       'top:0',
       'right:0',
       'display:none',
-      'flex-direction:column',
+      'flex-direction:row',
+      'gap:2px',
       'align-items:center',
       'z-index:37',
-      // The wrapper only positions; the buttons take the pointer. Gestures
-      // between the two fall through to the chart.
-      'pointer-events:none',
+      // The whole strip takes the pointer, not just the buttons: crossing
+      // onto it stops the chart's pointer stream, which is what freezes the
+      // crosshair price the pair fires at and holds the strip still for the
+      // hand. Gestures on it are order entry, nothing else.
+      'pointer-events:auto',
       'transform:translateY(-50%)',
       'touch-action:none',
     ].join(';')
@@ -2740,7 +2745,6 @@ export class TradingTerminal {
         'justify-content:center',
         'width:20px',
         'height:17px',
-        'margin:1px 0',
         'padding:0',
         'border:1px solid rgba(0,0,0,0.3)',
         'border-radius:4px',
@@ -2752,13 +2756,24 @@ export class TradingTerminal {
       ].join(';')
       return btn
     }
-    // BUY above SELL: the same green-over-red reading as a rising ladder.
+    // BUY left of SELL: the same reading order as "B S 45050.05" on the axis
+    // beside it.
     wrap.appendChild(mkBtn('BUY'))
     wrap.appendChild(mkBtn('SELL'))
-    // The buttons are order entry, not chart surface: a press on one must
-    // not also reach the chart's own handlers as a pan or a pick (the instant
-    // panel stops the same gestures for the same reason).
-    for (const type of ['pointerdown', 'pointerup', 'mousedown', 'touchstart'] as const) {
+    // The strip is order entry, not chart surface: its events must not reach
+    // the chart's own handlers as a pan or a pick, and — the point of the
+    // strip — a move over it must not reach this container's tracker either,
+    // or the pair would keep sliding under the hand it is waiting for (the
+    // instant panel stops the same gestures for the same reason).
+    for (const type of [
+      'pointerdown',
+      'pointerup',
+      'pointercancel',
+      'pointermove',
+      'pointerover',
+      'mousedown',
+      'touchstart',
+    ] as const) {
       wrap.addEventListener(type, (e) => e.stopPropagation())
     }
     for (const side of ['BUY', 'SELL'] as const) {
@@ -2775,11 +2790,12 @@ export class TradingTerminal {
     this.scaleBtns = wrap
 
     // Visible while the pointer is anywhere over the chart, gone the moment
-    // it leaves. The pair itself never repositions with the pointer: it is
-    // parked once (per appearance) at the price pane's centre line, and only
-    // the price it acts on — read from the same move events the chart's own
-    // crosshair eats — changes underneath. Coalesced through rAF: a high-Hz
-    // mouse fires pointermove far more often than a frame paints.
+    // it leaves. The pair rides the crosshair: its column stays pinned just
+    // left of the axis while its height follows the pointer, and crossing
+    // onto the strip itself ends both — the strip stops the move stream, so
+    // the last plot-side price is the one the press fires at. Coalesced
+    // through rAF: a high-Hz mouse fires pointermove far more often than a
+    // frame paints.
     let last: PointerEvent | null = null
     let raf = 0
     const schedule = (ev: PointerEvent) => {
@@ -2830,14 +2846,14 @@ export class TradingTerminal {
   }
 
   /**
-   * Show the pair on its fixed centre line and keep the price it acts on
-   * tracking the crosshair — or take them off when the chart may not trade.
+   * Ride the pair along the crosshair's line and keep the price it acts on
+   * under the pointer — or take them off when the chart may not trade.
    *
-   * The position is written only while the pair is parked (the first move
-   * after it appeared): the buttons must sit still for the hand to reach
-   * them, which was the whole point of taking them off the pointer.
-   * Everything about them that is not position — the crosshair price they
-   * will fire at, the titles that say so — keeps updating every frame.
+   * Position and price both track the move events, coalesced per frame: the
+   * strip's column stays pinned beside the axis (it never chases the pointer
+   * horizontally) while its height follows the crosshair, and the pointer
+   * crossing onto the strip itself ends both — the strip stops the moves, so
+   * the last plot-side price is the one the press fires at.
    */
   private updateScaleButtons(ev: PointerEvent): void {
     const wrap = this.scaleBtns
@@ -2873,17 +2889,25 @@ export class TradingTerminal {
       wrap.style.display = 'none'
       return
     }
-    // Park the line once per appearance: centred in the pane, just left of
-    // the axis column — never over the ladder itself, so the values the
-    // trader is reading stay visible.
-    if (wrap.style.display === 'none') {
-      let rightInset = 0
-      for (const slot of chart.priceAxisLayout(0)) {
-        if (slot.side === 'right') rightInset += slot.width
-      }
-      wrap.style.right = `${Math.round(rightInset) + 2}px`
-      wrap.style.top = `${Math.round(paneTop + paneHeight / 2)}px`
+    // Ride the crosshair: the pair sits on the crosshair's own line, side by
+    // side immediately before the axis value that shows that price —
+    // rewritten every frame, so the strip and the label never disagree. Just
+    // LEFT of the axis column (never on it), so the ladder's values stay
+    // readable, and the current bar's right margin keeps the strip off the
+    // candles.
+    let rightInset = 0
+    for (const slot of chart.priceAxisLayout(0)) {
+      if (slot.side === 'right') rightInset += slot.width
     }
+    wrap.style.right = `${Math.round(rightInset) + 2}px`
+    // Centred on the crosshair's Y, clamped so the strip never leaves the
+    // price pane at its top or bottom edge.
+    const half = wrap.offsetHeight > 0 ? wrap.offsetHeight / 2 : 10
+    let y = ev.clientY - box.top
+    if (paneHeight > 0) {
+      y = Math.min(Math.max(y, paneTop + half), paneTop + paneHeight - half)
+    }
+    wrap.style.top = `${Math.round(y)}px`
     const price = this.snap(p)
     this.scalePrice = price
     const lotTxt = this.sym?.lots

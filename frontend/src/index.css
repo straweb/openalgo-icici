@@ -1219,3 +1219,55 @@
      be invalid under half of them. The editor already sets its own colour. */
   color: inherit;
 }
+
+/* ============================================================
+   QuantDesk (vendored quanttrade terminal) — scoped dark amber
+   theme. Every shadcn token inside .qd-root resolves to the
+   quanttrade palette so the cloned UI looks exactly upstream,
+   independent of the host app's light/dark/analyzer theme.
+   ============================================================ */
+.qd-root {
+  --background: #0b0e11;
+  --foreground: #e6edf3;
+  --card: #12161b;
+  --card-foreground: #e6edf3;
+  --popover: #161b22;
+  --popover-foreground: #e6edf3;
+  --primary: #f5a623;
+  --primary-foreground: #0b0e11;
+  --secondary: #1c232c;
+  --secondary-foreground: #e6edf3;
+  --muted: #1c232c;
+  --muted-foreground: #8b949e;
+  --accent: #1c232c;
+  --accent-foreground: #e6edf3;
+  --destructive: #ff4d5e;
+  --destructive-foreground: #ffffff;
+  --border: #232b36;
+  --input: #232b36;
+  --ring: #f5a623;
+  --profit: #00c896;
+  --loss: #ff4d5e;
+  --buy: #00c896;
+  --sell: #ff4d5e;
+  --radius: 0.5rem;
+  color-scheme: dark;
+}
+
+.qd-root .tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* thin scrollbars inside quantdesk, like upstream */
+.qd-root *::-webkit-scrollbar { width: 6px; height: 6px; }
+.qd-root *::-webkit-scrollbar-thumb { background: #232b36; border-radius: 3px; }
+.qd-root *::-webkit-scrollbar-thumb:hover { background: #2f3947; }
+.qd-root *::-webkit-scrollbar-track { background: transparent; }
+
+/* flash pulses used by the terminal rows (upstream globals.css) */
+@keyframes qd-flash-up { 0% { background-color: rgba(0, 200, 150, 0.18); } 100% { background-color: transparent; } }
+@keyframes qd-flash-down { 0% { background-color: rgba(255, 77, 94, 0.18); } 100% { background-color: transparent; } }
+.qd-root .flash-up { animation: qd-flash-up 0.6s ease-out; }
+.qd-root .flash-down { animation: qd-flash-down 0.6s ease-out; }
+@keyframes qd-pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.qd-root .pulse-dot { animation: qd-pulse-dot 1.6s ease-in-out infinite; }

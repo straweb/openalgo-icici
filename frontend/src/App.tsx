@@ -60,6 +60,7 @@ const WebSocketOrder = lazy(() => import('@/pages/WebSocketOrder'))
 const ChartTest = lazy(() => import('@/pages/ChartTest'))
 const Playground = lazy(() => import('@/pages/Playground'))
 const Trading = lazy(() => import('@/pages/Trading'))
+const QuantDesk = lazy(() => import('@/pages/QuantDesk'))
 const Hedging = lazy(() => import('@/pages/Hedging'))
 const Castrade = lazy(() => import('@/pages/Castrade'))
 const Historify = lazy(() => import('@/pages/Historify'))
@@ -312,6 +313,9 @@ function App() {
               <Route element={<FullWidthLayout />}>
                 <Route path="/playground" element={<Playground />} />
                 <Route path="/trading" element={<Trading />} />
+                {/* QuantDesk: the vendored quanttrade terminal as an
+                    application surface — same chrome rules as /trading. */}
+                <Route path="/quantdesk" element={<QuantDesk />} />
                 {/* The hedging terminal is an application surface like /trading:
                     three columns and a dock inside a fixed viewport, none of
                     which fits Layout's centred page-scrolling container. */}
